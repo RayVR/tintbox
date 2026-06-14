@@ -3,6 +3,10 @@
 
 unsafe extern "C" {
     fn rcms_oracle_double_to_s15f16(v: f64) -> i32;
+    fn rcms_oracle_s15f16_to_double(a: i32) -> f64;
+    fn rcms_oracle_double_to_8fixed8(v: f64) -> u16;
+    fn rcms_oracle_to_fixed_domain(a: i32) -> i32;
+    fn rcms_oracle_from_fixed_domain(a: i32) -> i32;
 }
 
 /// lcms2 `_cmsDoubleTo15Fixed16`.
@@ -10,6 +14,10 @@ pub fn double_to_s15f16(v: f64) -> i32 {
     // SAFETY: pure C arithmetic, no pointers, no allocation.
     unsafe { rcms_oracle_double_to_s15f16(v) }
 }
+pub fn s15f16_to_double(a: i32) -> f64 { unsafe { rcms_oracle_s15f16_to_double(a) } }
+pub fn double_to_8fixed8(v: f64) -> u16 { unsafe { rcms_oracle_double_to_8fixed8(v) } }
+pub fn to_fixed_domain(a: i32) -> i32 { unsafe { rcms_oracle_to_fixed_domain(a) } }
+pub fn from_fixed_domain(a: i32) -> i32 { unsafe { rcms_oracle_from_fixed_domain(a) } }
 
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.
 pub struct Rng(u64);
