@@ -161,7 +161,7 @@ const T_VCGT: u32 = 0x7663_6774; // 'vcgt'
 const T_META: u32 = 0x6D65_7461; // 'meta'
 const T_PROFILE_SEQUENCE_ID: u32 = 0x7073_6964; // 'psid'
 const T_PROFILE_DESCRIPTION_ML: u32 = 0x6473_636d; // 'dscm'
-const T_CICP: u32 = 0x6369_7270; // 'cicp'
+const T_CICP: u32 = 0x6369_6370; // 'cicp'
 const T_ARGYLL_ARTS: u32 = 0x6172_7473; // 'arts'
 const T_MHC2: u32 = 0x4D48_4332; // 'MHC2'
 
