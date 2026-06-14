@@ -35,7 +35,7 @@ pub enum ClutTable {
 /// A CLUT element: the grid table plus the precomputed [`InterpParams`] that
 /// describe its sample geometry. Mirrors lcms2's `_cmsStageCLutData`
 /// (the `Tab`/`Params` pair).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Clut {
     /// The grid storage (16-bit or float).
     pub table: ClutTable,

@@ -1233,3 +1233,63 @@ int rcms_oracle_pipeline_clut_curves_matrix_eval_float(
     cmsPipelineFree(lut);
     return 1;
 }
+
+/* ---- LUT8 / LUT16 tag readers (Type_LUT8_Read / Type_LUT16_Read) -----------
+   cmsReadTag of an mft1/mft2 tag returns a cmsPipeline*. These extractors let
+   the differential test build the SAME pipeline lcms2 builds and evaluate input
+   grids through it, to diff against the rcms Pipeline bit-for-bit. */
+
+/* Report the input/output channel counts of the pipeline lcms2 builds for the
+   given mft1/mft2 tag. Returns 1 on success (writes *nIn/*nOut), 0 if the
+   profile cannot be opened or the tag is absent / not pipeline-backed. */
+int rcms_oracle_lut_channels(const uint8_t* buf, uint32_t len, uint32_t sig,
+                             uint32_t* nIn, uint32_t* nOut) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsPipeline* lut = (cmsPipeline*) cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = 0;
+    if (lut) {
+        *nIn = cmsPipelineInputChannels(lut);
+        *nOut = cmsPipelineOutputChannels(lut);
+        ok = 1;
+    }
+    cmsCloseProfile(p);
+    return ok;
+}
+
+/* Evaluate `nSamples` input vectors through lcms2's pipeline for the mft1/mft2
+   tag, in the 16-bit domain (cmsPipelineEval16). `inputs` is `nSamples * nIn`
+   u16 row-major; `out` receives `nSamples * nOut` u16 row-major. Returns 1 on
+   success, 0 otherwise. The pipeline is owned by the profile (freed on close). */
+int rcms_oracle_lut_eval16(const uint8_t* buf, uint32_t len, uint32_t sig,
+                           const uint16_t* inputs, uint32_t nSamples,
+                           uint16_t* out) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsPipeline* lut = (cmsPipeline*) cmsReadTag(p, (cmsTagSignature) sig);
+    if (!lut) { cmsCloseProfile(p); return 0; }
+    uint32_t nIn = cmsPipelineInputChannels(lut);
+    uint32_t nOut = cmsPipelineOutputChannels(lut);
+    for (uint32_t s = 0; s < nSamples; s++) {
+        cmsPipelineEval16(inputs + (size_t) s * nIn, out + (size_t) s * nOut, lut);
+    }
+    cmsCloseProfile(p);
+    return 1;
+}
+
+/* Float counterpart of rcms_oracle_lut_eval16 via cmsPipelineEvalFloat. */
+int rcms_oracle_lut_eval_float(const uint8_t* buf, uint32_t len, uint32_t sig,
+                               const float* inputs, uint32_t nSamples,
+                               float* out) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsPipeline* lut = (cmsPipeline*) cmsReadTag(p, (cmsTagSignature) sig);
+    if (!lut) { cmsCloseProfile(p); return 0; }
+    uint32_t nIn = cmsPipelineInputChannels(lut);
+    uint32_t nOut = cmsPipelineOutputChannels(lut);
+    for (uint32_t s = 0; s < nSamples; s++) {
+        cmsPipelineEvalFloat(inputs + (size_t) s * nIn, out + (size_t) s * nOut, lut);
+    }
+    cmsCloseProfile(p);
+    return 1;
+}

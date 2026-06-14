@@ -9,6 +9,7 @@
 use crate::color::{CIExyYTriple, CIEXYZ};
 use crate::curve::ToneCurve;
 use crate::fixed::{S15Fixed16, U16Fixed16};
+use crate::pipeline::Pipeline;
 use crate::profile::header::DateTime;
 use crate::sig::Signature;
 
@@ -106,6 +107,11 @@ pub enum Tag {
         bg: ToneCurve,
         desc: String,
     },
+    /// `cmsSigLut8Type` (`'mft1'`, `Type_LUT8_Read`, `cmstypes.c:2002`) AND
+    /// `cmsSigLut16Type` (`'mft2'`, `Type_LUT16_Read`, `cmstypes.c:2307`). Both
+    /// decode in lcms2 to a `cmsPipeline`, so they share one Rust value. Carried
+    /// by the A2Bx / B2Ax / gamut / preview LUT tags.
+    Lut(Pipeline),
 }
 
 /// One named colour of a `cmsNAMEDCOLORLIST` (`cmstypes.c:3369`). `name` is the

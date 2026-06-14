@@ -24,7 +24,7 @@ const V2_TO_V4: f64 = 65535.0 / 65280.0;
 const V4_TO_V2: f64 = 65280.0 / 65535.0;
 
 /// A single processing element in a [`Pipeline`](super::Pipeline).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Stage {
     /// `cmsSigCurveSetElemType`: one tone curve per channel. Input and output
     /// width both equal the curve count (cmslut.c `cmsStageAllocToneCurves`,

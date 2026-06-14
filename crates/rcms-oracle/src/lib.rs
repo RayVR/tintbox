@@ -321,6 +321,29 @@ unsafe extern "C" {
         input: *const f32,
         out: *mut f32,
     ) -> i32;
+    fn rcms_oracle_lut_channels(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        n_in: *mut u32,
+        n_out: *mut u32,
+    ) -> i32;
+    fn rcms_oracle_lut_eval16(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        inputs: *const u16,
+        n_samples: u32,
+        out: *mut u16,
+    ) -> i32;
+    fn rcms_oracle_lut_eval_float(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        inputs: *const f32,
+        n_samples: u32,
+        out: *mut f32,
+    ) -> i32;
 }
 
 /// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).
@@ -1997,6 +2020,85 @@ impl Rng {
     }
     pub fn next_f64_unit(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+/// lcms2 `cmsReadTag` of an mft1/mft2 tag -> `cmsPipeline`; reports the
+/// pipeline's `(input_channels, output_channels)`, or `None` if the profile
+/// cannot be opened or the tag is absent / not pipeline-backed.
+pub fn lut_channels(buf: &[u8], sig: u32) -> Option<(u32, u32)> {
+    let mut n_in = 0u32;
+    let mut n_out = 0u32;
+    // SAFETY: buf/len describe a valid readable slice C only reads; n_in/n_out
+    // are valid u32 the C writes only when it returns nonzero. The profile and
+    // its pipeline are opened and closed entirely inside the call.
+    let ok = unsafe {
+        rcms_oracle_lut_channels(buf.as_ptr(), buf.len() as u32, sig, &mut n_in, &mut n_out)
+    };
+    if ok != 0 {
+        Some((n_in, n_out))
+    } else {
+        None
+    }
+}
+
+/// Evaluate `n_samples` input vectors (`inputs` is `n_samples * n_in` u16
+/// row-major) through lcms2's pipeline for the mft1/mft2 `sig` via
+/// `cmsPipelineEval16`. Returns the `n_samples * n_out` u16 outputs row-major,
+/// or `None` on failure. `n_in`/`n_out` must match [`lut_channels`].
+pub fn lut_eval16(
+    buf: &[u8],
+    sig: u32,
+    inputs: &[u16],
+    n_samples: usize,
+    n_out: usize,
+) -> Option<Vec<u16>> {
+    let mut out = vec![0u16; n_samples * n_out];
+    // SAFETY: buf/len describe a valid readable slice C only reads; `inputs` is
+    // `n_samples * n_in` readable u16; `out` has `n_samples * n_out` u16 of room
+    // (the pipeline output width). C reads inputs and writes exactly that many
+    // outputs; the pipeline is opened and freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_lut_eval16(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            inputs.as_ptr(),
+            n_samples as u32,
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Float counterpart of [`lut_eval16`] via `cmsPipelineEvalFloat`.
+pub fn lut_eval_float(
+    buf: &[u8],
+    sig: u32,
+    inputs: &[f32],
+    n_samples: usize,
+    n_out: usize,
+) -> Option<Vec<f32>> {
+    let mut out = vec![0f32; n_samples * n_out];
+    // SAFETY: as `lut_eval16` but `inputs`/`out` are f32.
+    let ok = unsafe {
+        rcms_oracle_lut_eval_float(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            inputs.as_ptr(),
+            n_samples as u32,
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
     }
 }
 

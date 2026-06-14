@@ -194,7 +194,9 @@ fn elem_count(tag: &Tag) -> u32 {
         | Tag::Curve(_)
         // Type_vcgt_Read and Type_UcrBg_Read both set *nItems = 1.
         | Tag::Vcgt(_)
-        | Tag::UcrBg { .. } => 1,
+        | Tag::UcrBg { .. }
+        // Type_LUT8_Read and Type_LUT16_Read both set *nItems = 1.
+        | Tag::Lut(_) => 1,
     }
 }
 
@@ -909,6 +911,8 @@ mod tests {
         0x7061_7261, // 'para' ParametricCurve
         0x7663_6774, // 'vcgt' Vcgt
         0x6266_6420, // 'bfd ' UcrBg
+        0x6D66_7431, // 'mft1' Lut8
+        0x6D66_7432, // 'mft2' Lut16
     ];
 
     /// Comprehensive testbed sweep: for every `vendor/Little-CMS/testbed/*.icc`:

@@ -5,7 +5,7 @@
 //! (cmslut.c:1329-1374). The 16-bit entry point converts in/out at the boundary
 //! with `From16ToFloat` / `FromFloatTo16` (cmslut.c:83-101).
 
-mod clut;
+pub mod clut;
 mod stage;
 
 pub use clut::{Clut, ClutTable};
@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 pub const MAX_STAGE_CHANNELS: usize = 128;
 
 /// An ordered chain of [`Stage`]s mapping `input_channels` to `output_channels`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Pipeline {
     pub input_channels: usize,
     pub output_channels: usize,
