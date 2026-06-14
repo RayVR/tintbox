@@ -915,6 +915,7 @@ mod tests {
         0x6D66_7432, // 'mft2' Lut16
         0x6D41_4220, // 'mAB ' LutAtoB
         0x6D42_4120, // 'mBA ' LutBtoA
+        0x6D70_6574, // 'mpet' MultiProcessElement
     ];
 
     /// Comprehensive testbed sweep: for every `vendor/Little-CMS/testbed/*.icc`:
@@ -1015,13 +1016,20 @@ mod tests {
                             "[sweep] {name}:{raw_sig:08x} read_tag returned unexpected \
                              error {other:?} — should be Ok, Unsupported, BadType, or Corrupt"
                         );
-                        // Verify: if the on-disk type IS in-scope, this error is a bug.
+                        // Verify: if the on-disk type IS in-scope, this error is a
+                        // bug ONLY when lcms2 itself successfully read the tag. Some
+                        // testbed tags are deliberately malformed (e.g. bad_mpe.icc's
+                        // mpet), so lcms2's own `cmsReadTag` returns NULL — rcms is
+                        // then RIGHT to fail (Corrupt/BadType), matching lcms2.
                         if let Some(ty) = on_disk_type {
-                            assert!(
-                                !INSCOPE_TYPES.contains(&ty),
-                                "[sweep] {name}:{raw_sig:08x} INSCOPE type {ty:08x} returned \
-                                 non-Unsupported error {other:?} — this is a rcms bug",
-                            );
+                            if INSCOPE_TYPES.contains(&ty) {
+                                assert!(
+                                    !rcms_oracle::tag_read_succeeds(&bytes, raw_sig),
+                                    "[sweep] {name}:{raw_sig:08x} INSCOPE type {ty:08x} returned \
+                                     non-Unsupported error {other:?} but lcms2 read it fine — \
+                                     this is a rcms bug",
+                                );
+                            }
                         }
                         // Count these as "other" — not in-scope-Ok, not deferred-Unsupported.
                     }
@@ -1053,23 +1061,15 @@ mod tests {
         }
         eprintln!("===================================\n");
 
-        // Slice 3 done-criteria: every tone-curve on-disk type (`curv`/`para`/
-        // `vcgt`/`bfd `) is now in-scope, so the ONLY on-disk types that may still
-        // defer to `Unsupported` are the LUT/MPE set deferred to a later slice.
-        const DEFERRED_LUT_MPE: &[u32] = &[
-            0x6D66_7431, // 'mft1' LUT8
-            0x6D66_7432, // 'mft2' LUT16
-            0x6D41_4220, // 'mAB ' LutAtoB
-            0x6D42_4120, // 'mBA ' LutBtoA
-            0x6D70_6574, // 'mpet' MultiProcessElement
-        ];
-        for ty in deferred_by_type.keys() {
-            assert!(
-                DEFERRED_LUT_MPE.contains(ty),
-                "[sweep] deferred on-disk type {ty:08x} is not in the LUT/MPE set — \
-                 every other type (incl. curv/para/vcgt/bfd) must now be in-scope"
-            );
-        }
+        // Slice 4 done-criteria: every LUT/MPE on-disk type (mft1/mft2/mAB/mBA/
+        // mpet) is now in-scope, joining the tone-curve and struct types. With the
+        // MPE reader landed, ZERO deferred tag types remain — no testbed tag may
+        // return `Unsupported` for a known on-disk type.
+        assert!(
+            deferred_by_type.is_empty(),
+            "[sweep] expected 0 deferred on-disk types, but these still defer: {:08x?}",
+            deferred_by_type.keys().collect::<Vec<_>>()
+        );
 
         assert!(n_profiles > 0, "expected at least one accepted profile");
         assert!(

@@ -1293,3 +1293,16 @@ int rcms_oracle_lut_eval_float(const uint8_t* buf, uint32_t len, uint32_t sig,
     cmsCloseProfile(p);
     return 1;
 }
+
+/* Whether lcms2's cmsReadTag returns a non-NULL cooked value for `sig`. Used by
+   the comprehensive sweep to distinguish "rcms has a bug" from "lcms2 itself
+   rejects this (malformed) tag, so rcms is right to fail too". Returns 1 if the
+   profile opens AND cmsReadTag(sig) != NULL, else 0. */
+int rcms_oracle_tag_read_succeeds(const uint8_t* buf, uint32_t len, uint32_t sig) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    void* v = cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = (v != NULL);
+    cmsCloseProfile(p);
+    return ok;
+}

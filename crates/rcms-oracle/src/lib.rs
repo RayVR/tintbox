@@ -68,6 +68,7 @@ unsafe extern "C" {
     fn rcms_oracle_tag_count(buf: *const u8, len: u32) -> i32;
     fn rcms_oracle_tag_signature(buf: *const u8, len: u32, n: u32) -> u32;
     fn rcms_oracle_tag_true_type(buf: *const u8, len: u32, sig: u32) -> u32;
+    fn rcms_oracle_tag_read_succeeds(buf: *const u8, len: u32, sig: u32) -> i32;
     fn rcms_oracle_tetra16(
         grid: *const u32,
         n_out: u32,
@@ -1350,6 +1351,16 @@ pub fn tag_true_type(buf: &[u8], sig: u32) -> Option<u32> {
     } else {
         Some(t)
     }
+}
+
+/// Whether lcms2's `cmsReadTag(sig)` returns a non-NULL cooked value. `false`
+/// means lcms2 itself rejects the tag's contents (e.g. a malformed `mpet`),
+/// distinguishing "rcms bug" from "both stacks correctly reject this tag".
+pub fn tag_read_succeeds(buf: &[u8], sig: u32) -> bool {
+    // SAFETY: buf/len describe a valid readable slice C only reads; the profile
+    // and tag are opened/read/closed entirely inside the call.
+    let ok = unsafe { rcms_oracle_tag_read_succeeds(buf.as_ptr(), buf.len() as u32, sig) };
+    ok != 0
 }
 
 /// lcms2 `cmsReadTag` of an XYZType tag -> `[X,Y,Z]`, or `None` on failure.
