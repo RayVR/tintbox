@@ -7,6 +7,17 @@ unsafe extern "C" {
     fn rcms_oracle_log(x: f64) -> f64;
     fn rcms_oracle_log10(x: f64) -> f64;
     fn rcms_oracle_eval_parametric(ty: i32, params: *const f64, nparams: i32, x: f32) -> f32;
+    fn rcms_oracle_tabulated16_eval16(table: *const u16, n: u32, v: u16) -> u16;
+    fn rcms_oracle_tabulated16_eval_float(table: *const u16, n: u32, x: f32) -> f32;
+    fn rcms_oracle_tabulated_float_eval_float(table: *const f32, n: u32, x: f32) -> f32;
+    fn rcms_oracle_parametric_eval_float(ty: i32, params: *const f64, x: f32) -> f32;
+    fn rcms_oracle_parametric_table16(ty: i32, params: *const f64, out: *mut u16, cap: u32) -> i32;
+    fn rcms_oracle_tabulated_float_table16(
+        table: *const f32,
+        n_in: u32,
+        out: *mut u16,
+        cap: u32,
+    ) -> i32;
     fn rcms_oracle_double_to_s15f16(v: f64) -> i32;
     fn rcms_oracle_s15f16_to_double(a: i32) -> f64;
     fn rcms_oracle_double_to_8fixed8(v: f64) -> u16;
@@ -271,6 +282,92 @@ pub fn eval_parametric(ty: i32, params: &[f64], x: f32) -> Option<f32> {
         None
     } else {
         Some(y)
+    }
+}
+
+/// lcms2 `cmsBuildTabulatedToneCurve16` + `cmsEvalToneCurve16`: builds a 16-bit
+/// tabulated curve from `table` and evaluates it at `v`.
+pub fn tabulated16_eval16(table: &[u16], v: u16) -> u16 {
+    // SAFETY: `table` is a valid readable slice of `table.len()` u16s C only reads
+    // (copied into a curve handle built and freed inside the call).
+    unsafe { rcms_oracle_tabulated16_eval16(table.as_ptr(), table.len() as u32, v) }
+}
+
+/// lcms2 `cmsBuildTabulatedToneCurve16` + `cmsEvalToneCurveFloat` at `x`.
+pub fn tabulated16_eval_float(table: &[u16], x: f32) -> f32 {
+    // SAFETY: `table` is a valid readable slice C only reads; the curve handle is
+    // built and freed inside the call.
+    unsafe { rcms_oracle_tabulated16_eval_float(table.as_ptr(), table.len() as u32, x) }
+}
+
+/// lcms2 `cmsBuildTabulatedToneCurveFloat` + `cmsEvalToneCurveFloat` at `x`.
+/// Returns `None` when lcms2 rejects the table (empty), signalled as NaN.
+pub fn tabulated_float_eval_float(table: &[f32], x: f32) -> Option<f32> {
+    // SAFETY: `table` is a valid readable slice C only reads; the curve handle is
+    // built and freed inside the call.
+    let y =
+        unsafe { rcms_oracle_tabulated_float_eval_float(table.as_ptr(), table.len() as u32, x) };
+    if y.is_nan() {
+        None
+    } else {
+        Some(y)
+    }
+}
+
+/// lcms2 `cmsBuildParametricToneCurve` + `cmsEvalToneCurveFloat` at `x`. Returns
+/// `None` when lcms2 rejects the type/params (signalled as NaN).
+pub fn parametric_eval_float(ty: i32, params: &[f64], x: f32) -> Option<f32> {
+    // SAFETY: `params` is a valid readable slice; C reads exactly
+    // `ParameterCount[ty]` of them. The curve handle is built and freed inside.
+    let y = unsafe { rcms_oracle_parametric_eval_float(ty, params.as_ptr(), x) };
+    if y.is_nan() {
+        None
+    } else {
+        Some(y)
+    }
+}
+
+/// lcms2 `cmsBuildParametricToneCurve` + `cmsGetToneCurveEstimatedTable`: the
+/// materialised 16-bit approximation table, or `None` when lcms2 rejects the
+/// type/params.
+pub fn parametric_table16(ty: i32, params: &[f64]) -> Option<Vec<u16>> {
+    let cap = 4096usize; // lcms2's max grid points for a curve.
+    let mut out = vec![0u16; cap];
+    // SAFETY: `params` is a valid readable slice C reads `ParameterCount[ty]` of;
+    // `out` has `cap` u16 of room, which exceeds any table lcms2 materialises. C
+    // writes at most `cap` entries and returns the count, or -1 on reject.
+    let n = unsafe {
+        rcms_oracle_parametric_table16(ty, params.as_ptr(), out.as_mut_ptr(), cap as u32)
+    };
+    if n < 0 {
+        None
+    } else {
+        out.truncate(n as usize);
+        Some(out)
+    }
+}
+
+/// lcms2 `cmsBuildTabulatedToneCurveFloat` + `cmsGetToneCurveEstimatedTable`: the
+/// materialised 16-bit table, or `None` when lcms2 rejects the table.
+pub fn tabulated_float_table16(table: &[f32]) -> Option<Vec<u16>> {
+    let cap = 4096usize;
+    let mut out = vec![0u16; cap];
+    // SAFETY: `table` is a valid readable slice C only reads; `out` has `cap` u16,
+    // exceeding any table lcms2 materialises. C writes at most `cap` and returns
+    // the count, or -1 on reject.
+    let n = unsafe {
+        rcms_oracle_tabulated_float_table16(
+            table.as_ptr(),
+            table.len() as u32,
+            out.as_mut_ptr(),
+            cap as u32,
+        )
+    };
+    if n < 0 {
+        None
+    } else {
+        out.truncate(n as usize);
+        Some(out)
     }
 }
 

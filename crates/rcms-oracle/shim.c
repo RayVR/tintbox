@@ -31,6 +31,75 @@ float rcms_oracle_eval_parametric(int type, const double* params, int nparams, f
     return y;
 }
 
+/* ---- Tone-curve construction + evaluation (cmsgamma.c / cmsintrp.c) ---------
+   These build a curve from a caller-supplied table/params and evaluate it, so the
+   Rust side can diff cmsEvalToneCurve16 / cmsEvalToneCurveFloat and the
+   materialised Table16 bit-for-bit. */
+
+/* cmsBuildTabulatedToneCurve16 + cmsEvalToneCurve16 at v. */
+uint16_t rcms_oracle_tabulated16_eval16(const uint16_t* table, uint32_t n, uint16_t v) {
+    cmsToneCurve* c = cmsBuildTabulatedToneCurve16(NULL, n, table);
+    if (!c) return 0;
+    uint16_t out = cmsEvalToneCurve16(c, v);
+    cmsFreeToneCurve(c);
+    return out;
+}
+
+/* cmsBuildTabulatedToneCurve16 + cmsEvalToneCurveFloat at x. */
+float rcms_oracle_tabulated16_eval_float(const uint16_t* table, uint32_t n, float x) {
+    cmsToneCurve* c = cmsBuildTabulatedToneCurve16(NULL, n, table);
+    if (!c) return NAN;
+    float out = cmsEvalToneCurveFloat(c, x);
+    cmsFreeToneCurve(c);
+    return out;
+}
+
+/* cmsBuildTabulatedToneCurveFloat + cmsEvalToneCurveFloat at x. Returns NAN if
+   lcms2 rejects the table (n == 0). */
+float rcms_oracle_tabulated_float_eval_float(const float* table, uint32_t n, float x) {
+    cmsToneCurve* c = cmsBuildTabulatedToneCurveFloat(NULL, n, table);
+    if (!c) return NAN;
+    float out = cmsEvalToneCurveFloat(c, x);
+    cmsFreeToneCurve(c);
+    return out;
+}
+
+/* cmsBuildParametricToneCurve + cmsEvalToneCurveFloat at x. Returns NAN if lcms2
+   rejects the type/params. */
+float rcms_oracle_parametric_eval_float(int type, const double* params, float x) {
+    cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, type, params);
+    if (!c) return NAN;
+    float out = cmsEvalToneCurveFloat(c, x);
+    cmsFreeToneCurve(c);
+    return out;
+}
+
+/* Materialise the 16-bit approximation table of a cmsBuildParametricToneCurve
+   curve. Writes cmsGetToneCurveEstimatedTable into out (cap entries of room) and
+   returns the entry count, or -1 if lcms2 rejects the type/params. */
+int32_t rcms_oracle_parametric_table16(int type, const double* params, uint16_t* out, uint32_t cap) {
+    cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, type, params);
+    if (!c) return -1;
+    uint32_t n = cmsGetToneCurveEstimatedTableEntries(c);
+    const uint16_t* t = cmsGetToneCurveEstimatedTable(c);
+    if (n > cap) { cmsFreeToneCurve(c); return -1; }
+    for (uint32_t i = 0; i < n; i++) out[i] = t[i];
+    cmsFreeToneCurve(c);
+    return (int32_t) n;
+}
+
+/* Materialise the 16-bit table of a cmsBuildTabulatedToneCurveFloat curve. */
+int32_t rcms_oracle_tabulated_float_table16(const float* table, uint32_t n_in, uint16_t* out, uint32_t cap) {
+    cmsToneCurve* c = cmsBuildTabulatedToneCurveFloat(NULL, n_in, table);
+    if (!c) return -1;
+    uint32_t n = cmsGetToneCurveEstimatedTableEntries(c);
+    const uint16_t* t = cmsGetToneCurveEstimatedTable(c);
+    if (n > cap) { cmsFreeToneCurve(c); return -1; }
+    for (uint32_t i = 0; i < n; i++) out[i] = t[i];
+    cmsFreeToneCurve(c);
+    return (int32_t) n;
+}
+
 /* Fixed-point (cmsplugin.c:383). */
 int32_t rcms_oracle_double_to_s15f16(double v) { return (int32_t) _cmsDoubleTo15Fixed16(v); }
 
