@@ -6,6 +6,7 @@
 //! NOTE: modules are wired in incrementally as slice-1 tasks land, so the crate
 //! always compiles. The full module set / prelude is assembled by the final task.
 
+pub mod adapt;
 pub mod color;
 pub mod compat;
 pub mod context;

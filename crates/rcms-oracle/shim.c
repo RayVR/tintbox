@@ -126,6 +126,42 @@ int rcms_oracle_mat3_solve(double out[3], const double a[9], const double b[3]) 
     if (!_cmsMAT3solve(&X,&A,&B)) return 0; out[0]=X.n[0]; out[1]=X.n[1]; out[2]=X.n[2]; return 1;
 }
 
+/* White point from temperature (cmswtpnt.c). Writes [x,y,Y] into out; returns
+   1 on success (temp in [4000,25000]) or 0. */
+int rcms_oracle_white_point_from_temp(double out[3], double temp_k) {
+    cmsCIExyY wp;
+    if (!cmsWhitePointFromTemp(&wp, temp_k)) return 0;
+    out[0] = wp.x; out[1] = wp.y; out[2] = wp.Y;
+    return 1;
+}
+
+/* Bradford chromatic adaptation: adapt a color from SourceWhitePt to Illuminant
+   (cmsAdaptToIlluminant). All white points / value as [X,Y,Z]. Writes the
+   adapted [X,Y,Z] into out; returns 1 on success or 0 (singular adaptation). */
+int rcms_oracle_adapt_to_illuminant(double out[3], const double src_wp[3],
+                                    const double illuminant[3], const double value[3]) {
+    cmsCIEXYZ SrcWP, Ill, Val, Res;
+    SrcWP.X = src_wp[0]; SrcWP.Y = src_wp[1]; SrcWP.Z = src_wp[2];
+    Ill.X   = illuminant[0]; Ill.Y = illuminant[1]; Ill.Z = illuminant[2];
+    Val.X   = value[0]; Val.Y = value[1]; Val.Z = value[2];
+    if (!cmsAdaptToIlluminant(&Res, &SrcWP, &Ill, &Val)) return 0;
+    out[0] = Res.X; out[1] = Res.Y; out[2] = Res.Z;
+    return 1;
+}
+
+/* Bradford adaptation matrix (_cmsAdaptationMatrix, NULL cone -> Bradford).
+   from/to as [X,Y,Z]; writes the 9 matrix entries (row-major) into out.
+   Returns 1 on success or 0 (singular). _cmsAdaptationMatrix is internal but
+   exported (CMSCHECKPOINT) so it links here. */
+int rcms_oracle_adaptation_matrix(double out[9], const double from[3], const double to[3]) {
+    cmsMAT3 M; cmsCIEXYZ From, To;
+    From.X = from[0]; From.Y = from[1]; From.Z = from[2];
+    To.X   = to[0];   To.Y   = to[1];   To.Z   = to[2];
+    if (!_cmsAdaptationMatrix(&M, NULL, &From, &To)) return 0;
+    store_mat(out, &M);
+    return 1;
+}
+
 /* IEEE half<->float (cmshalf.c, table-based van der Zijp method). */
 float    rcms_oracle_half_to_float(uint16_t h) { return _cmsHalf2Float(h); }
 uint16_t rcms_oracle_float_to_half(float f)    { return _cmsFloat2Half(f); }

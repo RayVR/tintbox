@@ -30,6 +30,14 @@ unsafe extern "C" {
     fn rcms_oracle_mat3_per(out: *mut f64, a: *const f64, b: *const f64);
     fn rcms_oracle_mat3_inverse(out: *mut f64, a: *const f64) -> i32;
     fn rcms_oracle_mat3_solve(out: *mut f64, a: *const f64, b: *const f64) -> i32;
+    fn rcms_oracle_white_point_from_temp(out: *mut f64, temp_k: f64) -> i32;
+    fn rcms_oracle_adapt_to_illuminant(
+        out: *mut f64,
+        src_wp: *const f64,
+        illuminant: *const f64,
+        value: *const f64,
+    ) -> i32;
+    fn rcms_oracle_adaptation_matrix(out: *mut f64, from: *const f64, to: *const f64) -> i32;
     fn rcms_oracle_half_to_float(h: u16) -> f32;
     fn rcms_oracle_float_to_half(f: f32) -> u16;
     fn rcms_oracle_md5(out: *mut u8, buf: *const u8, len: u32);
@@ -412,6 +420,59 @@ pub fn mat3_solve(a: &[f64; 9], b: &[f64; 3]) -> Option<[f64; 3]> {
     // SAFETY: out/a/b are valid fixed-size local arrays; their pointers are valid for
     // the 9/3 doubles C reads. C writes 3 doubles to out only when it returns nonzero.
     let ok = unsafe { rcms_oracle_mat3_solve(out.as_mut_ptr(), a.as_ptr(), b.as_ptr()) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsWhitePointFromTemp`. Returns `Some([x, y, Y])` for a temperature in
+/// `[4000, 25000]`, else `None`.
+pub fn white_point_from_temp(temp_k: f64) -> Option<[f64; 3]> {
+    let mut out = [0.0f64; 3];
+    // SAFETY: out is a valid 3-double array C writes; temp_k is a plain scalar.
+    // C writes 3 doubles to out only when it returns nonzero.
+    let ok = unsafe { rcms_oracle_white_point_from_temp(out.as_mut_ptr(), temp_k) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsAdaptToIlluminant`. Adapts `value` (XYZ) from `src_wp` to
+/// `illuminant` via Bradford. Returns `None` on singular adaptation.
+pub fn adapt_to_illuminant(
+    src_wp: &[f64; 3],
+    illuminant: &[f64; 3],
+    value: &[f64; 3],
+) -> Option<[f64; 3]> {
+    let mut out = [0.0f64; 3];
+    // SAFETY: out/src_wp/illuminant/value are valid 3-double arrays C reads/writes.
+    // C writes 3 doubles to out only when it returns nonzero.
+    let ok = unsafe {
+        rcms_oracle_adapt_to_illuminant(
+            out.as_mut_ptr(),
+            src_wp.as_ptr(),
+            illuminant.as_ptr(),
+            value.as_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `_cmsAdaptationMatrix` with a NULL cone matrix (Bradford). Returns the
+/// 9 row-major matrix entries, or `None` on singular adaptation.
+pub fn adaptation_matrix(from: &[f64; 3], to: &[f64; 3]) -> Option<[f64; 9]> {
+    let mut out = [0.0f64; 9];
+    // SAFETY: out is a valid 9-double array C writes; from/to are valid 3-double
+    // arrays C reads. C writes 9 doubles to out only when it returns nonzero.
+    let ok = unsafe { rcms_oracle_adaptation_matrix(out.as_mut_ptr(), from.as_ptr(), to.as_ptr()) };
     if ok != 0 {
         Some(out)
     } else {
