@@ -3,6 +3,7 @@
 //! (`cmstypes.c`), but only the trivial types (slice-2 task 3) are wired up;
 //! every other (struct-shaped / deferred) type returns `Error::Unsupported`.
 
+pub mod structs;
 pub mod trivial;
 
 use crate::error::{Error, Result};
@@ -24,6 +25,12 @@ const T_DATETIME: u32 = 0x6474_696D; // 'dtim'
 const T_CHROMATICITY: u32 = 0x6368_726D; // 'chrm'
 const T_TEXT: u32 = 0x7465_7874; // 'text'
 const T_COLORANT_ORDER: u32 = 0x636C_726F; // 'clro'
+const T_MEASUREMENT: u32 = 0x6D65_6173; // 'meas'
+const T_VIEWING_CONDITIONS: u32 = 0x7669_6577; // 'view'
+const T_SCREENING: u32 = 0x7363_726E; // 'scrn'
+const T_CRD_INFO: u32 = 0x6372_6469; // 'crdi'
+const T_CICP: u32 = 0x6369_6370; // 'cicp'
+const T_COLORANT_TABLE: u32 = 0x636C_7274; // 'clrt'
 
 /// Decode the tag value for the on-disk `type_sig`. `r` is positioned at the
 /// start of the type payload (already past the 8-byte type base); `size` is the
@@ -42,6 +49,12 @@ pub fn read_tag_value<R: ProfileReader>(type_sig: Signature, r: &mut R, size: u3
         T_CHROMATICITY => trivial::read_chromaticity(r, size),
         T_TEXT => trivial::read_text(r, size),
         T_COLORANT_ORDER => trivial::read_colorant_order(r, size),
+        T_MEASUREMENT => structs::read_measurement(r, size),
+        T_VIEWING_CONDITIONS => structs::read_viewing_conditions(r, size),
+        T_SCREENING => structs::read_screening(r, size),
+        T_CRD_INFO => structs::read_crd_info(r, size),
+        T_CICP => structs::read_cicp(r, size),
+        T_COLORANT_TABLE => structs::read_colorant_table(r, size),
         _ => Err(Error::Unsupported("tag type deferred to a later slice")),
     }
 }

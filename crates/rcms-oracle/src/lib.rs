@@ -60,6 +60,13 @@ unsafe extern "C" {
         out: *mut u8,
         cap: u32,
     ) -> i32;
+    fn rcms_oracle_read_tag_measurement(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        out_u32: *mut u32,
+        out_f64: *mut f64,
+    ) -> i32;
 }
 
 /// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).
@@ -498,6 +505,30 @@ pub fn read_tag_colorant_order(buf: &[u8], sig: u32) -> Option<Vec<u8>> {
     if n >= 0 {
         out.truncate(n as usize);
         Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsReadTag` of a MeasurementType -> the `cmsICCMeasurementConditions`
+/// fields, returned as `([Observer, Geometry, IlluminantType], [Bx, By, Bz,
+/// Flare])`, or `None` if the tag is absent / unreadable.
+pub fn read_tag_measurement(buf: &[u8], sig: u32) -> Option<([u32; 3], [f64; 4])> {
+    let mut u = [0u32; 3];
+    let mut f = [0f64; 4];
+    // SAFETY: buf/len describe a valid readable slice; the out arrays have the
+    // exact lengths the C extractor writes (3 u32, 4 f64).
+    let ok = unsafe {
+        rcms_oracle_read_tag_measurement(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            u.as_mut_ptr(),
+            f.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some((u, f))
     } else {
         None
     }

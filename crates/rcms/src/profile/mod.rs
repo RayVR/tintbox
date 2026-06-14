@@ -177,7 +177,13 @@ fn elem_count(tag: &Tag) -> u32 {
         | Tag::DateTime(_)
         | Tag::Chromaticity(_)
         | Tag::Text(_)
-        | Tag::ColorantOrder(_) => 1,
+        | Tag::ColorantOrder(_)
+        | Tag::Measurement(_)
+        | Tag::ViewingConditions(_)
+        | Tag::Screening(_)
+        | Tag::CrdInfo(_)
+        | Tag::Cicp(_)
+        | Tag::ColorantTable(_) => 1,
     }
 }
 
@@ -514,6 +520,107 @@ mod tests {
             exercised.contains_key(&TY_XYZ),
             "expected at least one XYZ-typed tag exercised over the testbed"
         );
+    }
+
+    /// Differential: every testbed profile carrying a `'meas'` tag (the only
+    /// struct-shaped type in this task that has real testbed coverage —
+    /// test5.icc) must decode to the same `cmsICCMeasurementConditions` via rcms
+    /// `read_tag` as via lcms2 `cmsReadTag` (bit-exact for the f64 fields).
+    #[test]
+    fn measurement_tag_values_match_oracle_over_testbed() {
+        const TY_MEAS: u32 = 0x6D65_6173; // 'meas'
+        let mut checked = 0usize;
+        for path in testbed_icc() {
+            let bytes = fs::read(&path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+            if !rcms_oracle::open_succeeds(&bytes) {
+                continue;
+            }
+            let p = match Profile::open(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            for sig in p.tags().collect::<Vec<_>>() {
+                let raw = sig.to_raw();
+                if rcms_oracle::tag_true_type(&bytes, raw) != Some(TY_MEAS) {
+                    continue;
+                }
+                let (cu, cf) =
+                    rcms_oracle::read_tag_measurement(&bytes, raw).expect("oracle measurement");
+                match p.read_tag(sig).expect("rust measurement") {
+                    Tag::Measurement(m) => {
+                        assert_eq!(m.observer, cu[0], "{name}:{raw:08x} observer");
+                        assert_eq!(m.geometry, cu[1], "{name}:{raw:08x} geometry");
+                        assert_eq!(m.illuminant_type, cu[2], "{name}:{raw:08x} illuminant");
+                        rcms_oracle::assert_f64_bits_eq(m.backing.x, cf[0], (name.as_ref(), "bx"));
+                        rcms_oracle::assert_f64_bits_eq(m.backing.y, cf[1], (name.as_ref(), "by"));
+                        rcms_oracle::assert_f64_bits_eq(m.backing.z, cf[2], (name.as_ref(), "bz"));
+                        rcms_oracle::assert_f64_bits_eq(m.flare, cf[3], (name.as_ref(), "flare"));
+                    }
+                    other => panic!("{name}:{raw:08x} expected Measurement, got {other:?}"),
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "expected at least one 'meas' tag in the testbed"
+        );
+    }
+
+    /// Reachability: each struct-shaped type's on-disk signature now dispatches to
+    /// a reader (no longer `Error::Unsupported`). We feed a minimal valid payload
+    /// straight through `read_tag_value` and assert it does NOT return the
+    /// deferred-`Unsupported` sentinel. (Per-field correctness is covered by the
+    /// synthetic unit tests in `types::structs` and the `meas` differential above.)
+    #[test]
+    fn struct_types_now_dispatch() {
+        use crate::io::MemReader;
+        use crate::profile::types::read_tag_value;
+
+        // (type_sig, minimal valid payload bytes, expected SizeOfTag)
+        let meas = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&1u32.to_be_bytes()); // Observer
+            b.extend_from_slice(&[0u8; 12]); // Backing XYZ
+            b.extend_from_slice(&0u32.to_be_bytes()); // Geometry
+            b.extend_from_slice(&0u32.to_be_bytes()); // Flare
+            b.extend_from_slice(&0u32.to_be_bytes()); // IlluminantType
+            b
+        };
+        let view = vec![0u8; 28]; // 2 XYZ + u32
+        let scrn = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&0u32.to_be_bytes()); // Flag
+            b.extend_from_slice(&0u32.to_be_bytes()); // nChannels = 0
+            b
+        };
+        let crdi = {
+            let mut b = Vec::new();
+            for _ in 0..5 {
+                b.extend_from_slice(&0u32.to_be_bytes()); // five zero-length strings
+            }
+            b
+        };
+        let cicp = vec![1u8, 13, 0, 1];
+        let clrt = 0u32.to_be_bytes().to_vec(); // count = 0
+
+        for (ty, body) in [
+            (0x6D65_6173u32, meas), // 'meas'
+            (0x7669_6577, view),    // 'view'
+            (0x7363_726E, scrn),    // 'scrn'
+            (0x6372_6469, crdi),    // 'crdi'
+            (0x6369_6370, cicp),    // 'cicp'
+            (0x636C_7274, clrt),    // 'clrt'
+        ] {
+            let mut r = MemReader::new(&body);
+            let res = read_tag_value(Signature::from_raw(ty), &mut r, body.len() as u32);
+            assert!(
+                !matches!(res, Err(Error::Unsupported(_))),
+                "type {ty:08x} should dispatch, got {res:?}"
+            );
+            assert!(res.is_ok(), "type {ty:08x} should parse, got {res:?}");
+        }
     }
 
     /// A deferred-type tag (a TRC curve, on-disk type `'curv'`/`'para'`) must

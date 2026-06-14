@@ -42,4 +42,91 @@ pub enum Tag {
     /// `ColorantOrderType` (`'clro'`): the colorant laydown order, `Count` bytes.
     /// (`cmstypes.c:509`).
     ColorantOrder(Vec<u8>),
+    /// `cmsSigMeasurementType` (`'meas'`): a `cmsICCMeasurementConditions` struct.
+    /// (`cmstypes.c:1615`).
+    Measurement(Measurement),
+    /// `cmsSigViewingConditionsType` (`'view'`): a `cmsICCViewingConditions`
+    /// struct. (`cmstypes.c:4135`).
+    ViewingConditions(ViewingConditions),
+    /// `cmsSigScreeningType` (`'scrn'`): a `cmsScreening` struct (flag, channels).
+    /// (`cmstypes.c:4048`).
+    Screening(Screening),
+    /// `cmsSigCrdInfoType` (`'crdi'`): the PostScript CRD info — product name and
+    /// four rendering-intent CRD names, each a counted ASCII string.
+    /// (`cmstypes.c:3980`).
+    CrdInfo(CrdInfo),
+    /// `cmsSigcicpType` (`'cicp'`): a `cmsVideoSignalType` (ITU-T H.273 coding
+    /// parameters). (`cmstypes.c:5614`).
+    Cicp(Cicp),
+    /// `cmsSigColorantTableType` (`'clrt'`): a count-prefixed list of named
+    /// colorants, each a 32-byte name plus a 3×u16 PCS. (`cmstypes.c:3254`).
+    ColorantTable(Vec<ColorantTableEntry>),
+}
+
+/// `cmsICCMeasurementConditions` (`include/lcms2.h:1051`). `flare` is the
+/// s15Fixed16 `Flare` field decoded to f64 (lcms2 reads it via
+/// `_cmsRead15Fixed16Number`); the three `u32` fields are the raw wire values.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Measurement {
+    pub observer: u32,
+    pub backing: CIEXYZ,
+    pub geometry: u32,
+    pub flare: f64,
+    pub illuminant_type: u32,
+}
+
+/// `cmsICCViewingConditions` (`include/lcms2.h:1060`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewingConditions {
+    pub illuminant_xyz: CIEXYZ,
+    pub surround_xyz: CIEXYZ,
+    pub illuminant_type: u32,
+}
+
+/// One `cmsScreeningChannel` (`include/lcms2.h:1429`). `frequency` and
+/// `screen_angle` are s15Fixed16 decoded to f64 (lcms2 reads them via
+/// `_cmsRead15Fixed16Number`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScreeningChannel {
+    pub frequency: f64,
+    pub screen_angle: f64,
+    pub spot_shape: u32,
+}
+
+/// `cmsScreening` (`include/lcms2.h:1434`). lcms2 caps the channel count at
+/// `cmsMAXCHANNELS - 1` but keeps the original `n_channels`; we keep the cooked
+/// channel vector (already capped) and the (possibly larger) declared count.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Screening {
+    pub flag: u32,
+    pub n_channels: u32,
+    pub channels: Vec<ScreeningChannel>,
+}
+
+/// The five counted ASCII strings of `cmsSigCrdInfoType`: the PostScript product
+/// name and the rendering-intent 0..3 CRD names. lcms2 stores them in an MLU
+/// under the `PS`/`nm`,`#0`..`#3` keys; we keep them as plain byte strings (the
+/// counted bytes before the NUL the C appends), which is the comparable value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CrdInfo {
+    pub product_name: Vec<u8>,
+    pub crd_names: [Vec<u8>; 4],
+}
+
+/// `cmsVideoSignalType` (`include/lcms2.h:1067`): the four ITU-T H.273 bytes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cicp {
+    pub colour_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
+    pub video_full_range_flag: u8,
+}
+
+/// One colorant of `cmsSigColorantTableType`: a 32-byte ASCII name (NUL-trimmed)
+/// and the colorant's PCS as three u16. lcms2 stores these in a
+/// `cmsNAMEDCOLORLIST`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColorantTableEntry {
+    pub name: String,
+    pub pcs: [u16; 3],
 }

@@ -348,6 +348,30 @@ int rcms_oracle_read_tag_chromaticity(const uint8_t* buf, uint32_t len, uint32_t
     return ok;
 }
 
+/* MeasurementType -> cmsICCMeasurementConditions, flattened as
+   [Observer, Geometry, IlluminantType] (u32) + [Bx,By,Bz, Flare] (double).
+   Returns 1/0. */
+int rcms_oracle_read_tag_measurement(const uint8_t* buf, uint32_t len, uint32_t sig,
+                                     uint32_t out_u32[3], double out_f64[4]) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsICCMeasurementConditions* v =
+        (cmsICCMeasurementConditions*) cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = 0;
+    if (v) {
+        out_u32[0] = v->Observer;
+        out_u32[1] = v->Geometry;
+        out_u32[2] = v->IlluminantType;
+        out_f64[0] = v->Backing.X;
+        out_f64[1] = v->Backing.Y;
+        out_f64[2] = v->Backing.Z;
+        out_f64[3] = v->Flare;
+        ok = 1;
+    }
+    cmsCloseProfile(p);
+    return ok;
+}
+
 /* ColorantOrderType -> bytes (the laydown order). lcms2 stores a cmsMAXCHANNELS
    array padded with 0xFF; the meaningful Count is the leading run of non-0xFF
    entries, but to compare against rcms we return exactly the count the on-disk
