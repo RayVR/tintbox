@@ -106,8 +106,8 @@ mod tests {
             ];
             let r = Mat3(m).eval(Vec3(v));
             let c = rcms_oracle::mat3_eval(&m, &v);
-            for i in 0..3 {
-                rcms_oracle::assert_f64_bits_eq(r.0[i], c[i], (i, m, v));
+            for (i, (&rv, &cv)) in r.0.iter().zip(c.iter()).enumerate() {
+                rcms_oracle::assert_f64_bits_eq(rv, cv, (i, m, v));
             }
         }
     }
@@ -118,8 +118,8 @@ mod tests {
             let (a, b) = (rand_mat(&mut rng), rand_mat(&mut rng));
             let r = Mat3(a).per(&Mat3(b));
             let c = rcms_oracle::mat3_per(&a, &b);
-            for i in 0..9 {
-                rcms_oracle::assert_f64_bits_eq(r.0[i], c[i], (i, a, b));
+            for (i, (&rv, &cv)) in r.0.iter().zip(c.iter()).enumerate() {
+                rcms_oracle::assert_f64_bits_eq(rv, cv, (i, a, b));
             }
         }
     }
@@ -131,8 +131,8 @@ mod tests {
             let a = rand_mat(&mut rng);
             match (Mat3(a).inverse(), rcms_oracle::mat3_inverse(&a)) {
                 (Some(r), Some(c)) => {
-                    for i in 0..9 {
-                        rcms_oracle::assert_f64_bits_eq(r.0[i], c[i], (i, a));
+                    for (i, (&rv, &cv)) in r.0.iter().zip(c.iter()).enumerate() {
+                        rcms_oracle::assert_f64_bits_eq(rv, cv, (i, a));
                     }
                     tested += 1;
                 }
@@ -159,8 +159,8 @@ mod tests {
             ];
             match (Mat3(a).solve(Vec3(b)), rcms_oracle::mat3_solve(&a, &b)) {
                 (Some(r), Some(c)) => {
-                    for i in 0..3 {
-                        rcms_oracle::assert_f64_bits_eq(r.0[i], c[i], (i, a, b));
+                    for (i, (&rv, &cv)) in r.0.iter().zip(c.iter()).enumerate() {
+                        rcms_oracle::assert_f64_bits_eq(rv, cv, (i, a, b));
                     }
                     tested += 1;
                 }
