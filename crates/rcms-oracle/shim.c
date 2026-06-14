@@ -924,3 +924,385 @@ int rcms_oracle_read_tag_ucrbg(const uint8_t* buf, uint32_t len, uint32_t sig,
     cmsCloseProfile(p);
     return 1;
 }
+
+/* ---- 3D CLUT tetrahedral interpolation (cmsintrp.c TetrahedralInterp16/Float) -
+   Build a single granular CLUT stage with the given per-axis grid points (3 axes)
+   and nOut output channels from the caller's table, wrap it in a 3->nOut pipeline,
+   and evaluate one input vector through it. For a 3-input non-trilinear CLUT this
+   routes through TetrahedralInterp16 / TetrahedralInterpFloat (lcms2's default).
+   The grid is the per-axis sample count (nSamples[0..3]); table is laid out
+   row-major with nOut output channels per node, matching lcms2's CLUT layout.
+   Returns 1 on success, 0 if allocation fails. */
+int rcms_oracle_tetra16(const uint32_t* grid /*3*/, uint32_t nOut,
+                        const uint16_t* table, uint32_t tableLen,
+                        const uint16_t* in /*3*/, uint16_t* out /*nOut*/) {
+    (void) tableLen;
+    cmsStage* stage = cmsStageAllocCLut16bitGranular(NULL, grid, 3, nOut, table);
+    if (!stage) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, 3, nOut);
+    if (!lut) { cmsStageFree(stage); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, stage)) {
+        cmsStageFree(stage);
+        cmsPipelineFree(lut);
+        return 0;
+    }
+    cmsPipelineEval16(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+int rcms_oracle_tetra_float(const uint32_t* grid /*3*/, uint32_t nOut,
+                            const float* table, uint32_t tableLen,
+                            const float* in /*3*/, float* out /*nOut*/) {
+    (void) tableLen;
+    cmsStage* stage = cmsStageAllocCLutFloatGranular(NULL, grid, 3, nOut, table);
+    if (!stage) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, 3, nOut);
+    if (!lut) { cmsStageFree(stage); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, stage)) {
+        cmsStageFree(stage);
+        cmsPipelineFree(lut);
+        return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+/* ---- Generic n-D CLUT interpolation via _cmsComputeInterpParamsEx -----------
+   Drive lcms2's interpolation directly: build a cmsInterpParams from the caller's
+   per-axis grid, nIn/nOut, table, and flags, then invoke the function pointer
+   DefaultInterpolatorsFactory selected (p->Interpolation.Lerp16/LerpFloat). This
+   exercises BilinearInterp16/Float, TrilinearInterp16/Float, Eval4..Eval15, and —
+   critically — lets us force CMS_LERP_FLAGS_TRILINEAR for the 3-input path, which
+   the cmsStageAllocCLut* path never sets (it hardcodes CMS_LERP_FLAGS_16BITS).
+   `dwFlags` is the raw flag word (callers OR in CMS_LERP_FLAGS_FLOAT/TRILINEAR).
+   Returns 1 on success, 0 if param computation fails. */
+int rcms_oracle_interp16(const uint32_t* grid, uint32_t nIn, uint32_t nOut,
+                         const uint16_t* table, uint32_t dwFlags,
+                         const uint16_t* in, uint16_t* out) {
+    cmsInterpParams* p = _cmsComputeInterpParamsEx(NULL, grid, nIn, nOut,
+                                                   table, dwFlags);
+    if (!p) return 0;
+    p->Interpolation.Lerp16(in, out, p);
+    _cmsFreeInterpParams(p);
+    return 1;
+}
+
+int rcms_oracle_interp_float(const uint32_t* grid, uint32_t nIn, uint32_t nOut,
+                             const float* table, uint32_t dwFlags,
+                             const float* in, float* out) {
+    cmsInterpParams* p = _cmsComputeInterpParamsEx(NULL, grid, nIn, nOut,
+                                                   table, dwFlags | CMS_LERP_FLAGS_FLOAT);
+    if (!p) return 0;
+    p->Interpolation.LerpFloat(in, out, p);
+    _cmsFreeInterpParams(p);
+    return 1;
+}
+
+/* ---- Pipeline (cmsPipeline) differential shims (slice 4 task 2) -------------
+   Build real lcms2 pipelines from a Matrix stage (cmsStageAllocMatrix) and/or a
+   ToneCurves stage (cmsStageAllocToneCurves over cmsBuildTabulatedToneCurve16),
+   then evaluate via cmsPipelineEval16 / cmsPipelineEvalFloat. These exercise the
+   exact _LUTeval16 / _LUTevalFloat ping-pong walk and the From16ToFloat /
+   FromFloatTo16 boundary conversions we reimplement in rcms::pipeline. */
+
+/* Matrix-only pipeline. `matrix` is row-major Rows*Cols f64; `offset` is Rows
+   f64 or NULL. in/out are 16-bit, widths Cols/Rows. */
+int rcms_oracle_pipeline_matrix_eval16(uint32_t rows, uint32_t cols,
+                                       const double* matrix, const double* offset,
+                                       const uint16_t* in, uint16_t* out) {
+    cmsStage* st = cmsStageAllocMatrix(NULL, rows, cols, matrix, offset);
+    if (!st) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, cols, rows);
+    if (!lut) { cmsStageFree(st); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, st)) {
+        cmsStageFree(st); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEval16(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+int rcms_oracle_pipeline_matrix_eval_float(uint32_t rows, uint32_t cols,
+                                           const double* matrix, const double* offset,
+                                           const float* in, float* out) {
+    cmsStage* st = cmsStageAllocMatrix(NULL, rows, cols, matrix, offset);
+    if (!st) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, cols, rows);
+    if (!lut) { cmsStageFree(st); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, st)) {
+        cmsStageFree(st); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+/* Build a ToneCurves stage from `nCurves` 16-bit tabulated tables, each of
+   length `tblLen`, packed contiguously in `tables`. Returns the stage or NULL. */
+static cmsStage* build_curves_stage(uint32_t nCurves, uint32_t tblLen,
+                                    const uint16_t* tables) {
+    cmsToneCurve** curves = (cmsToneCurve**) calloc(nCurves, sizeof(cmsToneCurve*));
+    if (!curves) return NULL;
+    for (uint32_t i = 0; i < nCurves; i++) {
+        curves[i] = cmsBuildTabulatedToneCurve16(NULL, tblLen, tables + (size_t)i * tblLen);
+        if (!curves[i]) {
+            for (uint32_t k = 0; k < i; k++) cmsFreeToneCurve(curves[k]);
+            free(curves);
+            return NULL;
+        }
+    }
+    cmsStage* st = cmsStageAllocToneCurves(NULL, nCurves, curves);
+    /* cmsStageAllocToneCurves dups each curve, so free our originals. */
+    for (uint32_t i = 0; i < nCurves; i++) cmsFreeToneCurve(curves[i]);
+    free(curves);
+    return st;
+}
+
+/* ToneCurves-only pipeline (nCurves channels in == out). */
+int rcms_oracle_pipeline_curves_eval16(uint32_t nCurves, uint32_t tblLen,
+                                       const uint16_t* tables,
+                                       const uint16_t* in, uint16_t* out) {
+    cmsStage* st = build_curves_stage(nCurves, tblLen, tables);
+    if (!st) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nCurves, nCurves);
+    if (!lut) { cmsStageFree(st); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, st)) {
+        cmsStageFree(st); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEval16(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+int rcms_oracle_pipeline_curves_eval_float(uint32_t nCurves, uint32_t tblLen,
+                                           const uint16_t* tables,
+                                           const float* in, float* out) {
+    cmsStage* st = build_curves_stage(nCurves, tblLen, tables);
+    if (!st) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nCurves, nCurves);
+    if (!lut) { cmsStageFree(st); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, st)) {
+        cmsStageFree(st); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+/* Combined curves -> matrix pipeline. The curves stage has `nCurves` channels
+   (== matrix Cols); the matrix maps Cols -> Rows. in width = nCurves(=cols),
+   out width = rows. */
+int rcms_oracle_pipeline_curves_matrix_eval16(uint32_t nCurves, uint32_t tblLen,
+                                              const uint16_t* tables,
+                                              uint32_t rows, uint32_t cols,
+                                              const double* matrix, const double* offset,
+                                              const uint16_t* in, uint16_t* out) {
+    cmsStage* curves = build_curves_stage(nCurves, tblLen, tables);
+    if (!curves) return 0;
+    cmsStage* mat = cmsStageAllocMatrix(NULL, rows, cols, matrix, offset);
+    if (!mat) { cmsStageFree(curves); return 0; }
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nCurves, rows);
+    if (!lut) { cmsStageFree(curves); cmsStageFree(mat); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, curves)) {
+        cmsStageFree(curves); cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, mat)) {
+        cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEval16(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+int rcms_oracle_pipeline_curves_matrix_eval_float(uint32_t nCurves, uint32_t tblLen,
+                                                  const uint16_t* tables,
+                                                  uint32_t rows, uint32_t cols,
+                                                  const double* matrix, const double* offset,
+                                                  const float* in, float* out) {
+    cmsStage* curves = build_curves_stage(nCurves, tblLen, tables);
+    if (!curves) return 0;
+    cmsStage* mat = cmsStageAllocMatrix(NULL, rows, cols, matrix, offset);
+    if (!mat) { cmsStageFree(curves); return 0; }
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nCurves, rows);
+    if (!lut) { cmsStageFree(curves); cmsStageFree(mat); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, curves)) {
+        cmsStageFree(curves); cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, mat)) {
+        cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+/* ---- CLUT stage float-domain eval (slice 4 task 3) -------------------------
+   Build a single CLUT stage (16-bit or float, n-D granular) wrapped in a
+   1-stage nIn->nOut pipeline, and evaluate one input vector via
+   cmsPipelineEvalFloat. A 16-bit CLUT therefore exercises EvaluateCLUTfloatIn16
+   (FromFloatTo16 -> Lerp16 -> From16ToFloat); a float CLUT exercises
+   EvaluateCLUTfloat (direct LerpFloat). `grid` is the per-axis sample count
+   (nIn entries); `table` is row-major with nOut values per node. */
+int rcms_oracle_clut_stage_eval16(const uint32_t* grid, uint32_t nIn, uint32_t nOut,
+                                  const uint16_t* table,
+                                  const float* in, float* out) {
+    cmsStage* stage = cmsStageAllocCLut16bitGranular(NULL, grid, nIn, nOut, table);
+    if (!stage) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nIn, nOut);
+    if (!lut) { cmsStageFree(stage); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, stage)) {
+        cmsStageFree(stage); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+int rcms_oracle_clut_stage_eval_float(const uint32_t* grid, uint32_t nIn, uint32_t nOut,
+                                      const float* table,
+                                      const float* in, float* out) {
+    cmsStage* stage = cmsStageAllocCLutFloatGranular(NULL, grid, nIn, nOut, table);
+    if (!stage) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nIn, nOut);
+    if (!lut) { cmsStageFree(stage); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, stage)) {
+        cmsStageFree(stage); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+/* ---- Lab/XYZ conversion stage evals (slice 4 task 3) -----------------------
+   Each builds the corresponding lcms2 stage (_cmsStageAllocLab2XYZ etc.) in a
+   1-stage 3->3 pipeline and evaluates a 3-float input via cmsPipelineEvalFloat.
+   `which`: 0 = Lab2XYZ, 1 = XYZ2Lab, 2 = LabV2ToV4 (matrix form),
+   3 = LabV4ToV2 (matrix form). Returns 0 on alloc failure or bad `which`. */
+int rcms_oracle_labxyz_stage_eval(uint32_t which, const float* in, float* out) {
+    cmsStage* stage = NULL;
+    switch (which) {
+        case 0: stage = _cmsStageAllocLab2XYZ(NULL); break;
+        case 1: stage = _cmsStageAllocXYZ2Lab(NULL); break;
+        case 2: stage = _cmsStageAllocLabV2ToV4(NULL); break;
+        case 3: stage = _cmsStageAllocLabV4ToV2(NULL); break;
+        default: return 0;
+    }
+    if (!stage) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, 3, 3);
+    if (!lut) { cmsStageFree(stage); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, stage)) {
+        cmsStageFree(stage); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+/* ---- Combined CLUT -> curves -> matrix pipeline (slice 4 task 3) -----------
+   A 3-input CLUT stage (16-bit, `grid`/`clutTable`, nOut output channels),
+   feeding an nOut-channel ToneCurves stage (16-bit tabulated tables, each
+   tblLen long), feeding a rows x nOut matrix (+ optional offset). Evaluated via
+   cmsPipelineEvalFloat. Exercises a CLUT stage chained with curves and matrix.
+   nOut must equal both the curve count and the matrix cols. */
+int rcms_oracle_pipeline_clut_curves_matrix_eval_float(
+        const uint32_t* grid, uint32_t nIn, uint32_t nOut,
+        const uint16_t* clutTable,
+        uint32_t tblLen, const uint16_t* curveTables,
+        uint32_t rows, const double* matrix, const double* offset,
+        const float* in, float* out) {
+    cmsStage* clut = cmsStageAllocCLut16bitGranular(NULL, grid, nIn, nOut, clutTable);
+    if (!clut) return 0;
+    cmsStage* curves = build_curves_stage(nOut, tblLen, curveTables);
+    if (!curves) { cmsStageFree(clut); return 0; }
+    cmsStage* mat = cmsStageAllocMatrix(NULL, rows, nOut, matrix, offset);
+    if (!mat) { cmsStageFree(clut); cmsStageFree(curves); return 0; }
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nIn, rows);
+    if (!lut) { cmsStageFree(clut); cmsStageFree(curves); cmsStageFree(mat); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, clut)) {
+        cmsStageFree(clut); cmsStageFree(curves); cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, curves)) {
+        cmsStageFree(curves); cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, mat)) {
+        cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+/* ---- LUT8 / LUT16 tag readers (Type_LUT8_Read / Type_LUT16_Read) -----------
+   cmsReadTag of an mft1/mft2 tag returns a cmsPipeline*. These extractors let
+   the differential test build the SAME pipeline lcms2 builds and evaluate input
+   grids through it, to diff against the rcms Pipeline bit-for-bit. */
+
+/* Report the input/output channel counts of the pipeline lcms2 builds for the
+   given mft1/mft2 tag. Returns 1 on success (writes *nIn/*nOut), 0 if the
+   profile cannot be opened or the tag is absent / not pipeline-backed. */
+int rcms_oracle_lut_channels(const uint8_t* buf, uint32_t len, uint32_t sig,
+                             uint32_t* nIn, uint32_t* nOut) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsPipeline* lut = (cmsPipeline*) cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = 0;
+    if (lut) {
+        *nIn = cmsPipelineInputChannels(lut);
+        *nOut = cmsPipelineOutputChannels(lut);
+        ok = 1;
+    }
+    cmsCloseProfile(p);
+    return ok;
+}
+
+/* Evaluate `nSamples` input vectors through lcms2's pipeline for the mft1/mft2
+   tag, in the 16-bit domain (cmsPipelineEval16). `inputs` is `nSamples * nIn`
+   u16 row-major; `out` receives `nSamples * nOut` u16 row-major. Returns 1 on
+   success, 0 otherwise. The pipeline is owned by the profile (freed on close). */
+int rcms_oracle_lut_eval16(const uint8_t* buf, uint32_t len, uint32_t sig,
+                           const uint16_t* inputs, uint32_t nSamples,
+                           uint16_t* out) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsPipeline* lut = (cmsPipeline*) cmsReadTag(p, (cmsTagSignature) sig);
+    if (!lut) { cmsCloseProfile(p); return 0; }
+    uint32_t nIn = cmsPipelineInputChannels(lut);
+    uint32_t nOut = cmsPipelineOutputChannels(lut);
+    for (uint32_t s = 0; s < nSamples; s++) {
+        cmsPipelineEval16(inputs + (size_t) s * nIn, out + (size_t) s * nOut, lut);
+    }
+    cmsCloseProfile(p);
+    return 1;
+}
+
+/* Float counterpart of rcms_oracle_lut_eval16 via cmsPipelineEvalFloat. */
+int rcms_oracle_lut_eval_float(const uint8_t* buf, uint32_t len, uint32_t sig,
+                               const float* inputs, uint32_t nSamples,
+                               float* out) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsPipeline* lut = (cmsPipeline*) cmsReadTag(p, (cmsTagSignature) sig);
+    if (!lut) { cmsCloseProfile(p); return 0; }
+    uint32_t nIn = cmsPipelineInputChannels(lut);
+    uint32_t nOut = cmsPipelineOutputChannels(lut);
+    for (uint32_t s = 0; s < nSamples; s++) {
+        cmsPipelineEvalFloat(inputs + (size_t) s * nIn, out + (size_t) s * nOut, lut);
+    }
+    cmsCloseProfile(p);
+    return 1;
+}
+
+/* Whether lcms2's cmsReadTag returns a non-NULL cooked value for `sig`. Used by
+   the comprehensive sweep to distinguish "rcms has a bug" from "lcms2 itself
+   rejects this (malformed) tag, so rcms is right to fail too". Returns 1 if the
+   profile opens AND cmsReadTag(sig) != NULL, else 0. */
+int rcms_oracle_tag_read_succeeds(const uint8_t* buf, uint32_t len, uint32_t sig) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    void* v = cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = (v != NULL);
+    cmsCloseProfile(p);
+    return ok;
+}

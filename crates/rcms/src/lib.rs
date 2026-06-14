@@ -13,9 +13,11 @@ pub mod context;
 pub mod curve;
 pub mod error;
 pub mod fixed;
+pub mod interp;
 pub mod io;
 pub mod math;
 pub mod pcs;
+pub mod pipeline;
 pub mod profile;
 pub mod sig;
 
@@ -32,6 +34,7 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::fixed::{Half, S15Fixed16, U16Fixed16, U8Fixed8};
     pub use crate::io::{ProfileReader, ProfileWriter};
+    pub use crate::pipeline::{Pipeline, Stage};
     pub use crate::profile::{Header, Profile, Tag};
     pub use crate::sig::Signature;
 }

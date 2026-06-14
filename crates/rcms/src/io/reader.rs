@@ -43,6 +43,14 @@ pub trait ProfileReader {
         Ok(u64::from_be_bytes(b))
     }
 
+    /// Read a big-endian IEEE-754 single-precision float (lcms2
+    /// `_cmsReadFloat32Number`, cmsplugin.c): read the 32-bit big-endian word and
+    /// reinterpret its bits as an `f32`. The float32 wire layout is big-endian,
+    /// matching every other ICC scalar.
+    fn read_f32(&mut self) -> Result<f32> {
+        Ok(f32::from_bits(self.read_u32()?))
+    }
+
     fn read_i8(&mut self) -> Result<i8> {
         let mut b = [0u8; 1];
         self.read_exact(&mut b)?;

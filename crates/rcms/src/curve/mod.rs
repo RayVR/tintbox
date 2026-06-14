@@ -198,6 +198,35 @@ pub fn build_segmented(segments: Vec<CurveSegment>) -> ToneCurve {
     curve
 }
 
+/// Build a segmented curve from MPE-decoded segments, applying lcms2's
+/// `ReadSegmentedCurve` post-build fix-up (cmstypes.c:4317-4332).
+///
+/// lcms2 builds the curve via `cmsBuildSegmentedToneCurve` (which materialises
+/// the 16-bit table) and THEN, for every *sampled* segment (`seg_type == 0`),
+/// overwrites the implicit first sample point with
+/// `cmsEvalToneCurveFloat(Curve, x0)`. The first point is implicit in the ICC
+/// wire format (lcms2 allocates an extra slot, leaves it `0`, then fills it
+/// here). The table is built BEFORE the fix-up, so the fix-up affects only later
+/// float-domain evaluation of those sampled segments — match that ordering.
+pub fn build_mpe_segmented(segments: Vec<CurveSegment>) -> ToneCurve {
+    let mut curve = build_segmented(segments);
+
+    // Fix-up implicit points: SampledPoints[0] = EvalSegmentedFn(x0) for each
+    // sampled segment, exactly as the C does after building the table.
+    let n = curve.segments.len();
+    for i in 0..n {
+        if curve.segments[i].seg_type == 0 {
+            let x0 = curve.segments[i].x0 as f64;
+            let v = curve.eval_segmented(x0);
+            if !curve.segments[i].sampled.is_empty() {
+                curve.segments[i].sampled[0] = v as f32;
+            }
+        }
+    }
+
+    curve
+}
+
 impl ToneCurve {
     /// lcms2 `EvalSegmentedFn` (cmsgamma.c:722-765): evaluate the floating-point
     /// segmented description at `r`. Segments are scanned BACKWARDS; the first

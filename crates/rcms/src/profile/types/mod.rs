@@ -4,7 +4,9 @@
 //! every other (struct-shaped / deferred) type returns `Error::Unsupported`.
 
 pub mod curve;
+pub mod lut;
 pub mod mlu;
+pub mod mpe;
 pub mod named;
 pub mod structs;
 pub mod trivial;
@@ -44,6 +46,11 @@ const T_CURVE: u32 = 0x6375_7276; // 'curv'
 const T_PARAMETRIC_CURVE: u32 = 0x7061_7261; // 'para'
 const T_VCGT: u32 = 0x7663_6774; // 'vcgt'
 const T_UCRBG: u32 = 0x6266_6420; // 'bfd '
+const T_LUT8: u32 = 0x6D66_7431; // 'mft1'
+const T_LUT16: u32 = 0x6D66_7432; // 'mft2'
+const T_LUT_A2B: u32 = 0x6D41_4220; // 'mAB '
+const T_LUT_B2A: u32 = 0x6D42_4120; // 'mBA '
+const T_MPE: u32 = 0x6D70_6574; // 'mpet' MultiProcessElement
 
 /// Decode the tag value for the on-disk `type_sig`. `r` is positioned at the
 /// start of the type payload (already past the 8-byte type base); `size` is the
@@ -78,6 +85,11 @@ pub fn read_tag_value<R: ProfileReader>(type_sig: Signature, r: &mut R, size: u3
         T_PARAMETRIC_CURVE => curve::read_parametric_curve(r, size),
         T_VCGT => curve::read_vcgt(r, size),
         T_UCRBG => curve::read_ucrbg(r, size),
+        T_LUT8 => lut::read_lut8(r, size),
+        T_LUT16 => lut::read_lut16(r, size),
+        T_LUT_A2B => lut::read_lut_a2b(r, size),
+        T_LUT_B2A => lut::read_lut_b2a(r, size),
+        T_MPE => mpe::read_mpe(r, size),
         _ => Err(Error::Unsupported("tag type deferred to a later slice")),
     }
 }
