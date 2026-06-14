@@ -124,3 +124,57 @@ int rcms_oracle_read_alignment(const uint8_t* buf, uint32_t len, uint32_t offset
     cmsCloseIOhandler(io);
     return ok;
 }
+
+/* ICC header getters (cmsio0.c). Open the profile from memory, read its header
+   via the public cmsGetHeader* accessors, fill a flat struct, then close it.
+   Returns 1 if cmsOpenProfileFromMem succeeded (and *opened set to 1), else 0.
+   When open fails, only `opened` is meaningful (0); the other fields are
+   left as whatever the caller zeroed them to. This lets the differential test
+   compare the "does lcms2 accept this profile?" decision as well as the field
+   values for accepted profiles. */
+typedef struct {
+    uint32_t device_class;
+    uint32_t color_space;
+    uint32_t pcs;
+    uint32_t version;          /* cmsGetEncodedICCversion */
+    uint32_t rendering_intent;
+    uint32_t flags;
+    uint32_t manufacturer;
+    uint32_t model;
+    uint32_t creator;
+    uint64_t attributes;
+    uint8_t  profile_id[16];
+} rcms_oracle_header;
+
+/* Drive lcms2's header acceptance in isolation from the tag directory. We feed
+   the profile's first 128 header bytes followed by a zero tag count, so
+   _cmsReadHeader (which is invoked by cmsOpenProfileFromMem) runs its header
+   validation (magic, _validatedVersion, version > 0x5000000, validDeviceClass)
+   and then its tag-directory loop with TagCount == 0, which trivially succeeds.
+   This isolates the *header-level* accept/reject decision: a profile whose
+   header is well-formed but whose real tag directory is malformed (e.g. a
+   truncated file) is still "header-accepted" here, matching what a header-only
+   parser produces. Returns 1 (header accepted, fields written) or 0 (rejected).
+   `len` must be >= 128. */
+int rcms_oracle_read_header(const uint8_t* buf, uint32_t len, rcms_oracle_header* out) {
+    if (len < 128) return 0;
+    uint8_t hdr[132];
+    for (int i = 0; i < 128; i++) hdr[i] = buf[i];
+    hdr[128] = hdr[129] = hdr[130] = hdr[131] = 0; /* TagCount = 0 */
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)hdr, 132);
+    if (!p) return 0;
+    out->device_class     = (uint32_t) cmsGetDeviceClass(p);
+    out->color_space      = (uint32_t) cmsGetColorSpace(p);
+    out->pcs              = (uint32_t) cmsGetPCS(p);
+    out->version          = cmsGetEncodedICCversion(p);
+    out->rendering_intent = cmsGetHeaderRenderingIntent(p);
+    out->flags            = cmsGetHeaderFlags(p);
+    out->manufacturer     = cmsGetHeaderManufacturer(p);
+    out->model            = cmsGetHeaderModel(p);
+    out->creator          = cmsGetHeaderCreator(p);
+    cmsUInt64Number attr; cmsGetHeaderAttributes(p, &attr);
+    out->attributes       = (uint64_t) attr;
+    cmsGetHeaderProfileID(p, out->profile_id);
+    cmsCloseProfile(p);
+    return 1;
+}

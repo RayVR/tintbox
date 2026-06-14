@@ -27,6 +27,44 @@ unsafe extern "C" {
     fn rcms_oracle_read_type_base(buf: *const u8, len: u32, out: *mut u32) -> i32;
     fn rcms_oracle_read_alignment(buf: *const u8, len: u32, offset: u32, out_tell: *mut u32)
         -> i32;
+    fn rcms_oracle_read_header(buf: *const u8, len: u32, out: *mut OracleHeader) -> i32;
+}
+
+/// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).
+/// `#[repr(C)]` so the C struct and this agree on layout for the FFI write.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OracleHeader {
+    pub device_class: u32,
+    pub color_space: u32,
+    pub pcs: u32,
+    pub version: u32,
+    pub rendering_intent: u32,
+    pub flags: u32,
+    pub manufacturer: u32,
+    pub model: u32,
+    pub creator: u32,
+    pub attributes: u64,
+    pub profile_id: [u8; 16],
+}
+
+/// lcms2 `cmsOpenProfileFromMem` + the `cmsGetHeader*` accessors. Returns the
+/// header fields lcms2 exposes for an accepted profile, or `None` when lcms2
+/// rejects the profile (so the differential test can compare the accept/reject
+/// decision itself, not just field values).
+pub fn read_header(buf: &[u8]) -> Option<OracleHeader> {
+    let mut out = OracleHeader::default();
+    // SAFETY: buf/len describe a valid readable slice that C only reads (it copies
+    // it into an in-memory profile). `out` is a valid, properly-aligned
+    // `OracleHeader` whose layout matches the C `rcms_oracle_header` (both repr(C),
+    // same field order). C writes every field only when it returns nonzero. The
+    // profile handle is opened and closed entirely inside the C call.
+    let ok = unsafe { rcms_oracle_read_header(buf.as_ptr(), buf.len() as u32, &mut out) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// lcms2 `_cmsDoubleTo15Fixed16`.
