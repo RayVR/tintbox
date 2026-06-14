@@ -11,15 +11,36 @@
 //!   same grid/output sweep with random f32 tables and inputs.
 
 use rcms::interp::{
-    bilinear_16, bilinear_float, eval_n_inputs, eval_n_inputs_float, interp_factory,
-    tetrahedral_16, tetrahedral_float, trilinear_16, trilinear_float, Interp16, InterpFloat,
-    InterpFn, InterpParams,
+    bilinear_16, bilinear_float, eval_1_input, eval_1_input_float, eval_n_inputs,
+    eval_n_inputs_float, interp_factory, tetrahedral_16, tetrahedral_float, trilinear_16,
+    trilinear_float, Interp16, InterpFloat, InterpFn, InterpParams,
 };
 use rcms_oracle::{Rng, CMS_LERP_FLAGS_TRILINEAR};
 
 /// Number of nodes in a 3D grid with the given per-axis sample counts.
 fn n_nodes(grid: &[u32; 3]) -> usize {
     grid[0] as usize * grid[1] as usize * grid[2] as usize
+}
+
+/// Test-local mirror of `interp::fclamp` (cmsintrp.c `fclamp`): clamp to `[0,1]`,
+/// mapping NaN and `< 1e-9` to 0. Used only to identify the OOB band the float
+/// interpolators must skip.
+fn fclamp_ref(v: f32) -> f32 {
+    if v.is_nan() || v < 1e-9 {
+        0.0
+    } else if v > 1.0 {
+        1.0
+    } else {
+        v
+    }
+}
+
+/// Test-local mirror of `interp::quick_floor` (lcms2 `_cmsQuickFloor`): the
+/// magic-number truncating floor. Used only to detect the near-1.0 boundary band.
+fn quick_floor_ref(val: f32) -> i32 {
+    const MAGIC: f64 = 68_719_476_736.0 * 1.5; // 2^36 * 1.5
+    let temp = val as f64 + MAGIC;
+    (temp.to_bits() as u32 as i32) >> 16
 }
 
 /// Per-axis sample counts to sweep. Includes the smallest interpolating grid
@@ -392,6 +413,83 @@ fn bilinear_float_matches_oracle() {
     assert!(total > 100_000, "expected many samples");
 }
 
+/// Full-domain `bilinear_float` parity: now that `bilinear_float` floors with
+/// `quick_floor` (matching lcms2's `_cmsQuickFloor`, NOT libm floor), it is
+/// bit-exact against the oracle across the ENTIRE valid `[0, 1)` input domain,
+/// including the `1 - f32::EPSILON` value the original test had to avoid.
+///
+/// The only band lcms2 itself mishandles is where `fclamp(in) < 1.0` yet
+/// `quick_floor(fclamp(in) * domain) == domain` — there the C reads one node past
+/// the grid (latent OOB; inputs are expected pre-clamped). rcms clamps the index
+/// to stay memory-safe, so at that exact band rcms and the (OOB-reading) oracle
+/// may differ; calling the OOB oracle is UB, so we do NOT probe it. Every other
+/// input up to and including `1 - f32::EPSILON` is asserted bit-exact.
+#[test]
+fn bilinear_float_full_domain_matches_oracle() {
+    let mut rng = Rng::new(0xB111_FD00_1600);
+    let mut total: u64 = 0;
+    let mut boundary_hits: u64 = 0;
+
+    // `fclamp` maps `< 1e-9` to 0 and clamps `>= 1.0` to 1.0; the interesting
+    // domain is `[1e-9, 1.0)`. Sweep a dense set incl. the largest sub-1.0 f32.
+    let one_minus_eps = 1.0f32 - f32::EPSILON; // 0.99999994
+
+    for &grid in GRIDS_2D {
+        for &n_out in N_OUTS {
+            let p = InterpParams::new(&grid, 2, n_out);
+            let table_len = grid[0] as usize * grid[1] as usize * n_out;
+            let table: Vec<f32> = (0..table_len).map(|_| rng.next_f64_unit() as f32).collect();
+
+            // Per-axis fine sweep covering the whole `[0,1)` plus the top edge.
+            let steps = 400usize;
+            for ix in 0..=steps {
+                for iy in 0..=steps {
+                    let mk = |i: usize| -> f32 {
+                        if i == steps {
+                            one_minus_eps
+                        } else {
+                            (i as f64 / steps as f64) as f32
+                        }
+                    };
+                    let input = [mk(ix), mk(iy)];
+
+                    // Skip ONLY the genuine OOB band: where lcms2 would read past
+                    // the grid (quick_floor rounds to `domain` while fclamp < 1).
+                    let oob = |v: f32, dom: u32| -> bool {
+                        let fc = fclamp_ref(v);
+                        fc < 1.0 && quick_floor_ref(fc * dom as f32) >= dom as i32
+                    };
+                    if oob(input[0], grid[0]) || oob(input[1], grid[1]) {
+                        boundary_hits += 1;
+                        continue;
+                    }
+
+                    let mut out = vec![0f32; n_out];
+                    bilinear_float(&input, &mut out, &table, &p);
+                    let oracle = rcms_oracle::interp_float(&grid, n_out, &table, 0, &input)
+                        .expect("oracle interp_float bilinear");
+                    for k in 0..n_out {
+                        assert_eq!(
+                            out[k].to_bits(),
+                            oracle[k].to_bits(),
+                            "bilinear_float full-domain grid={grid:?} n_out={n_out} \
+                             in={input:?} ch={k} rust={} c={}",
+                            out[k],
+                            oracle[k]
+                        );
+                    }
+                    total += n_out as u64;
+                }
+            }
+        }
+    }
+    println!(
+        "bilinear_float full-domain: {total} output samples bit-exact \
+         ({boundary_hits} OOB-band inputs skipped)"
+    );
+    assert!(total > 1_000_000, "expected a dense full-domain sweep");
+}
+
 // ---------------------------------------------------------------------------
 // Trilinear (3D). Forced through TrilinearInterp16/Float via the trilinear flag.
 // ---------------------------------------------------------------------------
@@ -645,12 +743,90 @@ fn eval6_inputs_float_matches_oracle() {
 }
 
 // ---------------------------------------------------------------------------
+// 1-input, multi-output (Eval1Input / Eval1InputFloat).
+// ---------------------------------------------------------------------------
+
+const GRIDS_1D: &[u32] = &[2, 3, 4, 8, 17, 256, 4096];
+
+#[test]
+fn eval1_input_16_matches_oracle() {
+    let mut rng = Rng::new(0xE1_0007_1000);
+    let mut total: u64 = 0;
+    for &n in GRIDS_1D {
+        let grid = [n];
+        for &n_out in N_OUTS {
+            // Skip the single-output case here: that routes to LinLerp1D, covered
+            // separately. Eval1Input is the multi-output path.
+            if n_out == 1 {
+                continue;
+            }
+            let p = InterpParams::new(&grid, 1, n_out);
+            let table_len = n as usize * n_out;
+            for _ in 0..3 {
+                let table: Vec<u16> = (0..table_len).map(|_| rng.next_u64() as u16).collect();
+                for input in u16_inputs_nd(1, &mut rng, 3000) {
+                    let mut out = vec![0u16; n_out];
+                    eval_1_input(&input, &mut out, &table, &p);
+                    let oracle = rcms_oracle::interp16(&grid, n_out, &table, 0, &input)
+                        .expect("oracle interp16 Eval1Input");
+                    assert_eq!(
+                        out, oracle,
+                        "eval1_input16 grid={grid:?} n_out={n_out} in={input:?}"
+                    );
+                    total += n_out as u64;
+                }
+            }
+        }
+    }
+    println!("eval1_input_16: {total} output samples compared bit-exact");
+    assert!(total > 200_000, "expected many samples");
+}
+
+#[test]
+fn eval1_input_float_matches_oracle() {
+    let mut rng = Rng::new(0xE1_F10A_1000);
+    let mut total: u64 = 0;
+    for &n in GRIDS_1D {
+        let grid = [n];
+        for &n_out in N_OUTS {
+            if n_out == 1 {
+                continue;
+            }
+            let p = InterpParams::new(&grid, 1, n_out);
+            let table_len = n as usize * n_out;
+            for _ in 0..3 {
+                let table: Vec<f32> = (0..table_len).map(|_| rng.next_f64_unit() as f32).collect();
+                for input in f32_inputs_nd(1, &mut rng, 1500) {
+                    let mut out = vec![0f32; n_out];
+                    eval_1_input_float(&input, &mut out, &table, &p);
+                    let oracle = rcms_oracle::interp_float(&grid, n_out, &table, 0, &input)
+                        .expect("oracle interp_float Eval1InputFloat");
+                    for k in 0..n_out {
+                        assert_eq!(
+                            out[k].to_bits(),
+                            oracle[k].to_bits(),
+                            "eval1_input_float grid={grid:?} n_out={n_out} in={input:?} ch={k} \
+                             rust={} c={}",
+                            out[k],
+                            oracle[k]
+                        );
+                    }
+                    total += n_out as u64;
+                }
+            }
+        }
+    }
+    println!("eval1_input_float: {total} output samples compared bit-exact");
+    assert!(total > 100_000, "expected many samples");
+}
+
+// ---------------------------------------------------------------------------
 // Factory selection.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn factory_selects_expected_routine() {
-    // 1 input -> linear.
+    // 1 input, 1 output -> LinLerp1D / LinLerp1Dfloat.
     assert_eq!(
         interp_factory(1, 1, false, false),
         InterpFn::Lerp16(Interp16::Linear)
@@ -658,6 +834,15 @@ fn factory_selects_expected_routine() {
     assert_eq!(
         interp_factory(1, 1, true, false),
         InterpFn::LerpFloat(InterpFloat::Linear)
+    );
+    // 1 input, multi output -> Eval1Input / Eval1InputFloat.
+    assert_eq!(
+        interp_factory(1, 3, false, false),
+        InterpFn::Lerp16(Interp16::Eval1)
+    );
+    assert_eq!(
+        interp_factory(1, 4, true, false),
+        InterpFn::LerpFloat(InterpFloat::Eval1)
     );
     // 2 inputs -> bilinear (trilinear flag irrelevant).
     assert_eq!(

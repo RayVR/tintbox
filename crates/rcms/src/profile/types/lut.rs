@@ -40,6 +40,10 @@ fn mat3_is_identity(m: &[f64; 9]) -> bool {
 /// lcms2 `uipow` (cmstypes.c:1974): `n * a^b` with overflow check. Returns
 /// `None` on overflow (the C `(cmsUInt32Number) -1` sentinel) so callers reject
 /// the tag. `a == 0` or `n == 0` yields `0`.
+///
+/// Used by the LUT8/LUT16 CLUT path ONLY, which in the pinned lcms2 calls
+/// `uipow` directly (cmstypes.c:2051 / 2378) rather than `CubeSize`. The granular
+/// (per-dimension) CLUT readers use [`cube_size`] instead — see its note.
 fn uipow(n: u32, a: u32, b: u32) -> Option<u32> {
     if a == 0 || n == 0 {
         return Some(0);
@@ -49,6 +53,53 @@ fn uipow(n: u32, a: u32, b: u32) -> Option<u32> {
         rv = rv.checked_mul(a)?;
     }
     rv.checked_mul(n)
+}
+
+/// lcms2 `CubeSize` (cmslut.c:461): the hypercube node count for a per-dimension
+/// grid `dims`, with lcms2's exact overflow/validity guards. Returns `0` (the C
+/// sentinel that makes `cmsStageAllocCLut*Granular` reject the stage) when:
+///   - any `dim <= 1` (an impossible grid size: 0 = no CLUT, else >= 2),
+///   - the running product would exceed `u32::MAX / dim` (per-step overflow),
+///   - or the final product exceeds `u32::MAX / 15` (so a later `outputChan * rv`
+///     with `outputChan <= 15` cannot overflow `u32`).
+///
+/// This is STRICTER than a plain `checked_mul` chain: the `<= 1` rejection and
+/// the `/15` ceiling both reject grids that `checked_mul` would accept, matching
+/// lcms2 accept/reject parity for the granular CLUT readers (A2B/B2A and MPE).
+/// The intermediate product is accumulated in `u64` exactly as the C uses a
+/// `cmsUInt64Number rv`, so the `> u32::MAX/dim` test sees the true value.
+fn cube_size(dims: &[u32]) -> u32 {
+    let mut rv: u64 = 1;
+    // Iterate in reverse to mirror the C `for (; b > 0; b--)` over `Dims[b-1]`;
+    // the order is immaterial to the product but keeps the transcription literal.
+    for &dim in dims.iter().rev() {
+        let dim = dim as u64;
+        if dim <= 1 {
+            return 0;
+        }
+        if rv > u64::from(u32::MAX) / dim {
+            return 0;
+        }
+        rv *= dim;
+    }
+    if rv > u64::from(u32::MAX) / 15 {
+        return 0;
+    }
+    rv as u32
+}
+
+/// `n_entries = output_channels * CubeSize(grid)` for a granular CLUT, returning
+/// `None` (→ reject the tag) when lcms2's `cmsStageAllocCLut*Granular` would see
+/// `n == 0` and bail (`CubeSize` hit a guard, or `output_channels == 0`). The
+/// `output_channels * cube` product cannot overflow `u32` because `cube_size`
+/// caps `cube` at `u32::MAX / 15` and `output_channels <= 15`.
+pub(crate) fn granular_clut_entries(output_channels: u32, grid: &[u32]) -> Option<u32> {
+    let cube = cube_size(grid);
+    let n = output_channels.checked_mul(cube)?;
+    if n == 0 {
+        return None;
+    }
+    Some(n)
 }
 
 /// lcms2 `Read8bitTables` (cmstypes.c:1885-1932): read `n_channels` 256-entry
@@ -353,13 +404,11 @@ fn read_clut_at<R: ProfileReader>(
         .map(|&g| g as u32)
         .collect();
 
-    // nEntries = output_channels × Π grid (cmsStageAllocCLut16bitGranular).
-    let mut n_entries: u32 = output_channels;
-    for &g in &grid {
-        n_entries = n_entries
-            .checked_mul(g)
-            .ok_or(Error::Corrupt("AtoB/BtoA CLUT table size overflow"))?;
-    }
+    // nEntries = output_channels × CubeSize(grid) (cmsStageAllocCLut16bitGranular).
+    // `CubeSize` applies lcms2's dim<=1 / overflow / UINT_MAX/15 guards; an
+    // `n == 0` result is the C `nEntries == 0 -> return NULL`, i.e. reject.
+    let n_entries = granular_clut_entries(output_channels, &grid)
+        .ok_or(Error::Corrupt("AtoB/BtoA CLUT table size invalid"))?;
 
     let mut table = vec![0u16; n_entries as usize];
     match precision {

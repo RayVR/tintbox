@@ -20,6 +20,7 @@ use crate::io::ProfileReader;
 use crate::pipeline::clut::{Clut, ClutTable};
 use crate::pipeline::{Pipeline, Stage};
 use crate::profile::tag::Tag;
+use crate::profile::types::lut::granular_clut_entries;
 
 /// lcms2 `cmsMAXCHANNELS` (lcms2.h:113): the channel-count ceiling MPE readers
 /// reject at or above (valid range 1..=15).
@@ -243,13 +244,11 @@ fn read_mpe_clut<R: ProfileReader>(r: &mut R, lut: &mut Pipeline) -> Result<()> 
         }
     }
 
-    // nEntries = OutputChans * Π grid (cmsStageAllocCLutFloatGranular).
-    let mut n_entries: u32 = output_chans;
-    for &g in &grid {
-        n_entries = n_entries
-            .checked_mul(g)
-            .ok_or(Error::Corrupt("MPE CLUT: table size overflow"))?;
-    }
+    // nEntries = OutputChans * CubeSize(grid) (cmsStageAllocCLutFloatGranular).
+    // `CubeSize` applies lcms2's dim<=1 / per-step overflow / UINT_MAX/15 guards;
+    // an `n == 0` result is the C `nEntries == 0 -> return NULL`, i.e. reject.
+    let n_entries = granular_clut_entries(output_chans, &grid)
+        .ok_or(Error::Corrupt("MPE CLUT: table size invalid"))?;
 
     let mut table = vec![0.0f32; n_entries as usize];
     for slot in table.iter_mut() {

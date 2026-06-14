@@ -471,6 +471,51 @@ fn synthetic_mpet_nonsquare_matrix_matches_oracle() {
     assert!(samples > 0);
 }
 
+/// Adversarial CLUT grid: an `mpet` with a 4-input float CLUT whose grid dims
+/// are `[255,255,255,255]`. The node count `255^4 = 4_228_250_625` FITS in `u32`
+/// (so a naive `checked_mul` chain would accept it and try to allocate ~16 GiB),
+/// but it exceeds lcms2's `CubeSize` final `UINT_MAX/15` ceiling, so lcms2 itself
+/// rejects the tag (`cmsReadTag` -> NULL). rcms must match: reject WITHOUT
+/// allocating, via the same `CubeSize` parity guard. We cross-check against the
+/// oracle: rcms rejects exactly when lcms2 does.
+#[test]
+fn mpet_adversarial_clut_grid_rejected_like_oracle() {
+    // 4->1 float CLUT, grid [255,255,255,255]. The table bytes are NOT supplied
+    // in full (both stacks reject on the entry-count guard before reading them).
+    let clut = clut_element(4, 1, &[255, 255, 255, 255], &[]);
+    let elements = vec![(SIG_CLUT_ELEM, clut)];
+    let payload = build_mpet_payload(4, 1, &elements);
+    let profile = build_profile(TAG_D2B0, &payload);
+
+    // The profile must open; the on-disk type must be mpet.
+    assert!(
+        rcms_oracle::open_succeeds(&profile),
+        "lcms2 must open the profile (the tag is read lazily)"
+    );
+    assert_eq!(rcms_oracle::tag_true_type(&profile, TAG_D2B0), Some(TY_MPE));
+
+    // Oracle: lcms2's CubeSize rejects (255^4 > UINT_MAX/15), so cmsReadTag -> NULL.
+    let oracle_reads = rcms_oracle::tag_read_succeeds(&profile, TAG_D2B0);
+    assert!(
+        !oracle_reads,
+        "expected lcms2 to REJECT the adversarial [255;4] grid (CubeSize guard)"
+    );
+
+    // rcms must also reject (and must not be Unsupported: the type IS dispatched).
+    let p = Profile::open(&profile).expect("rcms open");
+    let sig = rcms::sig::Signature::from_raw(TAG_D2B0);
+    let res = p.read_tag(sig);
+    assert!(
+        res.is_err(),
+        "rcms accepted the adversarial [255;4] CLUT grid but lcms2 rejected it: {res:?}"
+    );
+    assert!(
+        !matches!(res, Err(rcms::error::Error::Unsupported(_))),
+        "adversarial mpet must be dispatched (not Unsupported), got {res:?}"
+    );
+    println!("adversarial mpet [255;4] CLUT grid rejected by BOTH rcms and lcms2");
+}
+
 /// Reachability: the `mpet` on-disk type no longer returns `Error::Unsupported`.
 #[test]
 fn mpet_type_no_longer_unsupported() {

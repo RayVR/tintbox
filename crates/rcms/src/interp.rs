@@ -87,8 +87,10 @@ impl InterpParams {
 /// functions; [`Interp16::eval`] dispatches with a zero-cost `match`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Interp16 {
-    /// 1D linear (`LinLerp1D`).
+    /// 1D linear, single output (`LinLerp1D`).
     Linear,
+    /// 1D linear, multi output (`Eval1Input`).
+    Eval1,
     /// 2D bilinear (`BilinearInterp16`).
     Bilinear,
     /// 3D trilinear (`TrilinearInterp16`).
@@ -105,6 +107,7 @@ impl Interp16 {
     pub fn eval(self, input: &[u16], output: &mut [u16], table: &[u16], p: &InterpParams) {
         match self {
             Interp16::Linear => lin_lerp_1d(input, output, table, p),
+            Interp16::Eval1 => eval_1_input(input, output, table, p),
             Interp16::Bilinear => bilinear_16(input, output, table, p),
             Interp16::Trilinear => trilinear_16(input, output, table, p),
             Interp16::Tetrahedral => tetrahedral_16(input, output, table, p),
@@ -117,8 +120,10 @@ impl Interp16 {
 /// `LerpFloat` member of lcms2's `cmsInterpFunction` union.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterpFloat {
-    /// 1D linear (`LinLerp1Dfloat`).
+    /// 1D linear, single output (`LinLerp1Dfloat`).
     Linear,
+    /// 1D linear, multi output (`Eval1InputFloat`).
+    Eval1,
     /// 2D bilinear (`BilinearInterpFloat`).
     Bilinear,
     /// 3D trilinear (`TrilinearInterpFloat`).
@@ -135,6 +140,7 @@ impl InterpFloat {
     pub fn eval(self, input: &[f32], output: &mut [f32], table: &[f32], p: &InterpParams) {
         match self {
             InterpFloat::Linear => lin_lerp_1d_float(input, output, table, p),
+            InterpFloat::Eval1 => eval_1_input_float(input, output, table, p),
             InterpFloat::Bilinear => bilinear_float(input, output, table, p),
             InterpFloat::Trilinear => trilinear_float(input, output, table, p),
             InterpFloat::Tetrahedral => tetrahedral_float(input, output, table, p),
@@ -157,10 +163,9 @@ pub enum InterpFn {
 /// Select the interpolation routine for `(n_inputs, is_float, is_trilinear)`,
 /// bit-for-bit matching lcms2's `DefaultInterpolatorsFactory` (cmsintrp.c:1178).
 ///
-/// - 1 input  -> linear (the 1-output `Eval1Input` case is folded into `Linear`,
-///   which only differs for multi-output 1D LUTs not produced by this factory's
-///   3D/n-D path; this matches the `nOutputChannels == 1` selection lcms2 makes
-///   for the CLUT interpolators this slice targets).
+/// - 1 input  -> `LinLerp1D`/`LinLerp1Dfloat` when `n_outputs == 1`, else
+///   `Eval1Input`/`Eval1InputFloat` (multi-output 1D LUTs), matching lcms2's
+///   `nOutputChannels == 1` branch exactly.
 /// - 2 inputs -> bilinear.
 /// - 3 inputs -> trilinear if `is_trilinear` (the `CMS_LERP_FLAGS_TRILINEAR`
 ///   hint), else tetrahedral.
@@ -187,10 +192,14 @@ pub fn interp_factory(
 
     match n_inputs {
         1 => {
-            if is_float {
-                InterpFn::LerpFloat(InterpFloat::Linear)
-            } else {
-                InterpFn::Lerp16(Interp16::Linear)
+            // lcms2 `DefaultInterpolatorsFactory` case 1: single-output 1D LUTs
+            // use `LinLerp1D`/`LinLerp1Dfloat`; multi-output 1D LUTs use
+            // `Eval1Input`/`Eval1InputFloat` (the same math looped over outputs).
+            match (n_outputs == 1, is_float) {
+                (true, true) => InterpFn::LerpFloat(InterpFloat::Linear),
+                (true, false) => InterpFn::Lerp16(Interp16::Linear),
+                (false, true) => InterpFn::LerpFloat(InterpFloat::Eval1),
+                (false, false) => InterpFn::Lerp16(Interp16::Eval1),
             }
         }
         2 => {
@@ -446,6 +455,62 @@ pub fn lin_lerp_1d_float(input: &[f32], output: &mut [f32], table: &[f32], p: &I
     output[0] = y0 + (y1 - y0) * rest;
 }
 
+/// 16-bit 1D linear interpolation for MULTI-output 1D LUTs, bit-identical to
+/// `Eval1Input` (cmsintrp.c:191-228). The single-output case uses [`lin_lerp_1d`]
+/// (`LinLerp1D`); this is the same math looped over `p.n_outputs`, indexing each
+/// node's output channels at `K0 + OutChan` / `K1 + OutChan`.
+pub fn eval_1_input(input: &[u16], output: &mut [u16], table: &[u16], p: &InterpParams) {
+    let total_out = p.n_outputs;
+    if input[0] == 0xffff || p.domain[0] == 0 {
+        let y0 = (p.domain[0] * p.opta[0]) as usize;
+        for (oc, out) in output.iter_mut().enumerate().take(total_out) {
+            *out = table[y0 + oc];
+        }
+        return;
+    }
+
+    let v = input[0] as i32 * p.domain[0] as i32;
+    let fk = to_fixed_domain(v);
+    let k0 = fixed_to_int(fk);
+    let rk = fixed_rest_to_int(fk);
+    // k1 = k0 + (Input != 0xFFFF ? 1 : 0); the 0xFFFF branch is handled above.
+    let k1 = k0 + 1;
+    let kk0 = (p.opta[0] as i32 * k0) as usize;
+    let kk1 = (p.opta[0] as i32 * k1) as usize;
+
+    for (oc, out) in output.iter_mut().enumerate().take(total_out) {
+        *out = linear_interp(rk, table[kk0 + oc] as i32, table[kk1 + oc] as i32);
+    }
+}
+
+/// Float 1D linear interpolation for MULTI-output 1D LUTs, bit-identical to
+/// `Eval1InputFloat` (cmsintrp.c:264-303). The single-output case uses
+/// [`lin_lerp_1d_float`] (`LinLerp1Dfloat`); this loops over `p.n_outputs`.
+pub fn eval_1_input_float(input: &[f32], output: &mut [f32], table: &[f32], p: &InterpParams) {
+    let total_out = p.n_outputs;
+    let val2 = fclamp(input[0]);
+    if val2 == 1.0 || p.domain[0] == 0 {
+        let start = (p.domain[0] * p.opta[0]) as usize;
+        for (oc, out) in output.iter_mut().enumerate().take(total_out) {
+            *out = table[start + oc];
+        }
+        return;
+    }
+
+    let val2 = val2 * p.domain[0] as f32;
+    let cell0 = val2.floor() as i32;
+    let cell1 = val2.ceil() as i32;
+    let rest = val2 - cell0 as f32;
+    let cell0 = (cell0 * p.opta[0] as i32) as usize;
+    let cell1 = (cell1 * p.opta[0] as i32) as usize;
+
+    for (oc, out) in output.iter_mut().enumerate().take(total_out) {
+        let y0 = table[cell0 + oc];
+        let y1 = table[cell1 + oc];
+        *out = y0 + (y1 - y0) * rest;
+    }
+}
+
 /// 16-bit 2D bilinear interpolation, bit-identical to `BilinearInterp16`
 /// (cmsintrp.c:409-465).
 ///
@@ -503,9 +568,13 @@ pub fn bilinear_float(input: &[f32], output: &mut [f32], table: &[f32], p: &Inte
     let px = fclamp(input[0]) * p.domain[0] as f32;
     let py = fclamp(input[1]) * p.domain[1] as f32;
 
-    let x0 = px.floor() as i32;
+    // lcms2 uses `_cmsQuickFloor` here (NOT libm floor), so match it bit-for-bit
+    // in the valid `[0,1)` domain — same helper `eval_n_float` uses. `quick_floor`
+    // and `.floor()` agree for in-range `px`; they can disagree only at the
+    // near-1.0 OOB band where lcms2 itself reads one node past the grid.
+    let x0 = quick_floor(px);
     let fx = px - x0 as f32;
-    let y0 = py.floor() as i32;
+    let y0 = quick_floor(py);
     let fy = py - y0 as f32;
 
     let xx0 = p.opta[1] as i32 * x0;
@@ -523,6 +592,20 @@ pub fn bilinear_float(input: &[f32], output: &mut [f32], table: &[f32], p: &Inte
         } else {
             p.opta[0] as i32
         };
+
+    // Memory-safety clamp: at the degenerate near-1.0 boundary `quick_floor(px)`
+    // can round up to `domain` while `fclamp(input) < 1.0` leaves the `+ opta`
+    // step in, so the highest index `xx1 + yy1 + (n_out-1)` would point one node
+    // past `table` — lcms2 reads that OOB (a latent bug; inputs are expected to
+    // be pre-clamped). rcms must stay in bounds, so cap the per-axis base indices
+    // at the last node. In the valid domain this clamp never fires, so it does
+    // not perturb the bit-exact result there.
+    let max_x = (p.n_samples[0].saturating_sub(1)) as i32 * p.opta[1] as i32;
+    let max_y = (p.n_samples[1].saturating_sub(1)) as i32 * p.opta[0] as i32;
+    let xx0 = xx0.min(max_x);
+    let xx1 = xx1.min(max_x);
+    let yy0 = yy0.min(max_y);
+    let yy1 = yy1.min(max_y);
 
     for (out_chan, out) in output.iter_mut().enumerate().take(total_out) {
         let oc = out_chan as i32;
