@@ -90,6 +90,22 @@ pub enum Tag {
     /// `cmstypes.c:1451`). Both decode in lcms2 to a `cmsToneCurve`, so they share
     /// one Rust value. Carried by the per-channel TRC tags (red/green/blue/grayTRC).
     Curve(ToneCurve),
+    /// `cmsSigVcgtType` (`'vcgt'`, `Type_vcgt_Read`, `cmstypes.c:4943`): the video
+    /// card gamma table — three `cmsToneCurve` (R/G/B), built from either an on-disk
+    /// 8/16-bit table (the table variant) or a per-channel gamma/min/max formula
+    /// (the formula variant, built as an ICC type-5 parametric curve). The `Vec`
+    /// always has length 3 (lcms2 rejects any other channel count).
+    Vcgt(Vec<ToneCurve>),
+    /// `cmsSigUcrBgType` (`'bfd '`, `Type_UcrBg_Read`, `cmstypes.c:3789`): the
+    /// under-color-removal / black-generation curves plus a free-text description.
+    /// `ucr` and `bg` are 16-bit tabulated curves; `desc` is the trailing ASCII
+    /// string (lcms2 stores it in a `cmsMLU`, but it is set via `cmsMLUsetASCII`
+    /// from the raw bytes, so the comparable value is the plain string).
+    UcrBg {
+        ucr: ToneCurve,
+        bg: ToneCurve,
+        desc: String,
+    },
 }
 
 /// One named colour of a `cmsNAMEDCOLORLIST` (`cmstypes.c:3369`). `name` is the

@@ -42,6 +42,8 @@ const T_PROFILE_SEQUENCE_ID: u32 = 0x7073_6964; // 'psid'
 const T_DICT: u32 = 0x6469_6374; // 'dict'
 const T_CURVE: u32 = 0x6375_7276; // 'curv'
 const T_PARAMETRIC_CURVE: u32 = 0x7061_7261; // 'para'
+const T_VCGT: u32 = 0x7663_6774; // 'vcgt'
+const T_UCRBG: u32 = 0x6266_6420; // 'bfd '
 
 /// Decode the tag value for the on-disk `type_sig`. `r` is positioned at the
 /// start of the type payload (already past the 8-byte type base); `size` is the
@@ -74,6 +76,8 @@ pub fn read_tag_value<R: ProfileReader>(type_sig: Signature, r: &mut R, size: u3
         T_DICT => named::read_dictionary(r, size),
         T_CURVE => curve::read_curve(r, size),
         T_PARAMETRIC_CURVE => curve::read_parametric_curve(r, size),
+        T_VCGT => curve::read_vcgt(r, size),
+        T_UCRBG => curve::read_ucrbg(r, size),
         _ => Err(Error::Unsupported("tag type deferred to a later slice")),
     }
 }

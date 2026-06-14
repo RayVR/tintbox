@@ -191,7 +191,10 @@ fn elem_count(tag: &Tag) -> u32 {
         | Tag::ProfileSequenceDesc(_)
         | Tag::ProfileSequenceId(_)
         | Tag::Dict(_)
-        | Tag::Curve(_) => 1,
+        | Tag::Curve(_)
+        // Type_vcgt_Read and Type_UcrBg_Read both set *nItems = 1.
+        | Tag::Vcgt(_)
+        | Tag::UcrBg { .. } => 1,
     }
 }
 
@@ -904,6 +907,8 @@ mod tests {
         0x6469_6374, // 'dict' Dictionary
         0x6375_7276, // 'curv' Curve
         0x7061_7261, // 'para' ParametricCurve
+        0x7663_6774, // 'vcgt' Vcgt
+        0x6266_6420, // 'bfd ' UcrBg
     ];
 
     /// Comprehensive testbed sweep: for every `vendor/Little-CMS/testbed/*.icc`:
@@ -1227,5 +1232,65 @@ mod tests {
                 "type {ty:08x} should parse to Curve, got {res:?}"
             );
         }
+    }
+
+    /// Differential: for every testbed profile both stacks accept, every tag whose
+    /// on-disk TYPE is `vcgt` must decode to a `Tag::Vcgt` of 3 curves whose
+    /// `eval_float` is bit-identical (f32::to_bits) to lcms2's
+    /// `cmsEvalToneCurveFloat` at 256 points in [0, 1] for each channel. `new.icc`
+    /// and `ibm-t61.icc` carry table-variant vcgt tags, so this is REAL coverage.
+    #[test]
+    fn vcgt_tag_values_match_oracle_over_testbed() {
+        const TY_VCGT: u32 = 0x7663_6774; // 'vcgt'
+
+        let xs: Vec<f32> = (0..256).map(|i| i as f32 / 255.0).collect();
+        let files = testbed_icc();
+        assert!(!files.is_empty(), "no .icc in testbed");
+
+        let mut vcgt_tags = 0usize;
+        for path in &files {
+            let bytes = fs::read(path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+
+            if !rcms_oracle::open_succeeds(&bytes) {
+                continue;
+            }
+            let p = match Profile::open(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            for sig in p.tags().collect::<Vec<_>>() {
+                let raw = sig.to_raw();
+                if rcms_oracle::tag_true_type(&bytes, raw) != Some(TY_VCGT) {
+                    continue;
+                }
+
+                let curves = match p.read_tag(sig).expect("rust vcgt") {
+                    Tag::Vcgt(c) => c,
+                    other => panic!("{name}:{raw:08x} expected Vcgt, got {other:?}"),
+                };
+                assert_eq!(curves.len(), 3, "{name}:{raw:08x} channel count");
+
+                let oracle = rcms_oracle::read_tag_vcgt(&bytes, raw, &xs).expect("oracle vcgt");
+                for (ch, oys) in oracle.iter().enumerate() {
+                    for (i, (&x, &cy)) in xs.iter().zip(oys.iter()).enumerate() {
+                        let ry = curves[ch].eval_float(x);
+                        assert_eq!(
+                            ry.to_bits(),
+                            cy.to_bits(),
+                            "{name}:{raw:08x} ch{ch} sample[{i}] x={x}: rust={ry} lcms2={cy}"
+                        );
+                    }
+                }
+                vcgt_tags += 1;
+            }
+        }
+
+        println!("testbed vcgt diff: {vcgt_tags} vcgt tags");
+        assert!(
+            vcgt_tags >= 2,
+            "expected vcgt tags in new.icc and ibm-t61.icc, found {vcgt_tags}"
+        );
     }
 }

@@ -871,3 +871,56 @@ int rcms_oracle_read_tag_curve(const uint8_t* buf, uint32_t len, uint32_t sig,
     cmsCloseProfile(p);
     return 1;
 }
+
+/* cmsReadTag of a vcgt tag -> a cmsToneCurve** (array of 3 R/G/B curves), each
+   sampled via cmsEvalToneCurveFloat at the n caller-supplied x points
+   (xs[0..n]). Writes 3*n floats to ys row-major (channel 0 first, then 1, 2).
+   Returns 1 on success, 0 if the profile cannot be opened or the tag is absent /
+   not vcgt-backed. The cmsToneCurve** is owned by the profile (freed on close). */
+int rcms_oracle_read_tag_vcgt(const uint8_t* buf, uint32_t len, uint32_t sig,
+                              const float* xs, uint32_t n, float* ys) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsToneCurve** curves = (cmsToneCurve**) cmsReadTag(p, (cmsTagSignature) sig);
+    if (!curves) { cmsCloseProfile(p); return 0; }
+    for (int ch = 0; ch < 3; ch++) {
+        if (!curves[ch]) { cmsCloseProfile(p); return 0; }
+        for (uint32_t i = 0; i < n; i++)
+            ys[ch * n + i] = cmsEvalToneCurveFloat(curves[ch], xs[i]);
+    }
+    cmsCloseProfile(p);
+    return 1;
+}
+
+/* cmsReadTag of a bfd (UcrBg) tag -> a cmsUcrBg* { Ucr, Bg, Desc }. The Ucr and
+   Bg tone curves are each sampled via cmsEvalToneCurveFloat at the n x points,
+   written to ucr_ys[0..n] / bg_ys[0..n]. The Desc MLU's ASCII translation is
+   written (NUL-terminated, truncated to dcap) to desc, with the byte count
+   (excluding NUL) returned via *dused. Returns 1 on success, 0 otherwise. The
+   cmsUcrBg* is owned by the profile (freed on close). */
+int rcms_oracle_read_tag_ucrbg(const uint8_t* buf, uint32_t len, uint32_t sig,
+                               const float* xs, uint32_t n,
+                               float* ucr_ys, float* bg_ys,
+                               char* desc, uint32_t dcap, uint32_t* dused) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsUcrBg* v = (cmsUcrBg*) cmsReadTag(p, (cmsTagSignature) sig);
+    if (!v || !v->Ucr || !v->Bg) { cmsCloseProfile(p); return 0; }
+    for (uint32_t i = 0; i < n; i++) {
+        ucr_ys[i] = cmsEvalToneCurveFloat(v->Ucr, xs[i]);
+        bg_ys[i]  = cmsEvalToneCurveFloat(v->Bg, xs[i]);
+    }
+    uint32_t got = 0;
+    if (v->Desc) {
+        /* cmsMLUgetASCII returns the byte count INCLUDING the NUL terminator. */
+        uint32_t want = cmsMLUgetASCII(v->Desc, cmsNoLanguage, cmsNoCountry, NULL, 0);
+        if (want > dcap) want = dcap;
+        uint32_t wrote = cmsMLUgetASCII(v->Desc, cmsNoLanguage, cmsNoCountry, desc, want);
+        got = (wrote > 0) ? wrote - 1 : 0; /* strip the NUL from the reported count */
+    } else {
+        if (dcap > 0) desc[0] = 0;
+    }
+    *dused = got;
+    cmsCloseProfile(p);
+    return 1;
+}

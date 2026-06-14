@@ -164,6 +164,27 @@ unsafe extern "C" {
         n: u32,
         ys: *mut f32,
     ) -> i32;
+    fn rcms_oracle_read_tag_vcgt(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        xs: *const f32,
+        n: u32,
+        ys: *mut f32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_read_tag_ucrbg(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        xs: *const f32,
+        n: u32,
+        ucr_ys: *mut f32,
+        bg_ys: *mut f32,
+        desc: *mut u8,
+        dcap: u32,
+        dused: *mut u32,
+    ) -> i32;
     fn rcms_oracle_dict_count(buf: *const u8, len: u32, sig: u32) -> i32;
     fn rcms_oracle_dict_entry(
         buf: *const u8,
@@ -1311,6 +1332,84 @@ pub fn read_tag_curve(buf: &[u8], sig: u32, xs: &[f32]) -> Option<Vec<f32>> {
     } else {
         None
     }
+}
+
+/// lcms2 `cmsReadTag` of a `vcgt` tag -> a `cmsToneCurve**` (3 R/G/B curves),
+/// each sampled via `cmsEvalToneCurveFloat` at every `x` in `xs`. Returns one
+/// `Vec<f32>` of length `xs.len()` per channel (`[r, g, b]`), or `None` if lcms2
+/// cannot open the profile or the tag is absent / not vcgt-backed.
+pub fn read_tag_vcgt(buf: &[u8], sig: u32, xs: &[f32]) -> Option<[Vec<f32>; 3]> {
+    let mut ys = vec![0.0f32; xs.len() * 3];
+    // SAFETY: buf/len describe a valid readable slice C only reads; xs is a valid
+    // readable slice of `xs.len()` f32, and ys has room for 3*xs.len() f32, which
+    // is exactly what C writes (row-major, 3 channels) when it returns nonzero.
+    // The cmsToneCurve** C samples is owned by the profile (freed on close).
+    let ok = unsafe {
+        rcms_oracle_read_tag_vcgt(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            xs.as_ptr(),
+            xs.len() as u32,
+            ys.as_mut_ptr(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let n = xs.len();
+    Some([
+        ys[0..n].to_vec(),
+        ys[n..2 * n].to_vec(),
+        ys[2 * n..3 * n].to_vec(),
+    ])
+}
+
+/// A `cmsUcrBg` as lcms2 exposes it: the Ucr/Bg curves sampled at the requested
+/// points and the ASCII `Desc` string (`cmsMLUgetASCII` of the no-language entry).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OracleUcrBg {
+    pub ucr: Vec<f32>,
+    pub bg: Vec<f32>,
+    pub desc: String,
+}
+
+/// lcms2 `cmsReadTag` of a `bfd ` (UcrBg) tag -> the Ucr/Bg curves sampled via
+/// `cmsEvalToneCurveFloat` at every `x` in `xs`, plus the ASCII `Desc`. Returns
+/// `None` if lcms2 cannot open the profile or the tag is absent / not UcrBg-backed.
+pub fn read_tag_ucrbg(buf: &[u8], sig: u32, xs: &[f32]) -> Option<OracleUcrBg> {
+    let mut ucr = vec![0.0f32; xs.len()];
+    let mut bg = vec![0.0f32; xs.len()];
+    let dcap = 1usize << 16;
+    let mut desc = vec![0u8; dcap];
+    let mut dused = 0u32;
+    // SAFETY: buf/len describe a valid readable slice C only reads; xs is a valid
+    // readable slice; ucr/bg have room for xs.len() f32 each (what C writes); desc
+    // has `dcap` bytes and C writes at most `dcap` (NUL-terminated), reporting the
+    // byte count (sans NUL) via dused. The cmsUcrBg* is owned by the profile.
+    let ok = unsafe {
+        rcms_oracle_read_tag_ucrbg(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            xs.as_ptr(),
+            xs.len() as u32,
+            ucr.as_mut_ptr(),
+            bg.as_mut_ptr(),
+            desc.as_mut_ptr(),
+            dcap as u32,
+            &mut dused,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    desc.truncate(dused as usize);
+    Some(OracleUcrBg {
+        ucr,
+        bg,
+        desc: desc.iter().map(|&b| b as char).collect(),
+    })
 }
 
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.
