@@ -1047,6 +1047,24 @@ mod tests {
         }
         eprintln!("===================================\n");
 
+        // Slice 3 done-criteria: every tone-curve on-disk type (`curv`/`para`/
+        // `vcgt`/`bfd `) is now in-scope, so the ONLY on-disk types that may still
+        // defer to `Unsupported` are the LUT/MPE set deferred to a later slice.
+        const DEFERRED_LUT_MPE: &[u32] = &[
+            0x6D66_7431, // 'mft1' LUT8
+            0x6D66_7432, // 'mft2' LUT16
+            0x6D41_4220, // 'mAB ' LutAtoB
+            0x6D42_4120, // 'mBA ' LutBtoA
+            0x6D70_6574, // 'mpet' MultiProcessElement
+        ];
+        for ty in deferred_by_type.keys() {
+            assert!(
+                DEFERRED_LUT_MPE.contains(ty),
+                "[sweep] deferred on-disk type {ty:08x} is not in the LUT/MPE set — \
+                 every other type (incl. curv/para/vcgt/bfd) must now be in-scope"
+            );
+        }
+
         assert!(n_profiles > 0, "expected at least one accepted profile");
         assert!(
             n_tags_total > 0,

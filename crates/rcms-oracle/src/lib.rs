@@ -1525,7 +1525,7 @@ mod transcendental_probe {
     #[ignore = "one-shot architectural probe; run explicitly with --nocapture --ignored"]
     fn transcendental_parity_probe() {
         let n_per: u64 = 3_000_000;
-        let mut rng = Rng::new(0x5113_3DE_0000_0003_u64 ^ 0x9E37_79B9_7F4A_7C15);
+        let mut rng = Rng::new(0x0511_33DE_0000_0003_u64 ^ 0x9E37_79B9_7F4A_7C15);
 
         // ---- pow: x in (0,4], y in [0.2,5.0] ----
         let mut pow_stats = Stats::new();

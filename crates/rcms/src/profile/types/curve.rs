@@ -282,7 +282,7 @@ mod tests {
         }
     }
 
-    /// `para` type 3 (ICC) → lcms2 type 4, four s15Fixed16 params (a sRGB-like set).
+    /// `para` type 3 (ICC) → lcms2 type 4, five s15Fixed16 params (a sRGB-like set).
     #[test]
     fn parametric_type3_params() {
         // ParamsByType[3] = 5 params; values picked to be exact in 15.16.
