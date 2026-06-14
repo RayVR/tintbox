@@ -52,6 +52,13 @@ fn decode_utf16be(bytes: &[u8]) -> String {
 /// largest `BeginOfThisString + Len` into one wide block and slices per entry;
 /// we read each entry's slice directly — identical bytes either way.
 pub fn read_mlu<R: ProfileReader>(r: &mut R, size: u32) -> Result<Tag> {
+    Ok(Tag::Mlu(read_mlu_value(r, size)?))
+}
+
+/// `Type_MLU_Read` returning the bare [`Mlu`] (not wrapped in [`Tag`]). Used both
+/// by [`read_mlu`] and by the embedded-MLU readers (profile-sequence, dictionary)
+/// that need the `cmsMLU*` directly, mirroring lcms2's `Type_MLU_Read` cast.
+pub fn read_mlu_value<R: ProfileReader>(r: &mut R, size: u32) -> Result<Mlu> {
     let count = r.read_u32()?;
     let rec_len = r.read_u32()?;
 
@@ -94,6 +101,13 @@ pub fn read_mlu<R: ProfileReader>(r: &mut R, size: u32) -> Result<Tag> {
     // The cursor now sits at the start of the string pool.
     let pool_start = r.tell();
 
+    // lcms2 reads the pool as one block of `LargestPosition` bytes (the max
+    // `BeginOfThisString + Len` over all entries) starting at the pool, leaving the
+    // IOHANDLER cursor at `pool_start + LargestPosition`. We read per-entry via
+    // `read_at`, so we must restore the cursor to that same end position — this
+    // matters for the SEQUENTIAL embedded-MLU reads in pseq/psid, where the next
+    // `_cmsReadTypeBase` continues from exactly there.
+    let mut largest_position: u64 = 0;
     let mut entries = Vec::with_capacity(count as usize);
     for (language, country, len, begin) in dir {
         // Read this entry's UTF-16BE slice straight from the pool. lcms2's
@@ -102,6 +116,7 @@ pub fn read_mlu<R: ProfileReader>(r: &mut R, size: u32) -> Result<Tag> {
         let mut buf = vec![0u8; len as usize];
         r.read_at(pool_start + begin as u64, &mut buf)?;
         let text = decode_utf16be(&buf);
+        largest_position = largest_position.max(begin as u64 + len as u64);
         entries.push(MluEntry {
             language,
             country,
@@ -109,7 +124,10 @@ pub fn read_mlu<R: ProfileReader>(r: &mut R, size: u32) -> Result<Tag> {
         });
     }
 
-    Ok(Tag::Mlu(Mlu { entries }))
+    // Leave the cursor where lcms2's single pool read leaves it.
+    r.seek(pool_start + largest_position)?;
+
+    Ok(Mlu { entries })
 }
 
 /// `Type_Text_Description_Read` (`cmstypes.c:1096`): the ICC v2 `textDescription`
@@ -132,6 +150,12 @@ pub fn read_mlu<R: ProfileReader>(r: &mut R, size: u32) -> Result<Tag> {
 /// - The ASCII is read as Latin-1/NUL-terminated (matching `cmsMLUsetASCII`,
 ///   which stores wide chars 1:1 from the bytes up to the first NUL).
 pub fn read_text_description<R: ProfileReader>(r: &mut R, size: u32) -> Result<Tag> {
+    Ok(Tag::Mlu(read_text_description_value(r, size)?))
+}
+
+/// `Type_Text_Description_Read` returning the bare [`Mlu`]. Used by the embedded
+/// text reader (profile-sequence) when the embedded type base is `'desc'`.
+pub fn read_text_description_value<R: ProfileReader>(r: &mut R, size: u32) -> Result<Mlu> {
     // One dword should be there.
     if size < 4 {
         return Err(Error::Corrupt("textDescription too small for ASCII count"));
@@ -191,7 +215,7 @@ pub fn read_text_description<R: ProfileReader>(r: &mut R, size: u32) -> Result<T
         }
     }
 
-    Ok(Tag::Mlu(Mlu { entries }))
+    Ok(Mlu { entries })
 }
 
 #[cfg(test)]

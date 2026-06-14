@@ -4,6 +4,7 @@
 //! every other (struct-shaped / deferred) type returns `Error::Unsupported`.
 
 pub mod mlu;
+pub mod named;
 pub mod structs;
 pub mod trivial;
 
@@ -34,6 +35,10 @@ const T_CICP: u32 = 0x6369_6370; // 'cicp'
 const T_COLORANT_TABLE: u32 = 0x636C_7274; // 'clrt'
 const T_MLU: u32 = 0x6D6C_7563; // 'mluc'
 const T_TEXT_DESCRIPTION: u32 = 0x6465_7363; // 'desc'
+const T_NAMED_COLOR2: u32 = 0x6E63_6C32; // 'ncl2'
+const T_PROFILE_SEQUENCE_DESC: u32 = 0x7073_6571; // 'pseq'
+const T_PROFILE_SEQUENCE_ID: u32 = 0x7073_6964; // 'psid'
+const T_DICT: u32 = 0x6469_6374; // 'dict'
 
 /// Decode the tag value for the on-disk `type_sig`. `r` is positioned at the
 /// start of the type payload (already past the 8-byte type base); `size` is the
@@ -60,6 +65,10 @@ pub fn read_tag_value<R: ProfileReader>(type_sig: Signature, r: &mut R, size: u3
         T_COLORANT_TABLE => structs::read_colorant_table(r, size),
         T_MLU => mlu::read_mlu(r, size),
         T_TEXT_DESCRIPTION => mlu::read_text_description(r, size),
+        T_NAMED_COLOR2 => named::read_named_color2(r, size),
+        T_PROFILE_SEQUENCE_DESC => named::read_profile_sequence_desc(r, size),
+        T_PROFILE_SEQUENCE_ID => named::read_profile_sequence_id(r, size),
+        T_DICT => named::read_dictionary(r, size),
         _ => Err(Error::Unsupported("tag type deferred to a later slice")),
     }
 }

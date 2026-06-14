@@ -185,7 +185,12 @@ fn elem_count(tag: &Tag) -> u32 {
         | Tag::Cicp(_)
         | Tag::ColorantTable(_)
         // Both Type_MLU_Read and Type_Text_Description_Read set *nItems = 1.
-        | Tag::Mlu(_) => 1,
+        | Tag::Mlu(_)
+        // NamedColor2 / ProfileSequence{Desc,Id} / Dictionary all set *nItems = 1.
+        | Tag::NamedColor2(_)
+        | Tag::ProfileSequenceDesc(_)
+        | Tag::ProfileSequenceId(_)
+        | Tag::Dict(_) => 1,
     }
 }
 
@@ -774,5 +779,146 @@ mod tests {
             checked > 0,
             "expected at least one deferred TRC curve tag in the testbed"
         );
+    }
+
+    /// Differential: every testbed profile carrying a `'dict'`-typed tag (the
+    /// `meta` tag in ibm-t61.icc / new.icc) must decode to the same dictionary via
+    /// rcms `read_tag` as via lcms2's dict API. lcms2 enumerates entries in the
+    /// REVERSE of the on-disk record order (`cmsDictAddEntry` prepends); rcms keeps
+    /// on-disk order, so we reverse the oracle list before comparing.
+    #[test]
+    fn dict_tag_values_match_oracle_over_testbed() {
+        const TY_DICT: u32 = 0x6469_6374; // 'dict'
+        let mut checked = 0usize;
+        for path in testbed_icc() {
+            let bytes = fs::read(&path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+            if !rcms_oracle::open_succeeds(&bytes) {
+                continue;
+            }
+            let p = match Profile::open(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            for sig in p.tags().collect::<Vec<_>>() {
+                let raw = sig.to_raw();
+                if rcms_oracle::tag_true_type(&bytes, raw) != Some(TY_DICT) {
+                    continue;
+                }
+                let mut oracle = rcms_oracle::read_tag_dict(&bytes, raw).expect("oracle dict");
+                oracle.entries.reverse(); // disk order to match rcms.
+
+                let dict = match p.read_tag(sig).expect("rust dict") {
+                    Tag::Dict(d) => d,
+                    other => panic!("{name}:{raw:08x} expected Dict, got {other:?}"),
+                };
+
+                assert_eq!(
+                    dict.entries.len(),
+                    oracle.entries.len(),
+                    "{name}:{raw:08x} dict entry count"
+                );
+                for (i, (r, o)) in dict.entries.iter().zip(oracle.entries.iter()).enumerate() {
+                    assert_eq!(r.name, o.name, "{name}:{raw:08x}[{i}] name");
+                    assert_eq!(r.value, o.value, "{name}:{raw:08x}[{i}] value");
+                    assert_opt_mlu_eq(
+                        r.display_name.as_ref(),
+                        o.display_name.as_ref(),
+                        &format!("{name}:{raw:08x}[{i}] display_name"),
+                    );
+                    assert_opt_mlu_eq(
+                        r.display_value.as_ref(),
+                        o.display_value.as_ref(),
+                        &format!("{name}:{raw:08x}[{i}] display_value"),
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "expected at least one 'dict'/'meta' tag in the testbed"
+        );
+    }
+
+    /// Compare an optional rcms [`Mlu`] against an optional oracle MLU
+    /// (translation-by-translation: language, country, decoded text). Both must be
+    /// `Some`/`None` together; an absent display MLU is `None` on both sides.
+    fn assert_opt_mlu_eq(
+        rust: Option<&crate::profile::tag::Mlu>,
+        oracle: Option<&rcms_oracle::OracleMlu>,
+        ctx: &str,
+    ) {
+        match (rust, oracle) {
+            (None, None) => {}
+            (Some(m), Some(o)) => {
+                assert_eq!(m.entries.len(), o.entries.len(), "{ctx} translation count");
+                for (i, (r, c)) in m.entries.iter().zip(o.entries.iter()).enumerate() {
+                    assert_eq!(r.language, c.language, "{ctx}[{i}] language");
+                    assert_eq!(r.country, c.country, "{ctx}[{i}] country");
+                    assert_eq!(r.text, c.text, "{ctx}[{i}] text");
+                }
+            }
+            (r, o) => panic!(
+                "{ctx} presence mismatch: rust={:?} oracle={:?}",
+                r.is_some(),
+                o.is_some()
+            ),
+        }
+    }
+
+    /// Reachability: NamedColor2 / ProfileSequence{Desc,Id} / Dictionary now
+    /// dispatch (no longer `Error::Unsupported`). Minimal valid payloads are fed
+    /// straight through `read_tag_value`; per-field correctness lives in the
+    /// `types::named` synthetic unit tests and the dict testbed differential.
+    #[test]
+    fn named_seq_dict_types_now_dispatch() {
+        use crate::io::MemReader;
+        use crate::profile::types::read_tag_value;
+
+        // ncl2: vendorFlag, count=0, nDeviceCoords=0, prefix[32], suffix[32].
+        let ncl2 = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&0u32.to_be_bytes()); // vendorFlag
+            b.extend_from_slice(&0u32.to_be_bytes()); // count = 0
+            b.extend_from_slice(&0u32.to_be_bytes()); // nDeviceCoords = 0
+            b.extend_from_slice(&[0u8; 32]); // prefix
+            b.extend_from_slice(&[0u8; 32]); // suffix
+            b
+        };
+        // pseq: Count = 0.
+        let pseq = 0u32.to_be_bytes().to_vec();
+        // psid: Count = 0 (empty position table).
+        let psid = 0u32.to_be_bytes().to_vec();
+        // dict: Count = 0, Length = 16.
+        let dict = {
+            let mut b = Vec::new();
+            b.extend_from_slice(&0u32.to_be_bytes()); // Count = 0
+            b.extend_from_slice(&16u32.to_be_bytes()); // Length = 16
+            b
+        };
+
+        // psid/dict use Tell-based BaseOffset, so drive them through the real
+        // type-base-prefixed path (8-byte base consumed by read_type_base).
+        for (ty, body, needs_base) in [
+            (0x6E63_6C32u32, ncl2, false), // 'ncl2'
+            (0x7073_6571, pseq, false),    // 'pseq'
+            (0x7073_6964, psid, true),     // 'psid'
+            (0x6469_6374, dict, true),     // 'dict'
+        ] {
+            let mut full = Vec::new();
+            full.extend_from_slice(&ty.to_be_bytes());
+            full.extend_from_slice(&[0, 0, 0, 0]); // reserved
+            full.extend_from_slice(&body);
+            let mut r = MemReader::new(&full);
+            let _ = r.read_type_base().unwrap();
+            let res = read_tag_value(Signature::from_raw(ty), &mut r, body.len() as u32);
+            let _ = needs_base;
+            assert!(
+                !matches!(res, Err(Error::Unsupported(_))),
+                "type {ty:08x} should dispatch, got {res:?}"
+            );
+            assert!(res.is_ok(), "type {ty:08x} should parse, got {res:?}");
+        }
     }
 }

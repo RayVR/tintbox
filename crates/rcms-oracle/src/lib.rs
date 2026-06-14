@@ -78,6 +78,67 @@ unsafe extern "C" {
         units: *mut u16,
         cap: u32,
     ) -> i32;
+    fn rcms_oracle_named_color2_info(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        out_counts: *mut u32,
+        prefix: *mut u8,
+        suffix: *mut u8,
+    ) -> i32;
+    fn rcms_oracle_named_color2_color(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        idx: u32,
+        name: *mut u8,
+        pcs: *mut u16,
+        colorant: *mut u16,
+    ) -> i32;
+    fn rcms_oracle_seq_count(buf: *const u8, len: u32, sig: u32) -> i32;
+    fn rcms_oracle_seq_desc_elem(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        idx: u32,
+        out_u32: *mut u32,
+        out_attr: *mut u64,
+        mblk: *mut u8,
+        mcap: u32,
+        mused: *mut u32,
+        dblk: *mut u8,
+        dcap: u32,
+        dused: *mut u32,
+    ) -> i32;
+    fn rcms_oracle_seq_id_elem(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        idx: u32,
+        profile_id: *mut u8,
+        blk: *mut u8,
+        cap: u32,
+        used: *mut u32,
+    ) -> i32;
+    fn rcms_oracle_dict_count(buf: *const u8, len: u32, sig: u32) -> i32;
+    fn rcms_oracle_dict_entry(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        idx: u32,
+        name_units: *mut u16,
+        ncap: u32,
+        nn: *mut u32,
+        value_units: *mut u16,
+        vcap: u32,
+        vn: *mut u32,
+        dnblk: *mut u8,
+        dncap: u32,
+        dnused: *mut u32,
+        dvblk: *mut u8,
+        dvcap: u32,
+        dvused: *mut u32,
+    ) -> i32;
 }
 
 /// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).
@@ -605,6 +666,314 @@ pub fn mlu_entries(buf: &[u8], sig: u32) -> Option<Vec<OracleMluEntry>> {
         });
     }
     Some(out)
+}
+
+/// A serialized nested MLU as the `serialize_mlu` C helper emits it: a list of
+/// translations, each with raw language/country bytes and the wide string decoded
+/// from the truncated u16 unit stream via [`char::decode_utf16`] — the same
+/// normalization rcms's MLU reader applies. Compare against an rcms `Mlu` by
+/// mapping its entries to this shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleMlu {
+    pub entries: Vec<OracleMluEntry>,
+}
+
+/// Decode a `serialize_mlu` byte block (u32 count; per translation 2 lang, 2
+/// country, u32 nunits, nunits×u16-BE) into an [`OracleMlu`].
+fn decode_serialized_mlu(blk: &[u8]) -> OracleMlu {
+    let mut off = 0usize;
+    let rd_u32 = |b: &[u8], o: usize| u32::from_be_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let count = rd_u32(blk, off);
+    off += 4;
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let language = [blk[off], blk[off + 1]];
+        let country = [blk[off + 2], blk[off + 3]];
+        off += 4;
+        let nunits = rd_u32(blk, off) as usize;
+        off += 4;
+        let units =
+            (0..nunits).map(|i| u16::from_be_bytes([blk[off + i * 2], blk[off + i * 2 + 1]]));
+        let text = char::decode_utf16(units)
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect();
+        off += nunits * 2;
+        entries.push(OracleMluEntry {
+            language,
+            country,
+            text,
+        });
+    }
+    OracleMlu { entries }
+}
+
+/// One named colour as lcms2 exposes it (`cmsNamedColorInfo`): the root name
+/// (NUL-trimmed), the 3×u16 PCS, and `ColorantCount` device coordinates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleNamedColor {
+    pub name: String,
+    pub pcs: [u16; 3],
+    pub device: Vec<u16>,
+}
+
+/// A `cmsNAMEDCOLORLIST` as lcms2 exposes it. `vendor_flag` is NOT present:
+/// lcms2 discards it on read, so the differential test compares it against the
+/// raw on-disk bytes instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleNamedColorList {
+    pub prefix: String,
+    pub suffix: String,
+    pub colors: Vec<OracleNamedColor>,
+}
+
+/// lcms2 `cmsReadTag` of a `ncl2` tag, decoded to its named-colour list (sans
+/// vendor flag), or `None` if absent / not named-colour-backed.
+pub fn read_tag_named_color2(buf: &[u8], sig: u32) -> Option<OracleNamedColorList> {
+    let mut counts = [0u32; 2];
+    let mut prefix = [0u8; 33];
+    let mut suffix = [0u8; 33];
+    // SAFETY: buf/len describe a valid readable slice; counts/prefix/suffix are
+    // valid 2-u32 / 33-byte arrays C writes only when it returns nonzero.
+    let ok = unsafe {
+        rcms_oracle_named_color2_info(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            counts.as_mut_ptr(),
+            prefix.as_mut_ptr(),
+            suffix.as_mut_ptr(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let n_colors = counts[0];
+    let colorant_count = counts[1] as usize;
+    let to_str = |b: &[u8; 33]| -> String {
+        let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
+        b[..end].iter().map(|&x| x as char).collect()
+    };
+    let mut colors = Vec::with_capacity(n_colors as usize);
+    for idx in 0..n_colors {
+        let mut name = [0u8; 33];
+        let mut pcs = [0u16; 3];
+        let mut colorant = [0u16; 16];
+        // SAFETY: name/pcs/colorant are valid 33-byte / 3-u16 / 16-u16 arrays C
+        // writes only when it returns nonzero; idx < n_colors.
+        let cok = unsafe {
+            rcms_oracle_named_color2_color(
+                buf.as_ptr(),
+                buf.len() as u32,
+                sig,
+                idx,
+                name.as_mut_ptr(),
+                pcs.as_mut_ptr(),
+                colorant.as_mut_ptr(),
+            )
+        };
+        if cok == 0 {
+            return None;
+        }
+        colors.push(OracleNamedColor {
+            name: to_str(&name),
+            pcs,
+            device: colorant[..colorant_count].to_vec(),
+        });
+    }
+    Some(OracleNamedColorList {
+        prefix: to_str(&prefix),
+        suffix: to_str(&suffix),
+        colors,
+    })
+}
+
+/// One `cmsPSEQDESC` element of a `pseq` tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleSeqDescItem {
+    pub device_mfg: u32,
+    pub device_model: u32,
+    pub attributes: u64,
+    pub technology: u32,
+    pub manufacturer: OracleMlu,
+    pub model: OracleMlu,
+}
+
+/// lcms2 `cmsReadTag` of a `pseq` tag, decoded to its element list, or `None`.
+pub fn read_tag_seq_desc(buf: &[u8], sig: u32) -> Option<Vec<OracleSeqDescItem>> {
+    // SAFETY: buf/len describe a valid readable slice C only reads.
+    let n = unsafe { rcms_oracle_seq_count(buf.as_ptr(), buf.len() as u32, sig) };
+    if n < 0 {
+        return None;
+    }
+    let cap = 1usize << 16;
+    let mut items = Vec::with_capacity(n as usize);
+    for idx in 0..n as u32 {
+        let mut u32s = [0u32; 3];
+        let mut attr = 0u64;
+        let mut mblk = vec![0u8; cap];
+        let mut dblk = vec![0u8; cap];
+        let mut mused = 0u32;
+        let mut dused = 0u32;
+        // SAFETY: all out pointers reference valid local buffers of the declared
+        // capacities; C writes within them only when it returns nonzero; idx < n.
+        let ok = unsafe {
+            rcms_oracle_seq_desc_elem(
+                buf.as_ptr(),
+                buf.len() as u32,
+                sig,
+                idx,
+                u32s.as_mut_ptr(),
+                &mut attr,
+                mblk.as_mut_ptr(),
+                cap as u32,
+                &mut mused,
+                dblk.as_mut_ptr(),
+                cap as u32,
+                &mut dused,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        items.push(OracleSeqDescItem {
+            device_mfg: u32s[0],
+            device_model: u32s[1],
+            attributes: attr,
+            technology: u32s[2],
+            manufacturer: decode_serialized_mlu(&mblk[..mused as usize]),
+            model: decode_serialized_mlu(&dblk[..dused as usize]),
+        });
+    }
+    Some(items)
+}
+
+/// One element of a `psid` tag: profile ID and description MLU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleSeqIdItem {
+    pub profile_id: [u8; 16],
+    pub description: OracleMlu,
+}
+
+/// lcms2 `cmsReadTag` of a `psid` tag, decoded to its element list, or `None`.
+pub fn read_tag_seq_id(buf: &[u8], sig: u32) -> Option<Vec<OracleSeqIdItem>> {
+    // SAFETY: buf/len describe a valid readable slice C only reads.
+    let n = unsafe { rcms_oracle_seq_count(buf.as_ptr(), buf.len() as u32, sig) };
+    if n < 0 {
+        return None;
+    }
+    let cap = 1usize << 16;
+    let mut items = Vec::with_capacity(n as usize);
+    for idx in 0..n as u32 {
+        let mut profile_id = [0u8; 16];
+        let mut blk = vec![0u8; cap];
+        let mut used = 0u32;
+        // SAFETY: profile_id is a valid 16-byte array; blk has `cap` bytes; C
+        // writes within them only when it returns nonzero; idx < n.
+        let ok = unsafe {
+            rcms_oracle_seq_id_elem(
+                buf.as_ptr(),
+                buf.len() as u32,
+                sig,
+                idx,
+                profile_id.as_mut_ptr(),
+                blk.as_mut_ptr(),
+                cap as u32,
+                &mut used,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        items.push(OracleSeqIdItem {
+            profile_id,
+            description: decode_serialized_mlu(&blk[..used as usize]),
+        });
+    }
+    Some(items)
+}
+
+/// One dictionary entry as lcms2 exposes it (`cmsDictGetEntryList` order, which
+/// is the REVERSE of the on-disk record order — see [`OracleDict::entries`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleDictEntry {
+    pub name: String,
+    pub value: String,
+    pub display_name: Option<OracleMlu>,
+    pub display_value: Option<OracleMlu>,
+}
+
+/// A `cmsHANDLE` dictionary as lcms2 exposes it. `entries` is in
+/// `cmsDictGetEntryList` order (reverse of on-disk); reverse it to compare
+/// against an rcms `Dict` (which stores on-disk order).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OracleDict {
+    pub entries: Vec<OracleDictEntry>,
+}
+
+/// Decode a wide u16 unit stream into a `String` via [`char::decode_utf16`].
+fn units_to_string(units: &[u16]) -> String {
+    char::decode_utf16(units.iter().copied())
+        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
+}
+
+/// lcms2 `cmsReadTag` of a `dict`/`meta` tag, decoded to its entry list (in
+/// `cmsDictGetEntryList` enumeration order), or `None`. A display MLU is `None`
+/// when lcms2 stored a NULL MLU for that column. lcms2 reports the empty MLU and
+/// the absent MLU identically here (a serialized count of 0 → an `OracleMlu`
+/// with no entries); the test maps an empty `OracleMlu` to `None` to match rcms,
+/// which stores `None` for a 0-size/absent cell.
+pub fn read_tag_dict(buf: &[u8], sig: u32) -> Option<OracleDict> {
+    // SAFETY: buf/len describe a valid readable slice C only reads.
+    let n = unsafe { rcms_oracle_dict_count(buf.as_ptr(), buf.len() as u32, sig) };
+    if n < 0 {
+        return None;
+    }
+    let cap = 1usize << 16;
+    let mut entries = Vec::with_capacity(n as usize);
+    for idx in 0..n as u32 {
+        let mut name_units = vec![0u16; cap];
+        let mut value_units = vec![0u16; cap];
+        let mut nn = 0u32;
+        let mut vn = 0u32;
+        let mut dnblk = vec![0u8; cap];
+        let mut dvblk = vec![0u8; cap];
+        let mut dnused = 0u32;
+        let mut dvused = 0u32;
+        // SAFETY: all out pointers reference valid local buffers of the declared
+        // capacities; C writes within them only when it returns nonzero; idx < n.
+        let ok = unsafe {
+            rcms_oracle_dict_entry(
+                buf.as_ptr(),
+                buf.len() as u32,
+                sig,
+                idx,
+                name_units.as_mut_ptr(),
+                cap as u32,
+                &mut nn,
+                value_units.as_mut_ptr(),
+                cap as u32,
+                &mut vn,
+                dnblk.as_mut_ptr(),
+                cap as u32,
+                &mut dnused,
+                dvblk.as_mut_ptr(),
+                cap as u32,
+                &mut dvused,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let to_opt_mlu = |m: OracleMlu| if m.entries.is_empty() { None } else { Some(m) };
+        entries.push(OracleDictEntry {
+            name: units_to_string(&name_units[..nn as usize]),
+            value: units_to_string(&value_units[..vn as usize]),
+            display_name: to_opt_mlu(decode_serialized_mlu(&dnblk[..dnused as usize])),
+            display_value: to_opt_mlu(decode_serialized_mlu(&dvblk[..dvused as usize])),
+        });
+    }
+    Some(OracleDict { entries })
 }
 
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.

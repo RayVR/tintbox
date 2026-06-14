@@ -67,6 +67,87 @@ pub enum Tag {
     /// `cmsMLU`, so they share one Rust value. (`textDescription` is the ICC v2
     /// form that an ICC v4 profile would carry as `mluc`.)
     Mlu(Mlu),
+    /// `cmsSigNamedColor2Type` (`'ncl2'`, `Type_NamedColor_Read`,
+    /// `cmstypes.c:3369`): a `cmsNAMEDCOLORLIST` — a vendor flag, shared
+    /// prefix/suffix, and a list of named colours each with a PCS and per-channel
+    /// device coordinates.
+    NamedColor2(NamedColorList),
+    /// `cmsSigProfileSequenceDescType` (`'pseq'`, `Type_ProfileSequenceDesc_Read`,
+    /// `cmstypes.c:3541`): the source→destination profile-sequence description,
+    /// one record per combined profile.
+    ProfileSequenceDesc(Vec<ProfileSequenceItem>),
+    /// `cmsSigProfileSequenceIdType` (`'psid'`, `Type_ProfileSequenceId_Read`,
+    /// `cmstypes.c:3687`): a positioned array of {16-byte profile ID, MLU
+    /// description}, used to identify the profiles in a device-link sequence.
+    ProfileSequenceId(Vec<ProfileIdItem>),
+    /// `cmsSigDictType` (`'dict'`, `Type_Dictionary_Read`, `cmstypes.c:5436`): a
+    /// metadata dictionary — name/value UTF-16 strings with optional localized
+    /// display-name/value MLUs. Carried by the `meta` (and `dict`) tags.
+    Dict(Dict),
+}
+
+/// One named colour of a `cmsNAMEDCOLORLIST` (`cmstypes.c:3369`). `name` is the
+/// fixed 32-byte root name (NUL-trimmed, Latin-1 1:1 like lcms2's `Root`), `pcs`
+/// is the 3×u16 PCS, and `device` holds `nDeviceCoords` u16 device coordinates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedColor {
+    pub name: String,
+    pub pcs: [u16; 3],
+    pub device: Vec<u16>,
+}
+
+/// A `cmsNAMEDCOLORLIST` (`Type_NamedColor_Read`, `cmstypes.c:3369`). `vendor_flag`
+/// is the leading u32; `prefix`/`suffix` are the fixed 32-byte ASCII name affixes
+/// (NUL-trimmed, force-terminated at index 31 like lcms2); `colors` is the list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamedColorList {
+    pub vendor_flag: u32,
+    pub prefix: String,
+    pub suffix: String,
+    pub colors: Vec<NamedColor>,
+}
+
+/// One `cmsPSEQDESC` record of `Type_ProfileSequenceDesc_Read` (`cmstypes.c:3541`):
+/// the four header-derived fields plus the two embedded-text MLUs (manufacturer
+/// and model descriptions).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileSequenceItem {
+    pub device_mfg: Signature,
+    pub device_model: Signature,
+    pub attributes: u64,
+    pub technology: Signature,
+    pub manufacturer: Mlu,
+    pub model: Mlu,
+}
+
+/// One element of `Type_ProfileSequenceId_Read` (`cmstypes.c:3687`): a 16-byte
+/// profile ID and the positioned embedded-MLU description.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileIdItem {
+    pub profile_id: [u8; 16],
+    pub description: Mlu,
+}
+
+/// One entry of `Type_Dictionary_Read` (`cmstypes.c:5436`). `name`/`value` are the
+/// required UTF-16 strings (decoded to `String`); `display_name`/`display_value`
+/// are the optional localized MLUs (present only when the record length is 24/32
+/// and the entry's offset/size are non-zero).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DictEntry {
+    pub name: String,
+    pub value: String,
+    pub display_name: Option<Mlu>,
+    pub display_value: Option<Mlu>,
+}
+
+/// A `cmsHANDLE` dictionary (`Type_Dictionary_Read`, `cmstypes.c:5436`).
+/// `entries` is in ON-DISK record order. Note lcms2's `cmsDictAddEntry` PREPENDS
+/// to the list head, so `cmsDictGetEntryList` enumerates entries in the REVERSE
+/// of this order — the differential test accounts for that by reversing the
+/// oracle's enumeration before comparing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dict {
+    pub entries: Vec<DictEntry>,
 }
 
 /// One localized record of a `cmsMLU` (`_cmsMLUentry`, `cmsnamed.c`): a 2-byte

@@ -456,3 +456,192 @@ int rcms_oracle_mlu_entry(const uint8_t* buf, uint32_t len, uint32_t sig,
     cmsCloseProfile(p);
     return n;
 }
+
+/* ---- NamedColor2 / ProfileSequence{Desc,Id} / Dictionary extractors -------- */
+/* These reach into lcms2's internal structs (lcms2_internal.h, included above)
+   for fields the public API does not expose, and serialize nested cmsMLU*
+   translations into a flat unit stream the Rust side mirrors. */
+
+/* Serialize one cmsMLU* into out: u32 translation count, then per translation
+   2 bytes language, 2 bytes country, u32 nunits, nunits u16 code units (raw,
+   truncated wchar->u16 exactly as rcms_oracle_mlu_entry does). Writes into the
+   byte buffer `out` (capacity `cap`); returns 0 (and sets *used) or -1 on
+   overflow. A NULL mlu serializes as count 0. */
+static int serialize_mlu(const cmsMLU* mlu, uint8_t* out, uint32_t cap, uint32_t* used) {
+    uint32_t off = 0;
+    uint32_t tcount = (mlu != NULL) ? cmsMLUtranslationsCount((cmsMLU*) mlu) : 0;
+    if (off + 4 > cap) return -1;
+    out[off++] = (tcount >> 24) & 0xff; out[off++] = (tcount >> 16) & 0xff;
+    out[off++] = (tcount >> 8) & 0xff;  out[off++] = tcount & 0xff;
+    for (uint32_t i = 0; i < tcount; i++) {
+        char L[3] = {0,0,0}, C[3] = {0,0,0};
+        if (!cmsMLUtranslationsCodes((cmsMLU*) mlu, i, L, C)) return -1;
+        if (off + 4 > cap) return -1;
+        out[off++] = (uint8_t) L[0]; out[off++] = (uint8_t) L[1];
+        out[off++] = (uint8_t) C[0]; out[off++] = (uint8_t) C[1];
+        cmsUInt32Number bytes = cmsMLUgetWide((cmsMLU*) mlu, L, C, NULL, 0);
+        uint32_t nunits = 0;
+        wchar_t* wide = NULL;
+        if (bytes >= sizeof(wchar_t)) {
+            nunits = bytes / sizeof(wchar_t) - 1; /* drop NUL */
+            wide = (wchar_t*) malloc(bytes);
+            if (!wide) return -1;
+            cmsMLUgetWide((cmsMLU*) mlu, L, C, wide, bytes);
+        }
+        if (off + 4 > cap) { free(wide); return -1; }
+        out[off++] = (nunits >> 24) & 0xff; out[off++] = (nunits >> 16) & 0xff;
+        out[off++] = (nunits >> 8) & 0xff;  out[off++] = nunits & 0xff;
+        for (uint32_t j = 0; j < nunits; j++) {
+            uint16_t u = (uint16_t) wide[j];
+            if (off + 2 > cap) { free(wide); return -1; }
+            out[off++] = (u >> 8) & 0xff; out[off++] = u & 0xff;
+        }
+        free(wide);
+    }
+    *used = off;
+    return 0;
+}
+
+/* NamedColor2 -> counts + prefix/suffix. Writes [nColors, ColorantCount] into
+   out_counts and the 33-byte Prefix/Suffix (NUL-padded). Returns 1/0.
+   (vendorFlag is discarded by lcms2 on read, so it is not exposed here.) */
+int rcms_oracle_named_color2_info(const uint8_t* buf, uint32_t len, uint32_t sig,
+                                  uint32_t out_counts[2], uint8_t prefix[33], uint8_t suffix[33]) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsNAMEDCOLORLIST* v = (cmsNAMEDCOLORLIST*) cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = 0;
+    if (v) {
+        out_counts[0] = v->nColors;
+        out_counts[1] = v->ColorantCount;
+        for (int i = 0; i < 33; i++) { prefix[i] = (uint8_t) v->Prefix[i]; suffix[i] = (uint8_t) v->Suffix[i]; }
+        ok = 1;
+    }
+    cmsCloseProfile(p);
+    return ok;
+}
+
+/* NamedColor2 colour `idx` -> name (33 bytes, NUL-terminated), PCS (3 u16), and
+   device colorants (up to cmsMAXCHANNELS u16). Returns 1/0. */
+int rcms_oracle_named_color2_color(const uint8_t* buf, uint32_t len, uint32_t sig,
+                                   uint32_t idx, uint8_t name[33], uint16_t pcs[3],
+                                   uint16_t colorant[16]) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsNAMEDCOLORLIST* v = (cmsNAMEDCOLORLIST*) cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = 0;
+    if (v) {
+        char Name[256]; cmsUInt16Number PCS[3]; cmsUInt16Number Colorant[16];
+        memset(Name, 0, sizeof(Name)); memset(Colorant, 0, sizeof(Colorant));
+        if (cmsNamedColorInfo(v, idx, Name, NULL, NULL, PCS, Colorant)) {
+            Name[32] = 0;
+            for (int i = 0; i < 33; i++) name[i] = (uint8_t) Name[i];
+            for (int i = 0; i < 3; i++) pcs[i] = PCS[i];
+            for (int i = 0; i < 16; i++) colorant[i] = Colorant[i];
+            ok = 1;
+        }
+    }
+    cmsCloseProfile(p);
+    return ok;
+}
+
+/* ProfileSequenceDesc/Id -> element count (cmsSEQ->n), or -1. */
+int rcms_oracle_seq_count(const uint8_t* buf, uint32_t len, uint32_t sig) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return -1;
+    cmsSEQ* seq = (cmsSEQ*) cmsReadTag(p, (cmsTagSignature) sig);
+    int n = -1;
+    if (seq) n = (int) seq->n;
+    cmsCloseProfile(p);
+    return n;
+}
+
+/* ProfileSequenceDesc element `idx` -> the four fixed fields plus the serialized
+   Manufacturer and Model MLUs. out_u32 = [deviceMfg, deviceModel, technology];
+   out_attr = attributes (u64). Returns 1/0. */
+int rcms_oracle_seq_desc_elem(const uint8_t* buf, uint32_t len, uint32_t sig, uint32_t idx,
+                              uint32_t out_u32[3], uint64_t* out_attr,
+                              uint8_t* mblk, uint32_t mcap, uint32_t* mused,
+                              uint8_t* dblk, uint32_t dcap, uint32_t* dused) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsSEQ* seq = (cmsSEQ*) cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = 0;
+    if (seq && idx < seq->n) {
+        cmsPSEQDESC* e = &seq->seq[idx];
+        out_u32[0] = (uint32_t) e->deviceMfg;
+        out_u32[1] = (uint32_t) e->deviceModel;
+        out_u32[2] = (uint32_t) e->technology;
+        *out_attr = (uint64_t) e->attributes;
+        if (serialize_mlu(e->Manufacturer, mblk, mcap, mused) == 0 &&
+            serialize_mlu(e->Model, dblk, dcap, dused) == 0)
+            ok = 1;
+    }
+    cmsCloseProfile(p);
+    return ok;
+}
+
+/* ProfileSequenceId element `idx` -> 16-byte ProfileID + serialized Description
+   MLU. Returns 1/0. */
+int rcms_oracle_seq_id_elem(const uint8_t* buf, uint32_t len, uint32_t sig, uint32_t idx,
+                            uint8_t profile_id[16], uint8_t* blk, uint32_t cap, uint32_t* used) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsSEQ* seq = (cmsSEQ*) cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = 0;
+    if (seq && idx < seq->n) {
+        cmsPSEQDESC* e = &seq->seq[idx];
+        for (int i = 0; i < 16; i++) profile_id[i] = e->ProfileID.ID8[i];
+        if (serialize_mlu(e->Description, blk, cap, used) == 0) ok = 1;
+    }
+    cmsCloseProfile(p);
+    return ok;
+}
+
+/* Dictionary -> entry count (length of cmsDictGetEntryList), or -1. */
+int rcms_oracle_dict_count(const uint8_t* buf, uint32_t len, uint32_t sig) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return -1;
+    cmsHANDLE hDict = (cmsHANDLE) cmsReadTag(p, (cmsTagSignature) sig);
+    int n = -1;
+    if (hDict) {
+        n = 0;
+        for (const cmsDICTentry* e = cmsDictGetEntryList(hDict); e != NULL; e = cmsDictNextEntry(e))
+            n++;
+    }
+    cmsCloseProfile(p);
+    return n;
+}
+
+/* Dictionary entry `idx` (in cmsDictGetEntryList enumeration order) -> name and
+   value as raw u16 unit streams, plus serialized DisplayName/DisplayValue MLUs.
+   Returns 1/0. */
+int rcms_oracle_dict_entry(const uint8_t* buf, uint32_t len, uint32_t sig, uint32_t idx,
+                           uint16_t* name_units, uint32_t ncap, uint32_t* nn,
+                           uint16_t* value_units, uint32_t vcap, uint32_t* vn,
+                           uint8_t* dnblk, uint32_t dncap, uint32_t* dnused,
+                           uint8_t* dvblk, uint32_t dvcap, uint32_t* dvused) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsHANDLE hDict = (cmsHANDLE) cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = 0;
+    if (hDict) {
+        const cmsDICTentry* e = cmsDictGetEntryList(hDict);
+        for (uint32_t i = 0; i < idx && e != NULL; i++) e = cmsDictNextEntry(e);
+        if (e != NULL) {
+            uint32_t n = 0, v = 0;
+            if (e->Name)  { while (e->Name[n])  n++; }
+            if (e->Value) { while (e->Value[v]) v++; }
+            if (n <= ncap && v <= vcap) {
+                for (uint32_t i = 0; i < n; i++) name_units[i]  = (uint16_t) e->Name[i];
+                for (uint32_t i = 0; i < v; i++) value_units[i] = (uint16_t) e->Value[i];
+                *nn = n; *vn = v;
+                if (serialize_mlu(e->DisplayName, dnblk, dncap, dnused) == 0 &&
+                    serialize_mlu(e->DisplayValue, dvblk, dvcap, dvused) == 0)
+                    ok = 1;
+            }
+        }
+    }
+    cmsCloseProfile(p);
+    return ok;
+}
