@@ -999,3 +999,141 @@ int rcms_oracle_interp_float(const uint32_t* grid, uint32_t nIn, uint32_t nOut,
     _cmsFreeInterpParams(p);
     return 1;
 }
+
+/* ---- Pipeline (cmsPipeline) differential shims (slice 4 task 2) -------------
+   Build real lcms2 pipelines from a Matrix stage (cmsStageAllocMatrix) and/or a
+   ToneCurves stage (cmsStageAllocToneCurves over cmsBuildTabulatedToneCurve16),
+   then evaluate via cmsPipelineEval16 / cmsPipelineEvalFloat. These exercise the
+   exact _LUTeval16 / _LUTevalFloat ping-pong walk and the From16ToFloat /
+   FromFloatTo16 boundary conversions we reimplement in rcms::pipeline. */
+
+/* Matrix-only pipeline. `matrix` is row-major Rows*Cols f64; `offset` is Rows
+   f64 or NULL. in/out are 16-bit, widths Cols/Rows. */
+int rcms_oracle_pipeline_matrix_eval16(uint32_t rows, uint32_t cols,
+                                       const double* matrix, const double* offset,
+                                       const uint16_t* in, uint16_t* out) {
+    cmsStage* st = cmsStageAllocMatrix(NULL, rows, cols, matrix, offset);
+    if (!st) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, cols, rows);
+    if (!lut) { cmsStageFree(st); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, st)) {
+        cmsStageFree(st); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEval16(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+int rcms_oracle_pipeline_matrix_eval_float(uint32_t rows, uint32_t cols,
+                                           const double* matrix, const double* offset,
+                                           const float* in, float* out) {
+    cmsStage* st = cmsStageAllocMatrix(NULL, rows, cols, matrix, offset);
+    if (!st) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, cols, rows);
+    if (!lut) { cmsStageFree(st); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, st)) {
+        cmsStageFree(st); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+/* Build a ToneCurves stage from `nCurves` 16-bit tabulated tables, each of
+   length `tblLen`, packed contiguously in `tables`. Returns the stage or NULL. */
+static cmsStage* build_curves_stage(uint32_t nCurves, uint32_t tblLen,
+                                    const uint16_t* tables) {
+    cmsToneCurve** curves = (cmsToneCurve**) calloc(nCurves, sizeof(cmsToneCurve*));
+    if (!curves) return NULL;
+    for (uint32_t i = 0; i < nCurves; i++) {
+        curves[i] = cmsBuildTabulatedToneCurve16(NULL, tblLen, tables + (size_t)i * tblLen);
+        if (!curves[i]) {
+            for (uint32_t k = 0; k < i; k++) cmsFreeToneCurve(curves[k]);
+            free(curves);
+            return NULL;
+        }
+    }
+    cmsStage* st = cmsStageAllocToneCurves(NULL, nCurves, curves);
+    /* cmsStageAllocToneCurves dups each curve, so free our originals. */
+    for (uint32_t i = 0; i < nCurves; i++) cmsFreeToneCurve(curves[i]);
+    free(curves);
+    return st;
+}
+
+/* ToneCurves-only pipeline (nCurves channels in == out). */
+int rcms_oracle_pipeline_curves_eval16(uint32_t nCurves, uint32_t tblLen,
+                                       const uint16_t* tables,
+                                       const uint16_t* in, uint16_t* out) {
+    cmsStage* st = build_curves_stage(nCurves, tblLen, tables);
+    if (!st) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nCurves, nCurves);
+    if (!lut) { cmsStageFree(st); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, st)) {
+        cmsStageFree(st); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEval16(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+int rcms_oracle_pipeline_curves_eval_float(uint32_t nCurves, uint32_t tblLen,
+                                           const uint16_t* tables,
+                                           const float* in, float* out) {
+    cmsStage* st = build_curves_stage(nCurves, tblLen, tables);
+    if (!st) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nCurves, nCurves);
+    if (!lut) { cmsStageFree(st); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, st)) {
+        cmsStageFree(st); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+/* Combined curves -> matrix pipeline. The curves stage has `nCurves` channels
+   (== matrix Cols); the matrix maps Cols -> Rows. in width = nCurves(=cols),
+   out width = rows. */
+int rcms_oracle_pipeline_curves_matrix_eval16(uint32_t nCurves, uint32_t tblLen,
+                                              const uint16_t* tables,
+                                              uint32_t rows, uint32_t cols,
+                                              const double* matrix, const double* offset,
+                                              const uint16_t* in, uint16_t* out) {
+    cmsStage* curves = build_curves_stage(nCurves, tblLen, tables);
+    if (!curves) return 0;
+    cmsStage* mat = cmsStageAllocMatrix(NULL, rows, cols, matrix, offset);
+    if (!mat) { cmsStageFree(curves); return 0; }
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nCurves, rows);
+    if (!lut) { cmsStageFree(curves); cmsStageFree(mat); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, curves)) {
+        cmsStageFree(curves); cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, mat)) {
+        cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEval16(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+int rcms_oracle_pipeline_curves_matrix_eval_float(uint32_t nCurves, uint32_t tblLen,
+                                                  const uint16_t* tables,
+                                                  uint32_t rows, uint32_t cols,
+                                                  const double* matrix, const double* offset,
+                                                  const float* in, float* out) {
+    cmsStage* curves = build_curves_stage(nCurves, tblLen, tables);
+    if (!curves) return 0;
+    cmsStage* mat = cmsStageAllocMatrix(NULL, rows, cols, matrix, offset);
+    if (!mat) { cmsStageFree(curves); return 0; }
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, nCurves, rows);
+    if (!lut) { cmsStageFree(curves); cmsStageFree(mat); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, curves)) {
+        cmsStageFree(curves); cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, mat)) {
+        cmsStageFree(mat); cmsPipelineFree(lut); return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}

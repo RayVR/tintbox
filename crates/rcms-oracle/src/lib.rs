@@ -238,6 +238,58 @@ unsafe extern "C" {
         dvcap: u32,
         dvused: *mut u32,
     ) -> i32;
+    fn rcms_oracle_pipeline_matrix_eval16(
+        rows: u32,
+        cols: u32,
+        matrix: *const f64,
+        offset: *const f64,
+        input: *const u16,
+        out: *mut u16,
+    ) -> i32;
+    fn rcms_oracle_pipeline_matrix_eval_float(
+        rows: u32,
+        cols: u32,
+        matrix: *const f64,
+        offset: *const f64,
+        input: *const f32,
+        out: *mut f32,
+    ) -> i32;
+    fn rcms_oracle_pipeline_curves_eval16(
+        n_curves: u32,
+        tbl_len: u32,
+        tables: *const u16,
+        input: *const u16,
+        out: *mut u16,
+    ) -> i32;
+    fn rcms_oracle_pipeline_curves_eval_float(
+        n_curves: u32,
+        tbl_len: u32,
+        tables: *const u16,
+        input: *const f32,
+        out: *mut f32,
+    ) -> i32;
+    fn rcms_oracle_pipeline_curves_matrix_eval16(
+        n_curves: u32,
+        tbl_len: u32,
+        tables: *const u16,
+        rows: u32,
+        cols: u32,
+        matrix: *const f64,
+        offset: *const f64,
+        input: *const u16,
+        out: *mut u16,
+    ) -> i32;
+    fn rcms_oracle_pipeline_curves_matrix_eval_float(
+        n_curves: u32,
+        tbl_len: u32,
+        tables: *const u16,
+        rows: u32,
+        cols: u32,
+        matrix: *const f64,
+        offset: *const f64,
+        input: *const f32,
+        out: *mut f32,
+    ) -> i32;
 }
 
 /// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).
@@ -537,6 +589,198 @@ pub fn interp_float(
             n_out as u32,
             table.as_ptr(),
             dw_flags,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 pipeline (`cmsPipelineAlloc` + `cmsStageAllocMatrix` +
+/// `cmsPipelineEval16`) holding a single Matrix stage `Cols -> Rows`. `matrix`
+/// is row-major `rows * cols` f64; `offset` is `rows` f64 or empty (NULL). `input`
+/// is `cols` u16. Returns the `rows` u16 outputs, or `None` if lcms2 rejects.
+pub fn pipeline_matrix_eval16(
+    rows: usize,
+    cols: usize,
+    matrix: &[f64],
+    offset: Option<&[f64]>,
+    input: &[u16],
+) -> Option<Vec<u16>> {
+    let mut out = vec![0u16; rows];
+    let off_ptr = offset.map_or(core::ptr::null(), |o| o.as_ptr());
+    // SAFETY: `matrix` is `rows*cols` readable f64, `offset` (when Some) is `rows`
+    // readable f64 else NULL, `input` is `cols` readable u16; `out` has `rows` u16.
+    // C only reads inputs and writes exactly `rows` outputs; the stage and
+    // pipeline are allocated and freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_pipeline_matrix_eval16(
+            rows as u32,
+            cols as u32,
+            matrix.as_ptr(),
+            off_ptr,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Float counterpart of [`pipeline_matrix_eval16`] via `cmsPipelineEvalFloat`.
+pub fn pipeline_matrix_eval_float(
+    rows: usize,
+    cols: usize,
+    matrix: &[f64],
+    offset: Option<&[f64]>,
+    input: &[f32],
+) -> Option<Vec<f32>> {
+    let mut out = vec![0f32; rows];
+    let off_ptr = offset.map_or(core::ptr::null(), |o| o.as_ptr());
+    // SAFETY: as `pipeline_matrix_eval16` but `input`/`out` are `cols`/`rows` f32.
+    let ok = unsafe {
+        rcms_oracle_pipeline_matrix_eval_float(
+            rows as u32,
+            cols as u32,
+            matrix.as_ptr(),
+            off_ptr,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 pipeline holding a single ToneCurves stage built from `n_curves`
+/// 16-bit tabulated curves (`cmsBuildTabulatedToneCurve16`), each of length
+/// `tbl_len`, packed contiguously in `tables` (length `n_curves * tbl_len`).
+/// `input` is `n_curves` u16. Returns the `n_curves` u16 outputs, or `None`.
+pub fn pipeline_curves_eval16(
+    n_curves: usize,
+    tbl_len: usize,
+    tables: &[u16],
+    input: &[u16],
+) -> Option<Vec<u16>> {
+    let mut out = vec![0u16; n_curves];
+    // SAFETY: `tables` is `n_curves*tbl_len` readable u16, `input` is `n_curves`
+    // readable u16; `out` has `n_curves` u16. C copies the tables into curve
+    // handles, evaluates, and frees everything inside the call.
+    let ok = unsafe {
+        rcms_oracle_pipeline_curves_eval16(
+            n_curves as u32,
+            tbl_len as u32,
+            tables.as_ptr(),
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Float counterpart of [`pipeline_curves_eval16`] via `cmsPipelineEvalFloat`.
+pub fn pipeline_curves_eval_float(
+    n_curves: usize,
+    tbl_len: usize,
+    tables: &[u16],
+    input: &[f32],
+) -> Option<Vec<f32>> {
+    let mut out = vec![0f32; n_curves];
+    // SAFETY: as `pipeline_curves_eval16` but `input`/`out` are `n_curves` f32.
+    let ok = unsafe {
+        rcms_oracle_pipeline_curves_eval_float(
+            n_curves as u32,
+            tbl_len as u32,
+            tables.as_ptr(),
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 pipeline `ToneCurves -> Matrix`: a curves stage (`n_curves` channels,
+/// from 16-bit tabulated tables as in [`pipeline_curves_eval16`]) feeding a
+/// Matrix stage `cols -> rows` (with `cols == n_curves`). `input` is `n_curves`
+/// u16; returns the `rows` u16 outputs, or `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn pipeline_curves_matrix_eval16(
+    n_curves: usize,
+    tbl_len: usize,
+    tables: &[u16],
+    rows: usize,
+    cols: usize,
+    matrix: &[f64],
+    offset: Option<&[f64]>,
+    input: &[u16],
+) -> Option<Vec<u16>> {
+    let mut out = vec![0u16; rows];
+    let off_ptr = offset.map_or(core::ptr::null(), |o| o.as_ptr());
+    // SAFETY: `tables` is `n_curves*tbl_len` readable u16; `matrix` is `rows*cols`
+    // readable f64; `offset` (Some) is `rows` readable f64 else NULL; `input` is
+    // `n_curves` readable u16; `out` has `rows` u16. All handles freed inside.
+    let ok = unsafe {
+        rcms_oracle_pipeline_curves_matrix_eval16(
+            n_curves as u32,
+            tbl_len as u32,
+            tables.as_ptr(),
+            rows as u32,
+            cols as u32,
+            matrix.as_ptr(),
+            off_ptr,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Float counterpart of [`pipeline_curves_matrix_eval16`].
+#[allow(clippy::too_many_arguments)]
+pub fn pipeline_curves_matrix_eval_float(
+    n_curves: usize,
+    tbl_len: usize,
+    tables: &[u16],
+    rows: usize,
+    cols: usize,
+    matrix: &[f64],
+    offset: Option<&[f64]>,
+    input: &[f32],
+) -> Option<Vec<f32>> {
+    let mut out = vec![0f32; rows];
+    let off_ptr = offset.map_or(core::ptr::null(), |o| o.as_ptr());
+    // SAFETY: as `pipeline_curves_matrix_eval16` but `input`/`out` are f32.
+    let ok = unsafe {
+        rcms_oracle_pipeline_curves_matrix_eval_float(
+            n_curves as u32,
+            tbl_len as u32,
+            tables.as_ptr(),
+            rows as u32,
+            cols as u32,
+            matrix.as_ptr(),
+            off_ptr,
             input.as_ptr(),
             out.as_mut_ptr(),
         )
