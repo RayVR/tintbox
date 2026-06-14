@@ -10,6 +10,10 @@ unsafe extern "C" {
     fn rcms_oracle_quick_floor(v: f64) -> i32;
     fn rcms_oracle_quick_floor_word(d: f64) -> u16;
     fn rcms_oracle_quick_saturate_word(d: f64) -> u16;
+    fn rcms_oracle_mat3_eval(out: *mut f64, m: *const f64, v: *const f64);
+    fn rcms_oracle_mat3_per(out: *mut f64, a: *const f64, b: *const f64);
+    fn rcms_oracle_mat3_inverse(out: *mut f64, a: *const f64) -> i32;
+    fn rcms_oracle_mat3_solve(out: *mut f64, a: *const f64, b: *const f64) -> i32;
 }
 
 /// lcms2 `_cmsDoubleTo15Fixed16`.
@@ -44,6 +48,51 @@ pub fn quick_floor_word(d: f64) -> u16 {
 pub fn quick_saturate_word(d: f64) -> u16 {
     // SAFETY: pure C arithmetic, no pointers, no allocation.
     unsafe { rcms_oracle_quick_saturate_word(d) }
+}
+
+/// lcms2 `_cmsMAT3eval`.
+pub fn mat3_eval(m: &[f64; 9], v: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: out/m/v are valid fixed-size local arrays; their pointers are valid
+    // for the 9/3/3 doubles C reads/writes, and C writes exactly 3 doubles to out.
+    unsafe {
+        rcms_oracle_mat3_eval(out.as_mut_ptr(), m.as_ptr(), v.as_ptr());
+    }
+    out
+}
+/// lcms2 `_cmsMAT3per`.
+pub fn mat3_per(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
+    let mut out = [0.0f64; 9];
+    // SAFETY: out/a/b are valid fixed-size local arrays; their pointers are valid
+    // for the 9 doubles C reads/writes, and C writes exactly 9 doubles to out.
+    unsafe {
+        rcms_oracle_mat3_per(out.as_mut_ptr(), a.as_ptr(), b.as_ptr());
+    }
+    out
+}
+/// lcms2 `_cmsMAT3inverse`. Returns `None` on singular matrix.
+pub fn mat3_inverse(a: &[f64; 9]) -> Option<[f64; 9]> {
+    let mut out = [0.0f64; 9];
+    // SAFETY: out/a are valid fixed-size local arrays; their pointers are valid for
+    // the 9 doubles C reads/writes. C writes 9 doubles to out only when it returns nonzero.
+    let ok = unsafe { rcms_oracle_mat3_inverse(out.as_mut_ptr(), a.as_ptr()) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+/// lcms2 `_cmsMAT3solve`. Returns `None` on singular matrix.
+pub fn mat3_solve(a: &[f64; 9], b: &[f64; 3]) -> Option<[f64; 3]> {
+    let mut out = [0.0f64; 3];
+    // SAFETY: out/a/b are valid fixed-size local arrays; their pointers are valid for
+    // the 9/3 doubles C reads. C writes 3 doubles to out only when it returns nonzero.
+    let ok = unsafe { rcms_oracle_mat3_solve(out.as_mut_ptr(), a.as_ptr(), b.as_ptr()) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.

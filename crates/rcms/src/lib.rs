@@ -11,6 +11,7 @@ pub mod compat;
 pub mod context;
 pub mod error;
 pub mod fixed;
+pub mod math;
 pub mod sig;
 
 pub use error::{Error, Result};
