@@ -5,12 +5,15 @@
 pub mod descriptor;
 pub mod directory;
 pub mod header;
+pub mod tag;
+pub mod types;
 
 pub use directory::TagEntry;
 pub use header::{ColorSpace, DateTime, Header, ProfileClass, RenderingIntent};
+pub use tag::Tag;
 
-use crate::error::Result;
-use crate::io::MemReader;
+use crate::error::{Error, Result};
+use crate::io::{MemReader, ProfileReader};
 use crate::sig::Signature;
 use core::cell::RefCell;
 use std::collections::BTreeMap;
@@ -22,9 +25,9 @@ pub struct Profile<'a> {
     bytes: &'a [u8],
     header: Header,
     dir: Vec<TagEntry>,
-    /// Placeholder for the per-tag decoded-value cache (populated in Task 3).
-    #[allow(dead_code)]
-    cache: RefCell<BTreeMap<u32, ()>>,
+    /// Lazy per-tag decoded-value cache, keyed by the *resolved* (link-chased)
+    /// tag signature. `read_tag` populates it on first read (lcms2 `TagPtrs`).
+    cache: RefCell<BTreeMap<u32, Tag>>,
 }
 
 impl<'a> Profile<'a> {
@@ -68,6 +71,113 @@ impl<'a> Profile<'a> {
     /// The directory entry for `sig`, if present.
     pub fn tag_entry(&self, sig: Signature) -> Option<&TagEntry> {
         self.dir.iter().find(|e| e.sig == sig)
+    }
+
+    /// lcms2 `_cmsSearchTag(Icc, sig, TRUE)` (`cmsio0.c:688-715`): locate the
+    /// directory entry for `sig`, following tag links TRANSITIVELY (a link points
+    /// at an earlier accepted entry; that entry may itself be a link). Returns the
+    /// resolved entry — the one whose offset/size hold the actual data. `None`
+    /// when `sig` is absent. We bound the walk by the directory length so a
+    /// pathological self-referential chain cannot loop forever (lcms2 relies on
+    /// links only ever pointing *backwards*, which the directory builder enforces).
+    fn search_tag(&self, sig: Signature) -> Option<&TagEntry> {
+        let mut cur = self.tag_entry(sig)?;
+        for _ in 0..self.dir.len() {
+            match cur.linked {
+                Some(linked) => cur = self.tag_entry(linked)?,
+                None => return Some(cur),
+            }
+        }
+        Some(cur)
+    }
+
+    /// The uncooked tag payload bytes: the `size` bytes at the tag's on-disk
+    /// `offset`, links chased to the resolved entry. Includes the 8-byte type
+    /// base — this is the raw on-disk tag exactly as lcms2 would read it raw.
+    /// Errors if the tag is absent or the byte range falls outside the profile.
+    pub fn read_tag_raw(&self, sig: Signature) -> Result<&'a [u8]> {
+        let entry = self.search_tag(sig).ok_or(Error::Range)?;
+        let off = entry.offset as usize;
+        let end = off.checked_add(entry.size as usize).ok_or(Error::Range)?;
+        self.bytes.get(off..end).ok_or(Error::Range)
+    }
+
+    /// lcms2 `cmsReadTag` (`cmsio0.c:1722-1876`), §7.5 flow, returning the decoded
+    /// [`Tag`] (a clone of the cached value).
+    ///
+    /// 1. `_cmsSearchTag(sig, TRUE)` — chase links transitively to the resolved
+    ///    entry. Absent → `Error::Range`.
+    /// 2. On-disk `TagSize < 8` → corruption error.
+    /// 3. Read the 8-byte type base; confirm the type sig is one of the original
+    ///    `sig`'s descriptor `allowed_types` (else `Error::BadType`, matching
+    ///    lcms2's `IsTypeSupported`).
+    /// 4. The handler receives `TagSize - 8` bytes; dispatch on the type.
+    /// 5. Validate the decoded element count `>= descriptor.elem_count`
+    ///    (`cmsio0.c:1852`); else corruption.
+    /// 6. Cache and return.
+    pub fn read_tag(&self, sig: Signature) -> Result<Tag> {
+        // 1. Locate + chase links. The cache is keyed by the resolved signature so
+        //    two links to the same data share one entry (lcms2 caches per slot n).
+        let entry = *self.search_tag(sig).ok_or(Error::Range)?;
+        let resolved = entry.sig;
+
+        if let Some(cached) = self.cache.borrow().get(&resolved.to_raw()) {
+            return Ok(cached.clone());
+        }
+
+        // The descriptor for the ORIGINAL sig drives the type/elem-count check
+        // (lcms2 looks up `_cmsGetTagDescriptor(Icc, sig)`). Unknown tag → error.
+        let desc = descriptor::descriptor(sig).ok_or(Error::BadType(sig))?;
+
+        // 2. TagSize < 8 is corruption (cmsio0.c:1772).
+        if entry.size < 8 {
+            return Err(Error::Corrupt("tag size < 8"));
+        }
+
+        // 3. Seek to offset, read the type base, validate against allowed_types.
+        let mut r = MemReader::new(self.bytes);
+        r.seek(entry.offset as u64)?;
+        let type_sig = r.read_type_base()?;
+        if !desc.allowed_types.contains(&type_sig) {
+            return Err(Error::BadType(type_sig));
+        }
+
+        // 4. Dispatch; the handler gets TagSize - 8 payload bytes.
+        let payload = entry.size - 8;
+        let value = types::read_tag_value(type_sig, &mut r, payload)?;
+
+        // 5. Element-count check (cmsio0.c:1852): the decoded count must be at
+        //    least the descriptor's required ElemCount.
+        if elem_count(&value) < desc.elem_count {
+            return Err(Error::Corrupt("inconsistent element count"));
+        }
+
+        // 6. Cache + return.
+        self.cache
+            .borrow_mut()
+            .insert(resolved.to_raw(), value.clone());
+        Ok(value)
+    }
+}
+
+/// The decoded element count lcms2's handler reports via `*nItems`, used for the
+/// §7.5 element-count validation (`cmsio0.c:1852`). Mirrors each trivial
+/// handler's `*nItems`: array types report their length, scalar/struct types 1.
+fn elem_count(tag: &Tag) -> u32 {
+    match tag {
+        // Array handlers set *nItems = n (the element count).
+        Tag::S15Fixed16Array(v) => v.len() as u32,
+        Tag::U16Fixed16Array(v) => v.len() as u32,
+        Tag::U8Array(v) => v.len() as u32,
+        Tag::U32Array(v) => v.len() as u32,
+        // Scalar / single-struct handlers set *nItems = 1.
+        Tag::Xyz(_)
+        | Tag::Signature(_)
+        | Tag::Data { .. }
+        | Tag::DateTime(_)
+        | Tag::Chromaticity(_)
+        | Tag::Text(_)
+        | Tag::ColorantOrder(_) => 1,
     }
 }
 
@@ -155,5 +265,302 @@ mod tests {
             let rust_ok = Profile::open(&bytes).is_ok();
             assert_eq!(rust_ok, oracle_ok, "open disagree on {name}");
         }
+    }
+
+    // On-disk tag-TYPE signatures of this task's trivial readers.
+    const TY_XYZ: u32 = 0x5859_5A20; // 'XYZ '
+    const TY_CORBIS_XYZ: u32 = 0x17A5_05B8;
+    const TY_S15F16: u32 = 0x7366_3332; // 'sf32'
+    const TY_U16F16: u32 = 0x7566_3332; // 'uf32'
+    const TY_UI08: u32 = 0x7569_3038; // 'ui08'
+    const TY_UI32: u32 = 0x7569_3332; // 'ui32'
+    const TY_SIG: u32 = 0x7369_6720; // 'sig '
+    const TY_DATA: u32 = 0x6461_7461; // 'data'
+    const TY_DTIM: u32 = 0x6474_696D; // 'dtim'
+    const TY_CHRM: u32 = 0x6368_726D; // 'chrm'
+    const TY_TEXT: u32 = 0x7465_7874; // 'text'
+    const TY_CLRO: u32 = 0x636C_726F; // 'clro'
+
+    /// Differential: for every testbed profile both rcms and lcms2 accept, every
+    /// tag whose on-disk TYPE is one of this task's trivial readers must decode to
+    /// the SAME value via rcms `read_tag` as via lcms2 `cmsReadTag`. Tallies which
+    /// trivial types were exercised over how many profiles.
+    #[test]
+    fn trivial_tag_values_match_oracle_over_testbed() {
+        use std::collections::BTreeMap;
+
+        let files = testbed_icc();
+        assert!(!files.is_empty(), "no .icc in testbed");
+
+        // type-sig -> count of tags compared with that on-disk type.
+        let mut exercised: BTreeMap<u32, usize> = BTreeMap::new();
+        let mut profiles_with_trivial = 0usize;
+
+        for path in &files {
+            let bytes = fs::read(path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+
+            if !rcms_oracle::open_succeeds(&bytes) {
+                continue;
+            }
+            let p = match Profile::open(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let mut hit_here = false;
+            for sig in p.tags().collect::<Vec<_>>() {
+                let raw = sig.to_raw();
+                let ty = match rcms_oracle::tag_true_type(&bytes, raw) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let rust = p.read_tag(sig);
+
+                match ty {
+                    TY_XYZ | TY_CORBIS_XYZ => {
+                        let c = rcms_oracle::read_tag_xyz(&bytes, raw).expect("oracle xyz");
+                        match rust.expect("rust xyz") {
+                            Tag::Xyz(v) => {
+                                rcms_oracle::assert_f64_bits_eq(
+                                    v.x,
+                                    c[0],
+                                    (name.as_ref(), raw, "x"),
+                                );
+                                rcms_oracle::assert_f64_bits_eq(
+                                    v.y,
+                                    c[1],
+                                    (name.as_ref(), raw, "y"),
+                                );
+                                rcms_oracle::assert_f64_bits_eq(
+                                    v.z,
+                                    c[2],
+                                    (name.as_ref(), raw, "z"),
+                                );
+                            }
+                            other => panic!("{name}:{raw:08x} expected Xyz, got {other:?}"),
+                        }
+                    }
+                    TY_S15F16 => {
+                        // Count derives from on-disk payload size / 4.
+                        let entry = p.tag_entry(sig).unwrap();
+                        let n = ((entry.size - 8) / 4) as usize;
+                        let c =
+                            rcms_oracle::read_tag_s15f16(&bytes, raw, n).expect("oracle s15f16");
+                        match rust.expect("rust s15f16") {
+                            Tag::S15Fixed16Array(v) => {
+                                assert_eq!(v.len(), n, "{name}:{raw:08x} s15f16 len");
+                                for (i, (rv, cv)) in v.iter().zip(c.iter()).enumerate() {
+                                    rcms_oracle::assert_f64_bits_eq(
+                                        rv.to_f64(),
+                                        *cv,
+                                        (name.as_ref(), raw, i),
+                                    );
+                                }
+                            }
+                            other => {
+                                panic!("{name}:{raw:08x} expected S15Fixed16Array, got {other:?}")
+                            }
+                        }
+                    }
+                    TY_U16F16 => {
+                        // No oracle extractor for u16f16 specifically; compare the
+                        // raw u32 cells against the raw tag bytes (payload after the
+                        // 8-byte base) — bit-exact by construction.
+                        match rust.expect("rust u16f16") {
+                            Tag::U16Fixed16Array(v) => {
+                                let raw_tag = p.read_tag_raw(sig).unwrap();
+                                let payload = &raw_tag[8..];
+                                assert_eq!(
+                                    v.len(),
+                                    payload.len() / 4,
+                                    "{name}:{raw:08x} u16f16 len"
+                                );
+                                for (i, cell) in payload.chunks_exact(4).enumerate() {
+                                    let want = u32::from_be_bytes(cell.try_into().unwrap());
+                                    assert_eq!(v[i].to_raw(), want, "{name}:{raw:08x} u16f16[{i}]");
+                                }
+                            }
+                            other => {
+                                panic!("{name}:{raw:08x} expected U16Fixed16Array, got {other:?}")
+                            }
+                        }
+                    }
+                    TY_UI08 => match rust.expect("rust ui08") {
+                        Tag::U8Array(v) => {
+                            let raw_tag = p.read_tag_raw(sig).unwrap();
+                            assert_eq!(v, &raw_tag[8..], "{name}:{raw:08x} ui08 bytes");
+                        }
+                        other => panic!("{name}:{raw:08x} expected U8Array, got {other:?}"),
+                    },
+                    TY_UI32 => match rust.expect("rust ui32") {
+                        Tag::U32Array(v) => {
+                            let raw_tag = p.read_tag_raw(sig).unwrap();
+                            let payload = &raw_tag[8..];
+                            assert_eq!(v.len(), payload.len() / 4, "{name}:{raw:08x} ui32 len");
+                            for (i, cell) in payload.chunks_exact(4).enumerate() {
+                                let want = u32::from_be_bytes(cell.try_into().unwrap());
+                                assert_eq!(v[i], want, "{name}:{raw:08x} ui32[{i}]");
+                            }
+                        }
+                        other => panic!("{name}:{raw:08x} expected U32Array, got {other:?}"),
+                    },
+                    TY_SIG => {
+                        let c = rcms_oracle::read_tag_signature(&bytes, raw).expect("oracle sig");
+                        match rust.expect("rust sig") {
+                            Tag::Signature(s) => assert_eq!(s.to_raw(), c, "{name}:{raw:08x} sig"),
+                            other => panic!("{name}:{raw:08x} expected Signature, got {other:?}"),
+                        }
+                    }
+                    TY_DATA => {
+                        let (cflag, cdata) =
+                            rcms_oracle::read_tag_data(&bytes, raw).expect("oracle data");
+                        match rust.expect("rust data") {
+                            Tag::Data { flag, data } => {
+                                assert_eq!(flag, cflag, "{name}:{raw:08x} data flag");
+                                assert_eq!(data, cdata, "{name}:{raw:08x} data bytes");
+                            }
+                            other => panic!("{name}:{raw:08x} expected Data, got {other:?}"),
+                        }
+                    }
+                    TY_DTIM => {
+                        let c =
+                            rcms_oracle::read_tag_datetime(&bytes, raw).expect("oracle datetime");
+                        match rust.expect("rust datetime") {
+                            Tag::DateTime(d) => {
+                                assert_eq!(
+                                    [d.year, d.month, d.day, d.hours, d.minutes, d.seconds],
+                                    c,
+                                    "{name}:{raw:08x} datetime"
+                                );
+                            }
+                            other => panic!("{name}:{raw:08x} expected DateTime, got {other:?}"),
+                        }
+                    }
+                    TY_CHRM => {
+                        let c =
+                            rcms_oracle::read_tag_chromaticity(&bytes, raw).expect("oracle chrm");
+                        match rust.expect("rust chrm") {
+                            Tag::Chromaticity(t) => {
+                                let got =
+                                    [t.red.x, t.red.y, t.green.x, t.green.y, t.blue.x, t.blue.y];
+                                for (i, (g, cv)) in got.iter().zip(c.iter()).enumerate() {
+                                    rcms_oracle::assert_f64_bits_eq(
+                                        *g,
+                                        *cv,
+                                        (name.as_ref(), raw, i),
+                                    );
+                                }
+                            }
+                            other => {
+                                panic!("{name}:{raw:08x} expected Chromaticity, got {other:?}")
+                            }
+                        }
+                    }
+                    TY_TEXT => {
+                        let c = rcms_oracle::read_tag_text(&bytes, raw).expect("oracle text");
+                        match rust.expect("rust text") {
+                            Tag::Text(s) => {
+                                assert_eq!(s.as_bytes(), c.as_slice(), "{name}:{raw:08x} text");
+                            }
+                            other => panic!("{name}:{raw:08x} expected Text, got {other:?}"),
+                        }
+                    }
+                    TY_CLRO => {
+                        // The oracle returns the 16-byte 0xFF-padded array; rcms
+                        // returns just the Count leading bytes. Compare rcms's bytes
+                        // against the oracle's leading bytes.
+                        let c =
+                            rcms_oracle::read_tag_colorant_order(&bytes, raw).expect("oracle clro");
+                        match rust.expect("rust clro") {
+                            Tag::ColorantOrder(order) => {
+                                assert!(order.len() <= c.len(), "{name}:{raw:08x} clro len");
+                                assert_eq!(
+                                    order.as_slice(),
+                                    &c[..order.len()],
+                                    "{name}:{raw:08x} clro bytes"
+                                );
+                            }
+                            other => {
+                                panic!("{name}:{raw:08x} expected ColorantOrder, got {other:?}")
+                            }
+                        }
+                    }
+                    // Not a trivial type this task handles; skip (e.g. curv, mluc).
+                    _ => continue,
+                }
+
+                *exercised.entry(ty).or_default() += 1;
+                hit_here = true;
+            }
+            if hit_here {
+                profiles_with_trivial += 1;
+            }
+        }
+
+        println!(
+            "trivial tag diff: {profiles_with_trivial} profiles carried trivial tags; \
+             per-type comparison counts (type_sig -> n):"
+        );
+        for (ty, n) in &exercised {
+            let b = ty.to_be_bytes();
+            let s: String = b.iter().map(|&c| c as char).collect();
+            println!("  '{s}' ({ty:08x}): {n}");
+        }
+
+        // XYZ colorant tags appear in test1..5 / sRGB-style profiles; require we
+        // exercised at least the XYZ reader.
+        assert!(
+            exercised.contains_key(&TY_XYZ),
+            "expected at least one XYZ-typed tag exercised over the testbed"
+        );
+    }
+
+    /// A deferred-type tag (a TRC curve, on-disk type `'curv'`/`'para'`) must
+    /// return `Error::Unsupported` from `read_tag` — never a panic or a wrong
+    /// value. lcms2 *can* read it; rcms defers curve types to a later slice, so
+    /// rcms returning Unsupported is the contracted behaviour for now.
+    #[test]
+    fn deferred_type_tag_returns_unsupported() {
+        let red_trc = Signature::from_raw(0x7254_5243); // 'rTRC'
+        let gray_trc = Signature::from_raw(0x6b54_5243); // 'kTRC'
+
+        let mut checked = 0usize;
+        for path in testbed_icc() {
+            let bytes = fs::read(&path).unwrap();
+            if !rcms_oracle::open_succeeds(&bytes) {
+                continue;
+            }
+            let p = match Profile::open(&bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            for sig in [red_trc, gray_trc] {
+                if !p.has_tag(sig) {
+                    continue;
+                }
+                // Only assert for curve/parametric on-disk types (the deferred set).
+                let ty = match rcms_oracle::tag_true_type(&bytes, sig.to_raw()) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                const TY_CURV: u32 = 0x6375_7276; // 'curv'
+                const TY_PARA: u32 = 0x7061_7261; // 'para'
+                if ty != TY_CURV && ty != TY_PARA {
+                    continue;
+                }
+                assert_eq!(
+                    p.read_tag(sig),
+                    Err(Error::Unsupported("tag type deferred to a later slice")),
+                    "deferred curve tag {sig} in {:?} should be Unsupported",
+                    path.file_name().unwrap()
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "expected at least one deferred TRC curve tag in the testbed"
+        );
     }
 }

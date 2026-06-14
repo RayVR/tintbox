@@ -211,3 +211,161 @@ uint32_t rcms_oracle_tag_signature(const uint8_t* buf, uint32_t len, uint32_t n)
     cmsCloseProfile(p);
     return sig;
 }
+
+/* The on-disk tag TYPE signature for a given tag (cmsGetTagTrueType). Returns 0
+   if the profile cannot be opened, the tag is absent, or the type is unknown.
+   This lets the differential test pick which tags carry one of this task's
+   trivial on-disk types before it asserts the cooked value. */
+uint32_t rcms_oracle_tag_true_type(const uint8_t* buf, uint32_t len, uint32_t sig) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    /* _cmsGetTagTrueType only knows the type after the tag has actually been
+       read (it inspects TagTypeHandlers[n], which is NULL until cmsReadTag
+       populates it). So read the tag first; ignore the cooked value. */
+    (void) cmsReadTag(p, (cmsTagSignature) sig);
+    uint32_t t = (uint32_t) _cmsGetTagTrueType(p, (cmsTagSignature) sig);
+    cmsCloseProfile(p);
+    return t;
+}
+
+/* ---- Per-type cooked-value extractors (cmsReadTag) ------------------------ */
+/* Each opens the profile, reads the named tag, copies the value into a flat
+   caller-provided buffer, and returns 1 on success (tag present, read OK) or 0
+   otherwise. The differential test calls these only after confirming via
+   rcms_oracle_tag_true_type that the on-disk type is the expected one. */
+
+/* XYZType -> 3 doubles [X,Y,Z]. */
+int rcms_oracle_read_tag_xyz(const uint8_t* buf, uint32_t len, uint32_t sig, double out[3]) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsCIEXYZ* v = (cmsCIEXYZ*) cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = 0;
+    if (v) { out[0]=v->X; out[1]=v->Y; out[2]=v->Z; ok = 1; }
+    cmsCloseProfile(p);
+    return ok;
+}
+
+/* S15Fixed16ArrayType -> doubles. Writes up to `cap` doubles, returns the count
+   (number of elements) or -1 on failure. */
+int rcms_oracle_read_tag_s15f16(const uint8_t* buf, uint32_t len, uint32_t sig,
+                                double* out, uint32_t cap) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return -1;
+    cmsFloat64Number* v = (cmsFloat64Number*) cmsReadTag(p, (cmsTagSignature) sig);
+    int n = -1;
+    if (v) {
+        /* lcms2 stores the count nowhere reachable here; the chad/arts tags have
+           a fixed ElemCount of 9 and are the only s15f16 tags. The differential
+           test passes the on-disk byte size / 4 as the expected count and asks
+           for exactly that many, so we copy `cap` elements. */
+        for (uint32_t i = 0; i < cap; i++) out[i] = v[i];
+        n = (int) cap;
+    }
+    cmsCloseProfile(p);
+    return n;
+}
+
+/* SignatureType -> u32. Returns 1/0. */
+int rcms_oracle_read_tag_signature(const uint8_t* buf, uint32_t len, uint32_t sig, uint32_t* out) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsSignature* v = (cmsSignature*) cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = 0;
+    if (v) { *out = (uint32_t) *v; ok = 1; }
+    cmsCloseProfile(p);
+    return ok;
+}
+
+/* TextType -> ASCII bytes (no terminator). Writes up to `cap` bytes into out,
+   returns the length (excluding the implicit NUL) or -1 on failure. */
+int rcms_oracle_read_tag_text(const uint8_t* buf, uint32_t len, uint32_t sig,
+                              uint8_t* out, uint32_t cap) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return -1;
+    cmsMLU* mlu = (cmsMLU*) cmsReadTag(p, (cmsTagSignature) sig);
+    int n = -1;
+    if (mlu) {
+        cmsUInt32Number sz = cmsMLUgetASCII(mlu, cmsNoLanguage, cmsNoCountry, NULL, 0);
+        if (sz > 0 && sz <= cap + 1) {
+            cmsMLUgetASCII(mlu, cmsNoLanguage, cmsNoCountry, (char*) out, sz);
+            n = (int) (sz - 1); /* drop the trailing NUL */
+        }
+    }
+    cmsCloseProfile(p);
+    return n;
+}
+
+/* DataType -> flag (u32) + raw bytes. Writes the flag into *flag and up to `cap`
+   data bytes into out; returns the data length or -1 on failure. */
+int rcms_oracle_read_tag_data(const uint8_t* buf, uint32_t len, uint32_t sig,
+                              uint32_t* flag, uint8_t* out, uint32_t cap) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return -1;
+    cmsICCData* v = (cmsICCData*) cmsReadTag(p, (cmsTagSignature) sig);
+    int n = -1;
+    if (v && v->len <= cap) {
+        *flag = v->flag;
+        for (cmsUInt32Number i = 0; i < v->len; i++) out[i] = v->data[i];
+        n = (int) v->len;
+    }
+    cmsCloseProfile(p);
+    return n;
+}
+
+/* DateTimeType -> 6 u16 [year,month,day,hours,minutes,seconds] (wire order, the
+   ICC dateTimeNumber fields recovered from the decoded struct tm). */
+int rcms_oracle_read_tag_datetime(const uint8_t* buf, uint32_t len, uint32_t sig, uint16_t out[6]) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    struct tm* t = (struct tm*) cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = 0;
+    if (t) {
+        out[0] = (uint16_t) (t->tm_year + 1900);
+        out[1] = (uint16_t) (t->tm_mon + 1);
+        out[2] = (uint16_t) t->tm_mday;
+        out[3] = (uint16_t) t->tm_hour;
+        out[4] = (uint16_t) t->tm_min;
+        out[5] = (uint16_t) t->tm_sec;
+        ok = 1;
+    }
+    cmsCloseProfile(p);
+    return ok;
+}
+
+/* ChromaticityType -> 6 doubles [Rx,Ry,Gx,Gy,Bx,By]. */
+int rcms_oracle_read_tag_chromaticity(const uint8_t* buf, uint32_t len, uint32_t sig, double out[6]) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsCIExyYTRIPLE* v = (cmsCIExyYTRIPLE*) cmsReadTag(p, (cmsTagSignature) sig);
+    int ok = 0;
+    if (v) {
+        out[0]=v->Red.x;   out[1]=v->Red.y;
+        out[2]=v->Green.x; out[3]=v->Green.y;
+        out[4]=v->Blue.x;  out[5]=v->Blue.y;
+        ok = 1;
+    }
+    cmsCloseProfile(p);
+    return ok;
+}
+
+/* ColorantOrderType -> bytes (the laydown order). lcms2 stores a cmsMAXCHANNELS
+   array padded with 0xFF; the meaningful Count is the leading run of non-0xFF
+   entries, but to compare against rcms we return exactly the count the on-disk
+   tag declared. We cannot recover that count from the cooked array reliably
+   (a legitimate entry could be 0xFF), so the differential test reads the raw
+   Count from the tag bytes itself; this extractor returns the full padded array
+   so the test can compare the first Count entries. Writes up to `cap` bytes,
+   returns the number written (cmsMAXCHANNELS) or -1 on failure. */
+int rcms_oracle_read_tag_colorant_order(const uint8_t* buf, uint32_t len, uint32_t sig,
+                                        uint8_t* out, uint32_t cap) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return -1;
+    cmsUInt8Number* v = (cmsUInt8Number*) cmsReadTag(p, (cmsTagSignature) sig);
+    int n = -1;
+    if (v && cap >= cmsMAXCHANNELS) {
+        for (int i = 0; i < cmsMAXCHANNELS; i++) out[i] = v[i];
+        n = cmsMAXCHANNELS;
+    }
+    cmsCloseProfile(p);
+    return n;
+}

@@ -25,6 +25,6 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::fixed::{Half, S15Fixed16, U16Fixed16, U8Fixed8};
     pub use crate::io::{ProfileReader, ProfileWriter};
-    pub use crate::profile::{Header, Profile};
+    pub use crate::profile::{Header, Profile, Tag};
     pub use crate::sig::Signature;
 }

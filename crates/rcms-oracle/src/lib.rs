@@ -31,6 +31,35 @@ unsafe extern "C" {
     fn rcms_oracle_open_succeeds(buf: *const u8, len: u32) -> i32;
     fn rcms_oracle_tag_count(buf: *const u8, len: u32) -> i32;
     fn rcms_oracle_tag_signature(buf: *const u8, len: u32, n: u32) -> u32;
+    fn rcms_oracle_tag_true_type(buf: *const u8, len: u32, sig: u32) -> u32;
+    fn rcms_oracle_read_tag_xyz(buf: *const u8, len: u32, sig: u32, out: *mut f64) -> i32;
+    fn rcms_oracle_read_tag_s15f16(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        out: *mut f64,
+        cap: u32,
+    ) -> i32;
+    fn rcms_oracle_read_tag_signature(buf: *const u8, len: u32, sig: u32, out: *mut u32) -> i32;
+    fn rcms_oracle_read_tag_text(buf: *const u8, len: u32, sig: u32, out: *mut u8, cap: u32)
+        -> i32;
+    fn rcms_oracle_read_tag_data(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        flag: *mut u32,
+        out: *mut u8,
+        cap: u32,
+    ) -> i32;
+    fn rcms_oracle_read_tag_datetime(buf: *const u8, len: u32, sig: u32, out: *mut u16) -> i32;
+    fn rcms_oracle_read_tag_chromaticity(buf: *const u8, len: u32, sig: u32, out: *mut f64) -> i32;
+    fn rcms_oracle_read_tag_colorant_order(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        out: *mut u8,
+        cap: u32,
+    ) -> i32;
 }
 
 /// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).
@@ -307,6 +336,171 @@ pub fn read_alignment(buf: &[u8], offset: u32) -> (bool, u32) {
     let ok =
         unsafe { rcms_oracle_read_alignment(buf.as_ptr(), buf.len() as u32, offset, &mut tell) };
     (ok != 0, tell)
+}
+
+/// lcms2 `_cmsGetTagTrueType`: the on-disk tag-type signature for a tag, or
+/// `None` if the profile cannot be opened, the tag is absent, or the type is
+/// unknown. Used to pick which tags carry one of the trivial on-disk types.
+pub fn tag_true_type(buf: &[u8], sig: u32) -> Option<u32> {
+    // SAFETY: buf/len describe a valid readable slice C only reads.
+    let t = unsafe { rcms_oracle_tag_true_type(buf.as_ptr(), buf.len() as u32, sig) };
+    if t == 0 {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+/// lcms2 `cmsReadTag` of an XYZType tag -> `[X,Y,Z]`, or `None` on failure.
+pub fn read_tag_xyz(buf: &[u8], sig: u32) -> Option<[f64; 3]> {
+    let mut out = [0.0f64; 3];
+    // SAFETY: buf/len describe a valid readable slice; out is a valid 3-double
+    // array C writes only when it returns nonzero.
+    let ok =
+        unsafe { rcms_oracle_read_tag_xyz(buf.as_ptr(), buf.len() as u32, sig, out.as_mut_ptr()) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsReadTag` of an S15Fixed16ArrayType -> `n` doubles, or `None`.
+pub fn read_tag_s15f16(buf: &[u8], sig: u32, n: usize) -> Option<Vec<f64>> {
+    let mut out = vec![0.0f64; n];
+    // SAFETY: buf/len describe a valid readable slice; out has room for n doubles,
+    // which is exactly what C writes when it returns >= 0.
+    let got = unsafe {
+        rcms_oracle_read_tag_s15f16(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            out.as_mut_ptr(),
+            n as u32,
+        )
+    };
+    if got >= 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsReadTag` of a SignatureType -> the u32 signature, or `None`.
+pub fn read_tag_signature(buf: &[u8], sig: u32) -> Option<u32> {
+    let mut out = 0u32;
+    // SAFETY: buf/len describe a valid readable slice; out is a valid u32 C writes
+    // only when it returns nonzero.
+    let ok =
+        unsafe { rcms_oracle_read_tag_signature(buf.as_ptr(), buf.len() as u32, sig, &mut out) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsReadTag` of a TextType -> the ASCII bytes (no NUL), or `None`.
+pub fn read_tag_text(buf: &[u8], sig: u32) -> Option<Vec<u8>> {
+    // The longest text tag in the testbed is well under 64 KiB; use a generous cap.
+    let cap = 65536usize;
+    let mut out = vec![0u8; cap];
+    // SAFETY: buf/len describe a valid readable slice; out has `cap` bytes, and C
+    // writes at most `cap` bytes (it bails when the string exceeds cap+1).
+    let n = unsafe {
+        rcms_oracle_read_tag_text(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            out.as_mut_ptr(),
+            cap as u32,
+        )
+    };
+    if n >= 0 {
+        out.truncate(n as usize);
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsReadTag` of a DataType -> `(flag, bytes)`, or `None`.
+pub fn read_tag_data(buf: &[u8], sig: u32) -> Option<(u32, Vec<u8>)> {
+    let cap = 1usize << 20;
+    let mut out = vec![0u8; cap];
+    let mut flag = 0u32;
+    // SAFETY: buf/len describe a valid readable slice; out has `cap` bytes and C
+    // writes at most `cap` (it bails when len > cap); flag is a valid u32.
+    let n = unsafe {
+        rcms_oracle_read_tag_data(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            &mut flag,
+            out.as_mut_ptr(),
+            cap as u32,
+        )
+    };
+    if n >= 0 {
+        out.truncate(n as usize);
+        Some((flag, out))
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsReadTag` of a DateTimeType -> `[year,month,day,hours,minutes,seconds]`.
+pub fn read_tag_datetime(buf: &[u8], sig: u32) -> Option<[u16; 6]> {
+    let mut out = [0u16; 6];
+    // SAFETY: buf/len describe a valid readable slice; out is a valid 6-u16 array
+    // C writes only when it returns nonzero.
+    let ok = unsafe {
+        rcms_oracle_read_tag_datetime(buf.as_ptr(), buf.len() as u32, sig, out.as_mut_ptr())
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsReadTag` of a ChromaticityType -> `[Rx,Ry,Gx,Gy,Bx,By]`, or `None`.
+pub fn read_tag_chromaticity(buf: &[u8], sig: u32) -> Option<[f64; 6]> {
+    let mut out = [0.0f64; 6];
+    // SAFETY: buf/len describe a valid readable slice; out is a valid 6-double
+    // array C writes only when it returns nonzero.
+    let ok = unsafe {
+        rcms_oracle_read_tag_chromaticity(buf.as_ptr(), buf.len() as u32, sig, out.as_mut_ptr())
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsReadTag` of a ColorantOrderType -> the full cmsMAXCHANNELS (16) byte
+/// laydown-order array (0xFF-padded past the declared count), or `None`.
+pub fn read_tag_colorant_order(buf: &[u8], sig: u32) -> Option<Vec<u8>> {
+    let cap = 16usize; // cmsMAXCHANNELS
+    let mut out = vec![0u8; cap];
+    // SAFETY: buf/len describe a valid readable slice; out has cmsMAXCHANNELS bytes,
+    // exactly what C writes when it returns nonzero.
+    let n = unsafe {
+        rcms_oracle_read_tag_colorant_order(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            out.as_mut_ptr(),
+            cap as u32,
+        )
+    };
+    if n >= 0 {
+        out.truncate(n as usize);
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.
