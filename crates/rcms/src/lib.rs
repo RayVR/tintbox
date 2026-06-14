@@ -7,12 +7,18 @@
 //! always compiles. The full module set / prelude is assembled by the final task.
 
 pub mod color;
+pub mod context;
+pub mod error;
 pub mod fixed;
 pub mod sig;
+
+pub use error::{Error, Result};
 
 /// One-line imports for consumers: `use rcms::prelude::*;`.
 pub mod prelude {
     pub use crate::color::{CIELCh, CIELab, CIEXYZTriple, CIExyY, CIExyYTriple, JCh, CIEXYZ};
+    pub use crate::context::{Context, Logger};
+    pub use crate::error::{Error, Result};
     pub use crate::fixed::{Half, S15Fixed16, U16Fixed16, U8Fixed8};
     pub use crate::sig::Signature;
 }
