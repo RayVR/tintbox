@@ -68,6 +68,22 @@ unsafe extern "C" {
     fn rcms_oracle_tag_count(buf: *const u8, len: u32) -> i32;
     fn rcms_oracle_tag_signature(buf: *const u8, len: u32, n: u32) -> u32;
     fn rcms_oracle_tag_true_type(buf: *const u8, len: u32, sig: u32) -> u32;
+    fn rcms_oracle_tetra16(
+        grid: *const u32,
+        n_out: u32,
+        table: *const u16,
+        table_len: u32,
+        input: *const u16,
+        out: *mut u16,
+    ) -> i32;
+    fn rcms_oracle_tetra_float(
+        grid: *const u32,
+        n_out: u32,
+        table: *const f32,
+        table_len: u32,
+        input: *const f32,
+        out: *mut f32,
+    ) -> i32;
     fn rcms_oracle_read_tag_xyz(buf: *const u8, len: u32, sig: u32, out: *mut f64) -> i32;
     fn rcms_oracle_read_tag_s15f16(
         buf: *const u8,
@@ -373,6 +389,67 @@ pub fn parametric_table16(ty: i32, params: &[f64]) -> Option<Vec<u16>> {
     } else {
         out.truncate(n as usize);
         Some(out)
+    }
+}
+
+/// lcms2 3D CLUT (16-bit) tetrahedral interpolation: builds a single granular
+/// CLUT stage (`cmsStageAllocCLut16bitGranular`) with per-axis sample counts
+/// `grid` (3 axes) and `n_out` output channels from `table`, wraps it in a
+/// 3->n_out pipeline, and evaluates `input` (3 u16) through `cmsPipelineEval16`.
+/// Returns the `n_out` u16 outputs, or `None` if lcms2 fails to allocate.
+pub fn tetra16(grid: &[u32; 3], n_out: usize, table: &[u16], input: &[u16; 3]) -> Option<Vec<u16>> {
+    let mut out = vec![0u16; n_out];
+    // SAFETY: `grid` is 3 readable u32; `table` is a readable slice of `table.len()`
+    // u16 (copied into the CLUT stage); `input` is 3 readable u16; `out` has `n_out`
+    // u16 of room (the pipeline output width). C only reads inputs and writes exactly
+    // `n_out` outputs; the stage and pipeline are allocated and freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_tetra16(
+            grid.as_ptr(),
+            n_out as u32,
+            table.as_ptr(),
+            table.len() as u32,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 3D CLUT (float) tetrahedral interpolation: builds a single granular
+/// CLUT stage (`cmsStageAllocCLutFloatGranular`) with per-axis sample counts
+/// `grid` (3 axes) and `n_out` output channels from `table`, wraps it in a
+/// 3->n_out pipeline, and evaluates `input` (3 f32) through `cmsPipelineEvalFloat`.
+/// Returns the `n_out` f32 outputs, or `None` if lcms2 fails to allocate.
+pub fn tetra_float(
+    grid: &[u32; 3],
+    n_out: usize,
+    table: &[f32],
+    input: &[f32; 3],
+) -> Option<Vec<f32>> {
+    let mut out = vec![0f32; n_out];
+    // SAFETY: `grid` is 3 readable u32; `table` is a readable slice of `table.len()`
+    // f32 (copied into the CLUT stage); `input` is 3 readable f32; `out` has `n_out`
+    // f32 of room (the pipeline output width). C only reads inputs and writes exactly
+    // `n_out` outputs; the stage and pipeline are allocated and freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_tetra_float(
+            grid.as_ptr(),
+            n_out as u32,
+            table.as_ptr(),
+            table.len() as u32,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
     }
 }
 

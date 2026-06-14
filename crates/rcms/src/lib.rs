@@ -13,6 +13,7 @@ pub mod context;
 pub mod curve;
 pub mod error;
 pub mod fixed;
+pub mod interp;
 pub mod io;
 pub mod math;
 pub mod pcs;

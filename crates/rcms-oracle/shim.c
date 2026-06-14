@@ -924,3 +924,47 @@ int rcms_oracle_read_tag_ucrbg(const uint8_t* buf, uint32_t len, uint32_t sig,
     cmsCloseProfile(p);
     return 1;
 }
+
+/* ---- 3D CLUT tetrahedral interpolation (cmsintrp.c TetrahedralInterp16/Float) -
+   Build a single granular CLUT stage with the given per-axis grid points (3 axes)
+   and nOut output channels from the caller's table, wrap it in a 3->nOut pipeline,
+   and evaluate one input vector through it. For a 3-input non-trilinear CLUT this
+   routes through TetrahedralInterp16 / TetrahedralInterpFloat (lcms2's default).
+   The grid is the per-axis sample count (nSamples[0..3]); table is laid out
+   row-major with nOut output channels per node, matching lcms2's CLUT layout.
+   Returns 1 on success, 0 if allocation fails. */
+int rcms_oracle_tetra16(const uint32_t* grid /*3*/, uint32_t nOut,
+                        const uint16_t* table, uint32_t tableLen,
+                        const uint16_t* in /*3*/, uint16_t* out /*nOut*/) {
+    (void) tableLen;
+    cmsStage* stage = cmsStageAllocCLut16bitGranular(NULL, grid, 3, nOut, table);
+    if (!stage) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, 3, nOut);
+    if (!lut) { cmsStageFree(stage); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, stage)) {
+        cmsStageFree(stage);
+        cmsPipelineFree(lut);
+        return 0;
+    }
+    cmsPipelineEval16(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
+
+int rcms_oracle_tetra_float(const uint32_t* grid /*3*/, uint32_t nOut,
+                            const float* table, uint32_t tableLen,
+                            const float* in /*3*/, float* out /*nOut*/) {
+    (void) tableLen;
+    cmsStage* stage = cmsStageAllocCLutFloatGranular(NULL, grid, 3, nOut, table);
+    if (!stage) return 0;
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, 3, nOut);
+    if (!lut) { cmsStageFree(stage); return 0; }
+    if (!cmsPipelineInsertStage(lut, cmsAT_END, stage)) {
+        cmsStageFree(stage);
+        cmsPipelineFree(lut);
+        return 0;
+    }
+    cmsPipelineEvalFloat(in, out, lut);
+    cmsPipelineFree(lut);
+    return 1;
+}
