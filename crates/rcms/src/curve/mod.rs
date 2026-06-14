@@ -218,13 +218,12 @@ impl ToneCurve {
                     eval_parametric(seg.seg_type, &seg.params, r)
                 };
 
+                // cmsgamma.c:752-758: `if (isinf(Out)) return PLUS_INF;` — C's
+                // isinf() is true for BOTH +inf and -inf, so both clamp to
+                // PLUS_INF (the subsequent `isinf(-Out) → MINUS_INF` is dead code
+                // in the C, only reachable when Out is finite). Match exactly.
                 if out.is_infinite() {
-                    // isinf(Out) → PLUS_INF; isinf(-Out) → MINUS_INF.
-                    if out > 0.0 {
-                        return PLUS_INF as f64;
-                    } else {
-                        return MINUS_INF as f64;
-                    }
+                    return PLUS_INF as f64;
                 }
                 return out;
             }
