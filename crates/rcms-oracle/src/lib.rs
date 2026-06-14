@@ -17,6 +17,8 @@ unsafe extern "C" {
     fn rcms_oracle_half_to_float(h: u16) -> f32;
     fn rcms_oracle_float_to_half(f: f32) -> u16;
     fn rcms_oracle_md5(out: *mut u8, buf: *const u8, len: u32);
+    fn rcms_oracle_read_u16(buf: *const u8, len: u32, out: *mut u16) -> i32;
+    fn rcms_oracle_read_u32(buf: *const u8, len: u32, out: *mut u32) -> i32;
 }
 
 /// lcms2 `_cmsDoubleTo15Fixed16`.
@@ -117,6 +119,29 @@ pub fn md5(buf: &[u8]) -> [u8; 16] {
         rcms_oracle_md5(out.as_mut_ptr(), buf.as_ptr(), buf.len() as u32);
     }
     out
+}
+
+/// lcms2 `_cmsReadUInt16Number` over an in-memory IOHANDLER (big-endian).
+pub fn read_u16(buf: &[u8]) -> Option<u16> {
+    let mut out = 0u16;
+    // SAFETY: buf/len describe a valid slice; out is a valid u16; C writes out only when it returns nonzero.
+    let ok = unsafe { rcms_oracle_read_u16(buf.as_ptr(), buf.len() as u32, &mut out) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+/// lcms2 `_cmsReadUInt32Number` over an in-memory IOHANDLER (big-endian).
+pub fn read_u32(buf: &[u8]) -> Option<u32> {
+    let mut out = 0u32;
+    // SAFETY: buf/len describe a valid slice; out is a valid u32; C writes out only when it returns nonzero.
+    let ok = unsafe { rcms_oracle_read_u32(buf.as_ptr(), buf.len() as u32, &mut out) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.

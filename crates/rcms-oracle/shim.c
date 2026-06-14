@@ -52,3 +52,20 @@ void rcms_oracle_md5(uint8_t out[16], const uint8_t* buf, uint32_t len) {
     cmsProfileID id; cmsMD5finish(&id, h);
     for (int i=0;i<16;i++) out[i] = id.ID8[i];
 }
+
+/* I/O big-endian read primitives (cmsplugin.c via in-memory IOHANDLER).
+   cmsOpenIOhandlerFromMem/cmsCloseIOhandler are public in lcms2.h;
+   _cmsReadUInt16Number/_cmsReadUInt32Number in lcms2_plugin.h — both
+   transitively included via lcms2_internal.h above. */
+int rcms_oracle_read_u16(const uint8_t* buf, uint32_t len, uint16_t* out) {
+    cmsIOHANDLER* io = cmsOpenIOhandlerFromMem(NULL, (void*)buf, len, "r");
+    if (!io) return 0;
+    cmsUInt16Number v; int ok = _cmsReadUInt16Number(io, &v);
+    cmsCloseIOhandler(io); *out = v; return ok;
+}
+int rcms_oracle_read_u32(const uint8_t* buf, uint32_t len, uint32_t* out) {
+    cmsIOHANDLER* io = cmsOpenIOhandlerFromMem(NULL, (void*)buf, len, "r");
+    if (!io) return 0;
+    cmsUInt32Number v; int ok = _cmsReadUInt32Number(io, &v);
+    cmsCloseIOhandler(io); *out = v; return ok;
+}

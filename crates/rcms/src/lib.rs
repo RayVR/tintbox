@@ -11,6 +11,7 @@ pub mod compat;
 pub mod context;
 pub mod error;
 pub mod fixed;
+pub mod io;
 pub mod math;
 pub mod sig;
 
@@ -22,5 +23,6 @@ pub mod prelude {
     pub use crate::context::{Context, Logger};
     pub use crate::error::{Error, Result};
     pub use crate::fixed::{Half, S15Fixed16, U16Fixed16, U8Fixed8};
+    pub use crate::io::{ProfileReader, ProfileWriter};
     pub use crate::sig::Signature;
 }
