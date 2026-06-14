@@ -968,3 +968,34 @@ int rcms_oracle_tetra_float(const uint32_t* grid /*3*/, uint32_t nOut,
     cmsPipelineFree(lut);
     return 1;
 }
+
+/* ---- Generic n-D CLUT interpolation via _cmsComputeInterpParamsEx -----------
+   Drive lcms2's interpolation directly: build a cmsInterpParams from the caller's
+   per-axis grid, nIn/nOut, table, and flags, then invoke the function pointer
+   DefaultInterpolatorsFactory selected (p->Interpolation.Lerp16/LerpFloat). This
+   exercises BilinearInterp16/Float, TrilinearInterp16/Float, Eval4..Eval15, and —
+   critically — lets us force CMS_LERP_FLAGS_TRILINEAR for the 3-input path, which
+   the cmsStageAllocCLut* path never sets (it hardcodes CMS_LERP_FLAGS_16BITS).
+   `dwFlags` is the raw flag word (callers OR in CMS_LERP_FLAGS_FLOAT/TRILINEAR).
+   Returns 1 on success, 0 if param computation fails. */
+int rcms_oracle_interp16(const uint32_t* grid, uint32_t nIn, uint32_t nOut,
+                         const uint16_t* table, uint32_t dwFlags,
+                         const uint16_t* in, uint16_t* out) {
+    cmsInterpParams* p = _cmsComputeInterpParamsEx(NULL, grid, nIn, nOut,
+                                                   table, dwFlags);
+    if (!p) return 0;
+    p->Interpolation.Lerp16(in, out, p);
+    _cmsFreeInterpParams(p);
+    return 1;
+}
+
+int rcms_oracle_interp_float(const uint32_t* grid, uint32_t nIn, uint32_t nOut,
+                             const float* table, uint32_t dwFlags,
+                             const float* in, float* out) {
+    cmsInterpParams* p = _cmsComputeInterpParamsEx(NULL, grid, nIn, nOut,
+                                                   table, dwFlags | CMS_LERP_FLAGS_FLOAT);
+    if (!p) return 0;
+    p->Interpolation.LerpFloat(in, out, p);
+    _cmsFreeInterpParams(p);
+    return 1;
+}

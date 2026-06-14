@@ -81,6 +81,149 @@ impl InterpParams {
     }
 }
 
+/// The 16-bit interpolation routine selected by [`interp_factory`], mirroring the
+/// `Lerp16` member of lcms2's `cmsInterpFunction` union. Each variant carries the
+/// same `(input, output, table, params)` calling convention as the standalone
+/// functions; [`Interp16::eval`] dispatches with a zero-cost `match`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Interp16 {
+    /// 1D linear (`LinLerp1D`).
+    Linear,
+    /// 2D bilinear (`BilinearInterp16`).
+    Bilinear,
+    /// 3D trilinear (`TrilinearInterp16`).
+    Trilinear,
+    /// 3D tetrahedral (`TetrahedralInterp16`).
+    Tetrahedral,
+    /// n-D (4..=15 inputs) (`Eval4Inputs`..`Eval15Inputs`).
+    EvalN,
+}
+
+impl Interp16 {
+    /// Evaluate the selected 16-bit interpolator.
+    #[inline]
+    pub fn eval(self, input: &[u16], output: &mut [u16], table: &[u16], p: &InterpParams) {
+        match self {
+            Interp16::Linear => lin_lerp_1d(input, output, table, p),
+            Interp16::Bilinear => bilinear_16(input, output, table, p),
+            Interp16::Trilinear => trilinear_16(input, output, table, p),
+            Interp16::Tetrahedral => tetrahedral_16(input, output, table, p),
+            Interp16::EvalN => eval_n_inputs(input, output, table, p),
+        }
+    }
+}
+
+/// The float interpolation routine selected by [`interp_factory`], mirroring the
+/// `LerpFloat` member of lcms2's `cmsInterpFunction` union.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterpFloat {
+    /// 1D linear (`LinLerp1Dfloat`).
+    Linear,
+    /// 2D bilinear (`BilinearInterpFloat`).
+    Bilinear,
+    /// 3D trilinear (`TrilinearInterpFloat`).
+    Trilinear,
+    /// 3D tetrahedral (`TetrahedralInterpFloat`).
+    Tetrahedral,
+    /// n-D (4..=15 inputs) (`Eval4InputsFloat`..`Eval15InputsFloat`).
+    EvalN,
+}
+
+impl InterpFloat {
+    /// Evaluate the selected float interpolator.
+    #[inline]
+    pub fn eval(self, input: &[f32], output: &mut [f32], table: &[f32], p: &InterpParams) {
+        match self {
+            InterpFloat::Linear => lin_lerp_1d_float(input, output, table, p),
+            InterpFloat::Bilinear => bilinear_float(input, output, table, p),
+            InterpFloat::Trilinear => trilinear_float(input, output, table, p),
+            InterpFloat::Tetrahedral => tetrahedral_float(input, output, table, p),
+            InterpFloat::EvalN => eval_n_inputs_float(input, output, table, p),
+        }
+    }
+}
+
+/// The interpolator [`interp_factory`] resolves for a given channel count and
+/// flags — either the 16-bit or the float routine, per `is_float`. Mirrors the
+/// `cmsInterpFunction` union that `DefaultInterpolatorsFactory` fills.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterpFn {
+    /// 16-bit interpolation routine.
+    Lerp16(Interp16),
+    /// Float interpolation routine.
+    LerpFloat(InterpFloat),
+}
+
+/// Select the interpolation routine for `(n_inputs, is_float, is_trilinear)`,
+/// bit-for-bit matching lcms2's `DefaultInterpolatorsFactory` (cmsintrp.c:1178).
+///
+/// - 1 input  -> linear (the 1-output `Eval1Input` case is folded into `Linear`,
+///   which only differs for multi-output 1D LUTs not produced by this factory's
+///   3D/n-D path; this matches the `nOutputChannels == 1` selection lcms2 makes
+///   for the CLUT interpolators this slice targets).
+/// - 2 inputs -> bilinear.
+/// - 3 inputs -> trilinear if `is_trilinear` (the `CMS_LERP_FLAGS_TRILINEAR`
+///   hint), else tetrahedral.
+/// - 4..=15   -> the n-D `EvalN` routine.
+///
+/// `n_outputs` is taken for the lcms2 safety check (`>= 4` inputs with
+/// `>= MAX_STAGE_CHANNELS` outputs is rejected) and to mirror the C signature.
+///
+/// # Panics
+/// Panics if `n_inputs` is 0 or `> 15`, or if the lcms2 safety check rejects the
+/// combination (`n_inputs >= 4 && n_outputs >= MAX_STAGE_CHANNELS`) — lcms2
+/// returns a zeroed (null) interpolator there, which has no valid routine.
+#[must_use]
+pub fn interp_factory(
+    n_inputs: usize,
+    n_outputs: usize,
+    is_float: bool,
+    is_trilinear: bool,
+) -> InterpFn {
+    assert!(
+        !(n_inputs >= 4 && n_outputs >= MAX_STAGE_CHANNELS),
+        "lcms2 safety check rejects >= 4 inputs with >= MAX_STAGE_CHANNELS outputs"
+    );
+
+    match n_inputs {
+        1 => {
+            if is_float {
+                InterpFn::LerpFloat(InterpFloat::Linear)
+            } else {
+                InterpFn::Lerp16(Interp16::Linear)
+            }
+        }
+        2 => {
+            if is_float {
+                InterpFn::LerpFloat(InterpFloat::Bilinear)
+            } else {
+                InterpFn::Lerp16(Interp16::Bilinear)
+            }
+        }
+        3 => {
+            if is_trilinear {
+                if is_float {
+                    InterpFn::LerpFloat(InterpFloat::Trilinear)
+                } else {
+                    InterpFn::Lerp16(Interp16::Trilinear)
+                }
+            } else if is_float {
+                InterpFn::LerpFloat(InterpFloat::Tetrahedral)
+            } else {
+                InterpFn::Lerp16(Interp16::Tetrahedral)
+            }
+        }
+        4..=15 => {
+            if is_float {
+                InterpFn::LerpFloat(InterpFloat::EvalN)
+            } else {
+                InterpFn::Lerp16(Interp16::EvalN)
+            }
+        }
+        _ => panic!("interp_factory: n_inputs must be in 1..=15, got {n_inputs}"),
+    }
+}
+
 /// 16-bit 3D tetrahedral interpolation, bit-identical to
 /// `TetrahedralInterp16` (cmsintrp.c:720-850).
 ///
@@ -241,6 +384,301 @@ pub fn tetrahedral_16(input: &[u16], output: &mut [u16], table: &[u16], p: &Inte
     }
 }
 
+/// `LinearInterp` (cmsintrp.c:184): fixed-point lerp used by the 16-bit n-D
+/// `EvalN` routines. `dif = (u32)(h - l) * a + 0x8000; dif = (dif >> 16) + l`.
+///
+/// `h - l` is computed as `cmsS15Fixed16Number` (i32) and then cast to `u32`,
+/// so the subtraction and the multiply both wrap (`CMS_NO_SANITIZE`).
+#[inline]
+fn linear_interp(a: i32, l: i32, h: i32) -> u16 {
+    let dif = (h.wrapping_sub(l) as u32)
+        .wrapping_mul(a as u32)
+        .wrapping_add(0x8000);
+    let dif = (dif >> 16).wrapping_add(l as u32);
+    dif as u16
+}
+
+/// `LERP(a,l,h)` for the 16-bit bilinear/trilinear routines (cmsintrp.c:417):
+/// `(cmsUInt16Number)(l + ROUND_FIXED_TO_INT((h - l) * a))` where
+/// `ROUND_FIXED_TO_INT(x) = (x + 0x8000) >> 16`. All arithmetic is `int` (i32)
+/// and wraps; the macro casts the result to `cmsUInt16Number`, so each nested
+/// LERP's intermediate (`dx00`, `dxy0`, ...) is truncated to 16 bits *before*
+/// the next LERP consumes it — the returned `i32` is therefore in `0..=0xFFFF`.
+#[inline]
+fn lerp16(a: i32, l: i32, h: i32) -> i32 {
+    let v = l.wrapping_add((h.wrapping_sub(l)).wrapping_mul(a).wrapping_add(0x8000) >> 16);
+    v as u16 as i32
+}
+
+/// 16-bit 1D linear interpolation, bit-identical to `LinLerp1D`
+/// (cmsintrp.c:189-220).
+///
+/// `input` is 1 u16 channel; `output` receives 1 u16 channel. Single-output by
+/// construction (lcms2 only routes 1-input/1-output LUTs here).
+pub fn lin_lerp_1d(input: &[u16], output: &mut [u16], table: &[u16], p: &InterpParams) {
+    if input[0] == 0xffff || p.domain[0] == 0 {
+        output[0] = table[p.domain[0] as usize];
+        return;
+    }
+    let val3 = p.domain[0] as i32 * input[0] as i32;
+    let val3 = to_fixed_domain(val3);
+    let cell0 = fixed_to_int(val3);
+    let rest = fixed_rest_to_int(val3);
+    let y0 = table[cell0 as usize] as i32;
+    let y1 = table[cell0 as usize + 1] as i32;
+    output[0] = linear_interp(rest, y0, y1);
+}
+
+/// Float 1D linear interpolation, bit-identical to `LinLerp1Dfloat`
+/// (cmsintrp.c:229-261).
+pub fn lin_lerp_1d_float(input: &[f32], output: &mut [f32], table: &[f32], p: &InterpParams) {
+    let val2 = fclamp(input[0]);
+    if val2 == 1.0 || p.domain[0] == 0 {
+        output[0] = table[p.domain[0] as usize];
+        return;
+    }
+    let val2 = val2 * p.domain[0] as f32;
+    let cell0 = val2.floor() as i32;
+    let cell1 = val2.ceil() as i32;
+    let rest = val2 - cell0 as f32;
+    let y0 = table[cell0 as usize];
+    let y1 = table[cell1 as usize];
+    output[0] = y0 + (y1 - y0) * rest;
+}
+
+/// 16-bit 2D bilinear interpolation, bit-identical to `BilinearInterp16`
+/// (cmsintrp.c:409-465).
+///
+/// `input` is 2 u16 channels; `output` receives `p.n_outputs` u16 channels.
+pub fn bilinear_16(input: &[u16], output: &mut [u16], table: &[u16], p: &InterpParams) {
+    let total_out = p.n_outputs;
+
+    let fx = to_fixed_domain(input[0] as i32 * p.domain[0] as i32);
+    let x0 = fixed_to_int(fx);
+    let rx = fixed_rest_to_int(fx);
+
+    let fy = to_fixed_domain(input[1] as i32 * p.domain[1] as i32);
+    let y0 = fixed_to_int(fy);
+    let ry = fixed_rest_to_int(fy);
+
+    let xx0 = p.opta[1] as i32 * x0;
+    let xx1 = xx0
+        + if input[0] == 0xFFFF {
+            0
+        } else {
+            p.opta[1] as i32
+        };
+
+    let yy0 = p.opta[0] as i32 * y0;
+    let yy1 = yy0
+        + if input[1] == 0xFFFF {
+            0
+        } else {
+            p.opta[0] as i32
+        };
+
+    for (out_chan, out) in output.iter_mut().enumerate().take(total_out) {
+        let oc = out_chan as i32;
+        let dens = |i: i32, j: i32| -> i32 { table[(i + j + oc) as usize] as i32 };
+
+        let d00 = dens(xx0, yy0);
+        let d01 = dens(xx0, yy1);
+        let d10 = dens(xx1, yy0);
+        let d11 = dens(xx1, yy1);
+
+        let dx0 = lerp16(rx, d00, d10);
+        let dx1 = lerp16(rx, d01, d11);
+
+        let dxy = lerp16(ry, dx0, dx1);
+
+        *out = dxy as u16;
+    }
+}
+
+/// Float 2D bilinear interpolation, bit-identical to `BilinearInterpFloat`
+/// (cmsintrp.c:356-406).
+pub fn bilinear_float(input: &[f32], output: &mut [f32], table: &[f32], p: &InterpParams) {
+    let total_out = p.n_outputs;
+
+    let px = fclamp(input[0]) * p.domain[0] as f32;
+    let py = fclamp(input[1]) * p.domain[1] as f32;
+
+    let x0 = px.floor() as i32;
+    let fx = px - x0 as f32;
+    let y0 = py.floor() as i32;
+    let fy = py - y0 as f32;
+
+    let xx0 = p.opta[1] as i32 * x0;
+    let xx1 = xx0
+        + if fclamp(input[0]) >= 1.0 {
+            0
+        } else {
+            p.opta[1] as i32
+        };
+
+    let yy0 = p.opta[0] as i32 * y0;
+    let yy1 = yy0
+        + if fclamp(input[1]) >= 1.0 {
+            0
+        } else {
+            p.opta[0] as i32
+        };
+
+    for (out_chan, out) in output.iter_mut().enumerate().take(total_out) {
+        let oc = out_chan as i32;
+        let dens = |i: i32, j: i32| -> f32 { table[(i + j + oc) as usize] };
+        let lerp = |a: f32, l: f32, h: f32| -> f32 { l + (h - l) * a };
+
+        let d00 = dens(xx0, yy0);
+        let d01 = dens(xx0, yy1);
+        let d10 = dens(xx1, yy0);
+        let d11 = dens(xx1, yy1);
+
+        let dx0 = lerp(fx, d00, d10);
+        let dx1 = lerp(fx, d01, d11);
+
+        *out = lerp(fy, dx0, dx1);
+    }
+}
+
+/// 16-bit 3D trilinear interpolation, bit-identical to `TrilinearInterp16`
+/// (cmsintrp.c:540-606).
+///
+/// `input` is 3 u16 channels; `output` receives `p.n_outputs` u16 channels.
+pub fn trilinear_16(input: &[u16], output: &mut [u16], table: &[u16], p: &InterpParams) {
+    let total_out = p.n_outputs;
+
+    let fx = to_fixed_domain(input[0] as i32 * p.domain[0] as i32);
+    let x0 = fixed_to_int(fx);
+    let rx = fixed_rest_to_int(fx);
+
+    let fy = to_fixed_domain(input[1] as i32 * p.domain[1] as i32);
+    let y0 = fixed_to_int(fy);
+    let ry = fixed_rest_to_int(fy);
+
+    let fz = to_fixed_domain(input[2] as i32 * p.domain[2] as i32);
+    let z0 = fixed_to_int(fz);
+    let rz = fixed_rest_to_int(fz);
+
+    let xx0 = p.opta[2] as i32 * x0;
+    let xx1 = xx0
+        + if input[0] == 0xFFFF {
+            0
+        } else {
+            p.opta[2] as i32
+        };
+
+    let yy0 = p.opta[1] as i32 * y0;
+    let yy1 = yy0
+        + if input[1] == 0xFFFF {
+            0
+        } else {
+            p.opta[1] as i32
+        };
+
+    let zz0 = p.opta[0] as i32 * z0;
+    let zz1 = zz0
+        + if input[2] == 0xFFFF {
+            0
+        } else {
+            p.opta[0] as i32
+        };
+
+    for (out_chan, out) in output.iter_mut().enumerate().take(total_out) {
+        let oc = out_chan as i32;
+        let dens = |i: i32, j: i32, k: i32| -> i32 { table[(i + j + k + oc) as usize] as i32 };
+
+        let d000 = dens(xx0, yy0, zz0);
+        let d001 = dens(xx0, yy0, zz1);
+        let d010 = dens(xx0, yy1, zz0);
+        let d011 = dens(xx0, yy1, zz1);
+
+        let d100 = dens(xx1, yy0, zz0);
+        let d101 = dens(xx1, yy0, zz1);
+        let d110 = dens(xx1, yy1, zz0);
+        let d111 = dens(xx1, yy1, zz1);
+
+        let dx00 = lerp16(rx, d000, d100);
+        let dx01 = lerp16(rx, d001, d101);
+        let dx10 = lerp16(rx, d010, d110);
+        let dx11 = lerp16(rx, d011, d111);
+
+        let dxy0 = lerp16(ry, dx00, dx10);
+        let dxy1 = lerp16(ry, dx01, dx11);
+
+        let dxyz = lerp16(rz, dxy0, dxy1);
+
+        *out = dxyz as u16;
+    }
+}
+
+/// Float 3D trilinear interpolation, bit-identical to `TrilinearInterpFloat`
+/// (cmsintrp.c:467-535).
+pub fn trilinear_float(input: &[f32], output: &mut [f32], table: &[f32], p: &InterpParams) {
+    let total_out = p.n_outputs;
+
+    let px = fclamp(input[0]) * p.domain[0] as f32;
+    let py = fclamp(input[1]) * p.domain[1] as f32;
+    let pz = fclamp(input[2]) * p.domain[2] as f32;
+
+    let x0 = px.floor() as i32;
+    let fx = px - x0 as f32;
+    let y0 = py.floor() as i32;
+    let fy = py - y0 as f32;
+    let z0 = pz.floor() as i32;
+    let fz = pz - z0 as f32;
+
+    let xx0 = p.opta[2] as i32 * x0;
+    let xx1 = xx0
+        + if fclamp(input[0]) >= 1.0 {
+            0
+        } else {
+            p.opta[2] as i32
+        };
+
+    let yy0 = p.opta[1] as i32 * y0;
+    let yy1 = yy0
+        + if fclamp(input[1]) >= 1.0 {
+            0
+        } else {
+            p.opta[1] as i32
+        };
+
+    let zz0 = p.opta[0] as i32 * z0;
+    let zz1 = zz0
+        + if fclamp(input[2]) >= 1.0 {
+            0
+        } else {
+            p.opta[0] as i32
+        };
+
+    for (out_chan, out) in output.iter_mut().enumerate().take(total_out) {
+        let oc = out_chan as i32;
+        let dens = |i: i32, j: i32, k: i32| -> f32 { table[(i + j + k + oc) as usize] };
+        let lerp = |a: f32, l: f32, h: f32| -> f32 { l + (h - l) * a };
+
+        let d000 = dens(xx0, yy0, zz0);
+        let d001 = dens(xx0, yy0, zz1);
+        let d010 = dens(xx0, yy1, zz0);
+        let d011 = dens(xx0, yy1, zz1);
+
+        let d100 = dens(xx1, yy0, zz0);
+        let d101 = dens(xx1, yy0, zz1);
+        let d110 = dens(xx1, yy1, zz0);
+        let d111 = dens(xx1, yy1, zz1);
+
+        let dx00 = lerp(fx, d000, d100);
+        let dx01 = lerp(fx, d001, d101);
+        let dx10 = lerp(fx, d010, d110);
+        let dx11 = lerp(fx, d011, d111);
+
+        let dxy0 = lerp(fy, dx00, dx10);
+        let dxy1 = lerp(fy, dx01, dx11);
+
+        *out = lerp(fz, dxy0, dxy1);
+    }
+}
+
 /// Float 3D tetrahedral interpolation, bit-identical to
 /// `TetrahedralInterpFloat` (cmsintrp.c:622-716).
 ///
@@ -329,5 +767,177 @@ pub fn tetrahedral_float(input: &[f32], output: &mut [f32], table: &[f32], p: &I
 
         output[out_chan as usize] = c0 + c1 * rx + c2 * ry + c3 * rz;
         out_chan += 1;
+    }
+}
+
+/// Maximum output channels lcms2 stacks on the C call stack in the n-D `EvalN`
+/// scratch buffers (`MAX_STAGE_CHANNELS`, lcms2_internal.h). The `EvalN` factory
+/// rejects `>= 4` inputs with `>= MAX_STAGE_CHANNELS` outputs, so this bounds the
+/// temporaries used by [`eval_n_inputs`].
+pub const MAX_STAGE_CHANNELS: usize = 128;
+
+/// 16-bit n-D interpolation for 4..=15 inputs, bit-identical to lcms2's
+/// `Eval4Inputs`..`Eval15Inputs` (cmsintrp.c, the `EVAL_FNS` macro chain).
+///
+/// lcms2 generates `EvalN` from a template that fixes the *first* input on
+/// `opta[N-1]` / `Domain[0]`, evaluates the `(N-1)`-D interpolation on the two
+/// sub-cubes flanking it (table offsets `K0` and `K1`), and linearly
+/// interpolates between them along the fixed dimension with [`linear_interp`].
+/// The recursion bottoms out at 3 inputs, which lcms2's `Eval4Inputs` evaluates
+/// with the 3D tetrahedral kernel — so this routine recurses down to
+/// [`tetrahedral_16`].
+///
+/// `p` describes the full n-D grid. The recursion never rebuilds `opta`/`n_samples`
+/// (matching the C, which copies `*p16` and only rewrites `Domain` and `Table`),
+/// so the inner calls read `p.opta[0..n-2]` exactly as the C does.
+///
+/// # Panics
+/// Panics if `p.n_inputs < 4` (use [`tetrahedral_16`] for 3 inputs).
+pub fn eval_n_inputs(input: &[u16], output: &mut [u16], table: &[u16], p: &InterpParams) {
+    assert!(p.n_inputs >= 4, "eval_n_inputs requires >= 4 inputs");
+    eval_n_inputs_rec(input, output, table, p, p.n_inputs);
+}
+
+/// Recursive worker for [`eval_n_inputs`]. `n` is the number of *remaining*
+/// inputs at this level (counts down to 3, where the tetrahedral kernel runs).
+fn eval_n_inputs_rec(input: &[u16], output: &mut [u16], table: &[u16], p: &InterpParams, n: usize) {
+    if n == 3 {
+        // lcms2 inlines TetrahedralInterp16 here; tetrahedral_16 is bit-identical.
+        tetrahedral_16(input, output, table, p);
+        return;
+    }
+
+    // NM = N - 1 in the C macro; the first input is fixed on opta[NM]/Domain[0].
+    let nm = n - 1;
+
+    let fk = to_fixed_domain(input[0] as i32 * p.domain[0] as i32);
+    let k0 = fixed_to_int(fk);
+    let rk = fixed_rest_to_int(fk);
+
+    // K0 = opta[NM] * k0; K1 = opta[NM] * (k0 + (Input[0] != 0xFFFF ? 1 : 0)).
+    let opta_nm = p.opta[nm] as i32;
+    let k0_idx = opta_nm * k0;
+    let k1_idx = opta_nm * (k0 + if input[0] != 0xFFFF { 1 } else { 0 });
+
+    // p1 is *p with Domain shifted left by one (Domain[0..NM] <- Domain[1..N]).
+    // opta/n_samples are untouched by the C memmove, so the inner level reads the
+    // same opta entries.
+    let p1 = shift_domain(p, nm);
+
+    let n_out = p.n_outputs;
+    let mut tmp1 = [0u16; MAX_STAGE_CHANNELS];
+    let mut tmp2 = [0u16; MAX_STAGE_CHANNELS];
+
+    eval_n_inputs_rec(
+        &input[1..],
+        &mut tmp1[..n_out],
+        &table[k0_idx as usize..],
+        &p1,
+        nm,
+    );
+    eval_n_inputs_rec(
+        &input[1..],
+        &mut tmp2[..n_out],
+        &table[k1_idx as usize..],
+        &p1,
+        nm,
+    );
+
+    for i in 0..n_out {
+        output[i] = linear_interp(rk, tmp1[i] as i32, tmp2[i] as i32);
+    }
+}
+
+/// Float n-D interpolation for 4..=15 inputs, bit-identical to lcms2's
+/// `Eval4InputsFloat`..`Eval15InputsFloat`. Same decomposition as
+/// [`eval_n_inputs`] but in floating point, bottoming out at
+/// [`tetrahedral_float`].
+///
+/// # Panics
+/// Panics if `p.n_inputs < 4`.
+pub fn eval_n_inputs_float(input: &[f32], output: &mut [f32], table: &[f32], p: &InterpParams) {
+    assert!(p.n_inputs >= 4, "eval_n_inputs_float requires >= 4 inputs");
+    eval_n_inputs_float_rec(input, output, table, p, p.n_inputs);
+}
+
+fn eval_n_inputs_float_rec(
+    input: &[f32],
+    output: &mut [f32],
+    table: &[f32],
+    p: &InterpParams,
+    n: usize,
+) {
+    if n == 3 {
+        tetrahedral_float(input, output, table, p);
+        return;
+    }
+
+    let nm = n - 1;
+
+    let pk = fclamp(input[0]) * p.domain[0] as f32;
+    let k0 = quick_floor(pk);
+    let rest = pk - k0 as f32;
+
+    let opta_nm = p.opta[nm] as i32;
+    let k0_idx = opta_nm * k0;
+    let k1_idx = k0_idx + if fclamp(input[0]) >= 1.0 { 0 } else { opta_nm };
+
+    let p1 = shift_domain(p, nm);
+
+    let n_out = p.n_outputs;
+    let mut tmp1 = [0f32; MAX_STAGE_CHANNELS];
+    let mut tmp2 = [0f32; MAX_STAGE_CHANNELS];
+
+    eval_n_inputs_float_rec(
+        &input[1..],
+        &mut tmp1[..n_out],
+        &table[k0_idx as usize..],
+        &p1,
+        nm,
+    );
+    eval_n_inputs_float_rec(
+        &input[1..],
+        &mut tmp2[..n_out],
+        &table[k1_idx as usize..],
+        &p1,
+        nm,
+    );
+
+    for i in 0..n_out {
+        let y0 = tmp1[i];
+        let y1 = tmp2[i];
+        output[i] = y0 + (y1 - y0) * rest;
+    }
+}
+
+/// `_cmsQuickFloor` (lcms2_internal.h, the fast-floor path; `CMS_DONT_USE_FAST_FLOOR`
+/// is *not* defined in the pinned build): add the magic `2^36 * 1.5` to `val`,
+/// then take the low 32 bits of the IEEE-754 double (`halves[0]` on a
+/// little-endian host) arithmetically shifted right by 16. The `+0.5` in
+/// `Eval4InputsFloat`/`EvalNFloat` is *not* applied here — they call
+/// `_cmsQuickFloor(pk)` directly — so this is a bit-exact transcription of the C
+/// macro the oracle exposes as `rcms_oracle_quick_floor`.
+#[inline]
+fn quick_floor(val: f32) -> i32 {
+    const MAGIC: f64 = 68_719_476_736.0 * 1.5; // 2^36 * 1.5
+    let temp = val as f64 + MAGIC;
+    // halves[0] = low 32 bits of the f64 on little-endian; `>> 16` is arithmetic
+    // (signed int shift in C).
+    (temp.to_bits() as u32 as i32) >> 16
+}
+
+/// Build the inner-level [`InterpParams`] for the n-D recursion: a copy of `p`
+/// with `domain` shifted left by one (`domain[0..keep] = p.domain[1..=keep]`) and
+/// `n_inputs` reduced. lcms2 only `memmove`s `Domain` (and offsets `Table`); it
+/// leaves `opta`/`nSamples`/`nOutputs` untouched, and so does this.
+fn shift_domain(p: &InterpParams, keep: usize) -> InterpParams {
+    let mut domain = p.domain.clone();
+    domain[..keep].copy_from_slice(&p.domain[1..=keep]);
+    InterpParams {
+        n_inputs: keep,
+        n_outputs: p.n_outputs,
+        n_samples: p.n_samples.clone(),
+        domain,
+        opta: p.opta.clone(),
     }
 }

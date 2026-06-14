@@ -84,6 +84,24 @@ unsafe extern "C" {
         input: *const f32,
         out: *mut f32,
     ) -> i32;
+    fn rcms_oracle_interp16(
+        grid: *const u32,
+        n_in: u32,
+        n_out: u32,
+        table: *const u16,
+        dw_flags: u32,
+        input: *const u16,
+        out: *mut u16,
+    ) -> i32;
+    fn rcms_oracle_interp_float(
+        grid: *const u32,
+        n_in: u32,
+        n_out: u32,
+        table: *const f32,
+        dw_flags: u32,
+        input: *const f32,
+        out: *mut f32,
+    ) -> i32;
     fn rcms_oracle_read_tag_xyz(buf: *const u8, len: u32, sig: u32, out: *mut f64) -> i32;
     fn rcms_oracle_read_tag_s15f16(
         buf: *const u8,
@@ -442,6 +460,83 @@ pub fn tetra_float(
             n_out as u32,
             table.as_ptr(),
             table.len() as u32,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 flag word for the trilinear interpolation hint
+/// (`CMS_LERP_FLAGS_TRILINEAR`, lcms2_plugin.h). OR this into `dw_flags` to force
+/// the 3-input path through `TrilinearInterp16`/`Float` instead of the
+/// tetrahedral default — the `cmsStageAllocCLut*` path never sets it.
+pub const CMS_LERP_FLAGS_TRILINEAR: u32 = 0x0100;
+
+/// lcms2 generic n-D CLUT interpolation (16-bit): builds a `cmsInterpParams` from
+/// the per-axis `grid` (`n_in` axes), `n_out` outputs, `table`, and `dw_flags`,
+/// then invokes the `Lerp16` routine `DefaultInterpolatorsFactory` selected. This
+/// reaches `BilinearInterp16` (2 in), `TrilinearInterp16` (3 in +
+/// [`CMS_LERP_FLAGS_TRILINEAR`]), `TetrahedralInterp16` (3 in, no flag), and
+/// `Eval4Inputs`..`Eval15Inputs` (4..15 in). Returns the `n_out` u16 outputs, or
+/// `None` if lcms2 fails to compute the params.
+pub fn interp16(
+    grid: &[u32],
+    n_out: usize,
+    table: &[u16],
+    dw_flags: u32,
+    input: &[u16],
+) -> Option<Vec<u16>> {
+    let mut out = vec![0u16; n_out];
+    // SAFETY: `grid` is `n_in` readable u32 (n_in = grid.len()); `table` is a
+    // readable slice copied into the interp params; `input` is `n_in` readable u16;
+    // `out` has `n_out` u16 of room (the interpolator's output width). C only reads
+    // inputs and writes exactly `n_out` outputs; the params are allocated and freed
+    // inside the call.
+    let ok = unsafe {
+        rcms_oracle_interp16(
+            grid.as_ptr(),
+            grid.len() as u32,
+            n_out as u32,
+            table.as_ptr(),
+            dw_flags,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 generic n-D CLUT interpolation (float). Like [`interp16`] but routes
+/// through the `LerpFloat` routines (`CMS_LERP_FLAGS_FLOAT` is OR'd in by the
+/// shim). Returns the `n_out` f32 outputs, or `None`.
+pub fn interp_float(
+    grid: &[u32],
+    n_out: usize,
+    table: &[f32],
+    dw_flags: u32,
+    input: &[f32],
+) -> Option<Vec<f32>> {
+    let mut out = vec![0f32; n_out];
+    // SAFETY: `grid` is `n_in` readable u32; `table` is a readable slice copied into
+    // the interp params; `input` is `n_in` readable f32; `out` has `n_out` f32 of
+    // room. C only reads inputs and writes exactly `n_out` outputs; the params are
+    // allocated and freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_interp_float(
+            grid.as_ptr(),
+            grid.len() as u32,
+            n_out as u32,
+            table.as_ptr(),
+            dw_flags,
             input.as_ptr(),
             out.as_mut_ptr(),
         )
