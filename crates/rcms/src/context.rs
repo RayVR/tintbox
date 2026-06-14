@@ -16,10 +16,18 @@ pub struct Context<'a> {
 }
 
 impl<'a> Context<'a> {
-    pub fn new() -> Self { Context { logger: None } }
-    pub fn with_logger(logger: &'a dyn Logger) -> Self { Context { logger: Some(logger) } }
+    pub fn new() -> Self {
+        Context { logger: None }
+    }
+    pub fn with_logger(logger: &'a dyn Logger) -> Self {
+        Context {
+            logger: Some(logger),
+        }
+    }
     pub fn log(&self, code: u32, args: core::fmt::Arguments<'_>) {
-        if let Some(l) = self.logger { l.log(code, &args); }
+        if let Some(l) = self.logger {
+            l.log(code, &args);
+        }
     }
 }
 
@@ -37,7 +45,9 @@ mod tests {
     fn logger_receives_lazy_message() {
         struct Cap(Cell<u32>);
         impl Logger for Cap {
-            fn log(&self, code: u32, _args: &core::fmt::Arguments<'_>) { self.0.set(code); }
+            fn log(&self, code: u32, _args: &core::fmt::Arguments<'_>) {
+                self.0.set(code);
+            }
         }
         let cap = Cap(Cell::new(0));
         Context::with_logger(&cap).log(42, format_args!("x={}", 7));

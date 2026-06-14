@@ -29,8 +29,12 @@ impl FloorStrategy for Lcms2Floor {
     }
     fn quick_saturate_word(d: f64) -> u16 {
         let d = d + 0.5;
-        if d <= 0.0 { return 0; }
-        if d >= 65535.0 { return 0xffff; }
+        if d <= 0.0 {
+            return 0;
+        }
+        if d >= 65535.0 {
+            return 0xffff;
+        }
         Self::quick_floor_word(d)
     }
 }
@@ -39,14 +43,20 @@ impl FloorStrategy for Lcms2Floor {
 /// Kept compiled so the divergence harness can quantify the difference.
 pub struct NativeFloor;
 impl FloorStrategy for NativeFloor {
-    fn quick_floor(val: f64) -> i32 { val.floor() as i32 }
+    fn quick_floor(val: f64) -> i32 {
+        val.floor() as i32
+    }
     fn quick_floor_word(d: f64) -> u16 {
         (Self::quick_floor(d - 32767.0) as u16).wrapping_add(32767)
     }
     fn quick_saturate_word(d: f64) -> u16 {
         let d = d + 0.5;
-        if d <= 0.0 { return 0; }
-        if d >= 65535.0 { return 0xffff; }
+        if d <= 0.0 {
+            return 0;
+        }
+        if d >= 65535.0 {
+            return 0xffff;
+        }
         Self::quick_floor_word(d)
     }
 }
@@ -60,7 +70,11 @@ mod tests {
         let mut rng = rcms_oracle::Rng::new(0x5EED);
         for _ in 0..2_000_000 {
             let v = (rng.next_f64_unit() - 0.5) * 65_000.0;
-            assert_eq!(Lcms2Floor::quick_floor(v), rcms_oracle::quick_floor(v), "v={v}");
+            assert_eq!(
+                Lcms2Floor::quick_floor(v),
+                rcms_oracle::quick_floor(v),
+                "v={v}"
+            );
         }
     }
 
@@ -69,10 +83,18 @@ mod tests {
         let mut rng = rcms_oracle::Rng::new(0xABCD);
         for _ in 0..2_000_000 {
             let d = rng.next_f64_unit() * 65_535.0;
-            assert_eq!(Lcms2Floor::quick_floor_word(d), rcms_oracle::quick_floor_word(d), "d={d}");
+            assert_eq!(
+                Lcms2Floor::quick_floor_word(d),
+                rcms_oracle::quick_floor_word(d),
+                "d={d}"
+            );
         }
         for d in [0.0, 0.5, 32766.9, 32767.0, 32767.5, 65534.9, 65535.0] {
-            assert_eq!(Lcms2Floor::quick_floor_word(d), rcms_oracle::quick_floor_word(d), "d={d}");
+            assert_eq!(
+                Lcms2Floor::quick_floor_word(d),
+                rcms_oracle::quick_floor_word(d),
+                "d={d}"
+            );
         }
     }
 
@@ -81,7 +103,11 @@ mod tests {
         let mut rng = rcms_oracle::Rng::new(0xF00D);
         for _ in 0..2_000_000 {
             let d = (rng.next_f64_unit() - 0.1) * 80_000.0;
-            assert_eq!(Lcms2Floor::quick_saturate_word(d), rcms_oracle::quick_saturate_word(d), "d={d}");
+            assert_eq!(
+                Lcms2Floor::quick_saturate_word(d),
+                rcms_oracle::quick_saturate_word(d),
+                "d={d}"
+            );
         }
     }
 
@@ -95,12 +121,21 @@ mod tests {
         while d <= 65535.0 {
             let a = Lcms2Floor::quick_floor_word(d);
             let b = NativeFloor::quick_floor_word(d);
-            assert_eq!(a, rcms_oracle::quick_floor_word(d), "lcms2 strategy drifted from oracle at d={d}");
-            if a != b { diffs += 1; }
+            assert_eq!(
+                a,
+                rcms_oracle::quick_floor_word(d),
+                "lcms2 strategy drifted from oracle at d={d}"
+            );
+            if a != b {
+                diffs += 1;
+            }
             samples += 1;
             d += 0.25;
         }
         eprintln!("native vs lcms2 floor: {diffs}/{samples} samples differ");
-        assert!(diffs * 1000 < samples, "native floor diverges far more than expected: {diffs}/{samples}");
+        assert!(
+            diffs * 1000 < samples,
+            "native floor diverges far more than expected: {diffs}/{samples}"
+        );
     }
 }

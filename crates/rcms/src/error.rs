@@ -2,8 +2,8 @@
 //! stays no_std/alloc-free and the (not-cold) malformed-profile path never heaps.
 //! Rich context (offending value, byte offset) is emitted via the Context logger.
 
-use core::fmt;
 use crate::sig::Signature;
+use core::fmt;
 
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +43,9 @@ mod tests {
     use super::*;
     #[test]
     fn displays() {
-        assert_eq!(Error::Truncated { needed: 4, got: 2 }.to_string(), "truncated: needed 4, got 2");
+        assert_eq!(
+            Error::Truncated { needed: 4, got: 2 }.to_string(),
+            "truncated: needed 4, got 2"
+        );
     }
 }
