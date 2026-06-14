@@ -73,7 +73,11 @@ pub fn read_mlu_value<R: ProfileReader>(r: &mut R, size: u32) -> Result<Mlu> {
 
     // Directory sits immediately after Count+RecLen; the pool follows the
     // directory, which is where the cursor lands after the loop.
-    let mut dir = Vec::with_capacity(count as usize);
+    // Cap the capacity hint: `count` is attacker-controlled; an unbounded hint
+    // OOM-aborts on wasm (32-bit linear memory). The loop is bounded by `count`
+    // reads that fail on truncation, so a small hint is safe. (Matches the cap
+    // used by the directory / pseq / psid / dict readers.)
+    let mut dir = Vec::with_capacity((count as usize).min(0x1_0000));
     for _ in 0..count {
         let language = r.read_u16()?.to_be_bytes();
         let country = r.read_u16()?.to_be_bytes();
@@ -108,7 +112,7 @@ pub fn read_mlu_value<R: ProfileReader>(r: &mut R, size: u32) -> Result<Mlu> {
     // matters for the SEQUENTIAL embedded-MLU reads in pseq/psid, where the next
     // `_cmsReadTypeBase` continues from exactly there.
     let mut largest_position: u64 = 0;
-    let mut entries = Vec::with_capacity(count as usize);
+    let mut entries = Vec::with_capacity((count as usize).min(0x1_0000));
     for (language, country, len, begin) in dir {
         // Read this entry's UTF-16BE slice straight from the pool. lcms2's
         // Entries[i].Len is `len` BYTES; the unit count is len/2 (an odd
