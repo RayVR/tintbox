@@ -48,6 +48,10 @@ impl U8Fixed8 {
     pub fn from_f64(v: f64) -> Self {
         Self(((S15Fixed16::from_f64(v).to_raw() >> 8) & 0xffff) as u16)
     }
+    /// lcms2 `_cms8Fixed8toDouble` (cmsplugin.c:365): `fixed8 / 256.0`.
+    pub fn to_f64(self) -> f64 {
+        self.0 as f64 / 256.0
+    }
 }
 
 impl U16Fixed16 {

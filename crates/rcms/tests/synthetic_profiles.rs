@@ -313,6 +313,158 @@ fn dictionary_reclen32_matches_oracle() {
     }
 }
 
+/// 256 sample points x in [0, 1] (inclusive endpoints) for tone-curve diffs.
+fn sample_xs() -> Vec<f32> {
+    (0..256).map(|i| i as f32 / 255.0).collect()
+}
+
+/// A `vcgt` formula-variant payload (no type base): TagType=1, then per channel
+/// (3) gamma/min/max each as s15Fixed16. lcms2 builds an ICC type-5 parametric
+/// curve `Y = (max-min)·X^gamma + min` per channel.
+#[test]
+fn vcgt_formula_matches_oracle() {
+    let s15f16 = |v: f64| ((v * 65536.0).round() as i32) as u32;
+    // Per channel: (gamma, min, max). Distinct, in-range values that are exact in
+    // 15.16 so the on-disk encoding has no rounding the oracle wouldn't see too.
+    let chans = [(2.2, 0.0, 1.0), (1.8, 0.0625, 0.9375), (2.4, 0.125, 0.875)];
+
+    let mut payload = type_base(b"vcgt");
+    payload.extend_from_slice(&1u32.to_be_bytes()); // GammaType = formula
+    for (g, mn, mx) in chans {
+        payload.extend_from_slice(&s15f16(g).to_be_bytes());
+        payload.extend_from_slice(&s15f16(mn).to_be_bytes());
+        payload.extend_from_slice(&s15f16(mx).to_be_bytes());
+    }
+
+    let vcgt_tag = 0x7663_6774u32; // 'vcgt'
+    let bytes = build_profile(vcgt_tag, &payload);
+    assert!(
+        rcms_oracle::open_succeeds(&bytes),
+        "lcms2 must accept the synthetic formula-vcgt profile"
+    );
+
+    let xs = sample_xs();
+    let oracle = rcms_oracle::read_tag_vcgt(&bytes, vcgt_tag, &xs).expect("oracle vcgt formula");
+
+    let p = Profile::open(&bytes).expect("rcms open");
+    let curves = match p
+        .read_tag(Signature::from_raw(vcgt_tag))
+        .expect("rcms vcgt")
+    {
+        Tag::Vcgt(c) => c,
+        other => panic!("expected Vcgt, got {other:?}"),
+    };
+    assert_eq!(curves.len(), 3);
+    for (ch, oys) in oracle.iter().enumerate() {
+        for (i, (&x, &cy)) in xs.iter().zip(oys.iter()).enumerate() {
+            let ry = curves[ch].eval_float(x);
+            assert_eq!(
+                ry.to_bits(),
+                cy.to_bits(),
+                "vcgt formula ch{ch} sample[{i}] x={x}: rust={ry} lcms2={cy}"
+            );
+        }
+    }
+}
+
+/// A `vcgt` table-variant payload with 1-byte entries (the FROM_8_TO_16 scaling
+/// path the testbed's 2-byte profiles never exercise). 3 channels × 16 entries.
+#[test]
+fn vcgt_table_1byte_matches_oracle() {
+    let n_elems = 16u16;
+    let mut payload = type_base(b"vcgt");
+    payload.extend_from_slice(&0u32.to_be_bytes()); // GammaType = table
+    payload.extend_from_slice(&3u16.to_be_bytes()); // nChannels
+    payload.extend_from_slice(&n_elems.to_be_bytes()); // nElems
+    payload.extend_from_slice(&1u16.to_be_bytes()); // nBytes = 1
+    for ch in 0..3u32 {
+        for i in 0..n_elems as u32 {
+            // A distinct ramp per channel, full 0..255 range.
+            let v = ((i * 255 / (n_elems as u32 - 1)) + ch * 3).min(255) as u8;
+            payload.push(v);
+        }
+    }
+
+    let vcgt_tag = 0x7663_6774u32;
+    let bytes = build_profile(vcgt_tag, &payload);
+    assert!(
+        rcms_oracle::open_succeeds(&bytes),
+        "lcms2 must accept the synthetic 1-byte-table vcgt profile"
+    );
+
+    let xs = sample_xs();
+    let oracle = rcms_oracle::read_tag_vcgt(&bytes, vcgt_tag, &xs).expect("oracle vcgt table");
+
+    let p = Profile::open(&bytes).expect("rcms open");
+    let curves = match p
+        .read_tag(Signature::from_raw(vcgt_tag))
+        .expect("rcms vcgt")
+    {
+        Tag::Vcgt(c) => c,
+        other => panic!("expected Vcgt, got {other:?}"),
+    };
+    for (ch, oys) in oracle.iter().enumerate() {
+        for (i, (&x, &cy)) in xs.iter().zip(oys.iter()).enumerate() {
+            let ry = curves[ch].eval_float(x);
+            assert_eq!(
+                ry.to_bits(),
+                cy.to_bits(),
+                "vcgt 1-byte table ch{ch} sample[{i}] x={x}: rust={ry} lcms2={cy}"
+            );
+        }
+    }
+}
+
+/// A `bfd ` (UcrBg) payload: CountUcr u32 + UCR u16 table, CountBg u32 + BG u16
+/// table, then a trailing ASCII description (no NUL on disk — the tag size bounds
+/// it). lcms2 builds 16-bit tabulated Ucr/Bg curves and an MLU-backed Desc.
+#[test]
+fn ucrbg_matches_oracle() {
+    let ucr: [u16; 5] = [0, 0x4000, 0x8000, 0xC000, 0xFFFF];
+    let bg: [u16; 3] = [0xFFFF, 0x8000, 0x0000];
+    let desc = "Synthetic UCR/BG method";
+
+    let mut payload = type_base(b"bfd ");
+    payload.extend_from_slice(&(ucr.len() as u32).to_be_bytes());
+    for v in ucr {
+        payload.extend_from_slice(&v.to_be_bytes());
+    }
+    payload.extend_from_slice(&(bg.len() as u32).to_be_bytes());
+    for v in bg {
+        payload.extend_from_slice(&v.to_be_bytes());
+    }
+    payload.extend_from_slice(desc.as_bytes());
+
+    let bfd_tag = 0x6266_6420u32; // 'bfd '
+    let bytes = build_profile(bfd_tag, &payload);
+    assert!(
+        rcms_oracle::open_succeeds(&bytes),
+        "lcms2 must accept the synthetic bfd/UcrBg profile"
+    );
+
+    let xs = sample_xs();
+    let oracle = rcms_oracle::read_tag_ucrbg(&bytes, bfd_tag, &xs).expect("oracle ucrbg");
+
+    let p = Profile::open(&bytes).expect("rcms open");
+    let (r_ucr, r_bg, r_desc) = match p
+        .read_tag(Signature::from_raw(bfd_tag))
+        .expect("rcms ucrbg")
+    {
+        Tag::UcrBg { ucr, bg, desc } => (ucr, bg, desc),
+        other => panic!("expected UcrBg, got {other:?}"),
+    };
+
+    assert_eq!(r_desc, oracle.desc, "desc");
+    for (i, (&x, &cy)) in xs.iter().zip(oracle.ucr.iter()).enumerate() {
+        let ry = r_ucr.eval_float(x);
+        assert_eq!(ry.to_bits(), cy.to_bits(), "ucr sample[{i}] x={x}");
+    }
+    for (i, (&x, &cy)) in xs.iter().zip(oracle.bg.iter()).enumerate() {
+        let ry = r_bg.eval_float(x);
+        assert_eq!(ry.to_bits(), cy.to_bits(), "bg sample[{i}] x={x}");
+    }
+}
+
 /// Compare an rcms MLU against an oracle MLU translation-by-translation.
 fn assert_mlu_eq(rust: &rcms::profile::tag::Mlu, oracle: &rcms_oracle::OracleMlu, ctx: &str) {
     assert_eq!(

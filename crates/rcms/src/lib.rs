@@ -6,13 +6,16 @@
 //! NOTE: modules are wired in incrementally as slice-1 tasks land, so the crate
 //! always compiles. The full module set / prelude is assembled by the final task.
 
+pub mod adapt;
 pub mod color;
 pub mod compat;
 pub mod context;
+pub mod curve;
 pub mod error;
 pub mod fixed;
 pub mod io;
 pub mod math;
+pub mod pcs;
 pub mod profile;
 pub mod sig;
 
@@ -22,6 +25,10 @@ pub use error::{Error, Result};
 pub mod prelude {
     pub use crate::color::{CIELCh, CIELab, CIEXYZTriple, CIExyY, CIExyYTriple, JCh, CIEXYZ};
     pub use crate::context::{Context, Logger};
+    pub use crate::curve::{
+        build_gamma, build_parametric, build_segmented, build_tabulated_16, build_tabulated_float,
+        eval_parametric, CurveSegment, ToneCurve,
+    };
     pub use crate::error::{Error, Result};
     pub use crate::fixed::{Half, S15Fixed16, U16Fixed16, U8Fixed8};
     pub use crate::io::{ProfileReader, ProfileWriter};

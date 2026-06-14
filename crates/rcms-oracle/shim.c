@@ -1,6 +1,104 @@
 #include "lcms2_internal.h"
 #include <stdint.h>
 #include <stdlib.h>
+#include <math.h>
+
+/* ---- TEMPORARY transcendental parity probe (slice 3 de-risk) -------------- */
+/* These expose the exact C libm functions lcms2's parametric curve evaluator
+   uses (pow/log/log10) so a Rust test can compare bit patterns against
+   f64::powf/ln/log10. KEPT after the probe: slice 3's parametric tone-curve
+   differential tests will want a pow/log oracle regardless of the outcome. */
+double rcms_oracle_pow(double x, double y) { return pow(x, y); }
+double rcms_oracle_log(double x)           { return log(x); }
+double rcms_oracle_log10(double x)         { return log10(x); }
+
+/* ---- Parametric tone-curve evaluator (cmsgamma.c DefaultEvalParametricFn) ----
+   Builds a one-segment parametric curve of the given type and evaluates it via
+   cmsEvalToneCurveFloat at x. For a curve built by cmsBuildParametricToneCurve
+   the single function segment spans (MINUS_INF, PLUS_INF], so any finite x is
+   in-domain and EvalSegmentedFn dispatches straight to DefaultEvalParametricFn
+   (no table interpolation; nSegments==1 so the 16-bit-table branch of
+   cmsEvalToneCurveFloat is skipped). EvalSegmentedFn additionally clamps an
+   infinite result to +/-1E22F before the cmsFloat32Number cast. Returns the
+   evaluator output as a float, or NAN if lcms2 rejects the type/params (so the
+   Rust side can skip those param sets). */
+float rcms_oracle_eval_parametric(int type, const double* params, int nparams, float x) {
+    (void) nparams; /* lcms2 reads exactly ParameterCount[type] params itself. */
+    cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, type, params);
+    if (!c) return NAN;
+    float y = cmsEvalToneCurveFloat(c, x);
+    cmsFreeToneCurve(c);
+    return y;
+}
+
+/* ---- Tone-curve construction + evaluation (cmsgamma.c / cmsintrp.c) ---------
+   These build a curve from a caller-supplied table/params and evaluate it, so the
+   Rust side can diff cmsEvalToneCurve16 / cmsEvalToneCurveFloat and the
+   materialised Table16 bit-for-bit. */
+
+/* cmsBuildTabulatedToneCurve16 + cmsEvalToneCurve16 at v. */
+uint16_t rcms_oracle_tabulated16_eval16(const uint16_t* table, uint32_t n, uint16_t v) {
+    cmsToneCurve* c = cmsBuildTabulatedToneCurve16(NULL, n, table);
+    if (!c) return 0;
+    uint16_t out = cmsEvalToneCurve16(c, v);
+    cmsFreeToneCurve(c);
+    return out;
+}
+
+/* cmsBuildTabulatedToneCurve16 + cmsEvalToneCurveFloat at x. */
+float rcms_oracle_tabulated16_eval_float(const uint16_t* table, uint32_t n, float x) {
+    cmsToneCurve* c = cmsBuildTabulatedToneCurve16(NULL, n, table);
+    if (!c) return NAN;
+    float out = cmsEvalToneCurveFloat(c, x);
+    cmsFreeToneCurve(c);
+    return out;
+}
+
+/* cmsBuildTabulatedToneCurveFloat + cmsEvalToneCurveFloat at x. Returns NAN if
+   lcms2 rejects the table (n == 0). */
+float rcms_oracle_tabulated_float_eval_float(const float* table, uint32_t n, float x) {
+    cmsToneCurve* c = cmsBuildTabulatedToneCurveFloat(NULL, n, table);
+    if (!c) return NAN;
+    float out = cmsEvalToneCurveFloat(c, x);
+    cmsFreeToneCurve(c);
+    return out;
+}
+
+/* cmsBuildParametricToneCurve + cmsEvalToneCurveFloat at x. Returns NAN if lcms2
+   rejects the type/params. */
+float rcms_oracle_parametric_eval_float(int type, const double* params, float x) {
+    cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, type, params);
+    if (!c) return NAN;
+    float out = cmsEvalToneCurveFloat(c, x);
+    cmsFreeToneCurve(c);
+    return out;
+}
+
+/* Materialise the 16-bit approximation table of a cmsBuildParametricToneCurve
+   curve. Writes cmsGetToneCurveEstimatedTable into out (cap entries of room) and
+   returns the entry count, or -1 if lcms2 rejects the type/params. */
+int32_t rcms_oracle_parametric_table16(int type, const double* params, uint16_t* out, uint32_t cap) {
+    cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, type, params);
+    if (!c) return -1;
+    uint32_t n = cmsGetToneCurveEstimatedTableEntries(c);
+    const uint16_t* t = cmsGetToneCurveEstimatedTable(c);
+    if (n > cap) { cmsFreeToneCurve(c); return -1; }
+    for (uint32_t i = 0; i < n; i++) out[i] = t[i];
+    cmsFreeToneCurve(c);
+    return (int32_t) n;
+}
+
+/* Materialise the 16-bit table of a cmsBuildTabulatedToneCurveFloat curve. */
+int32_t rcms_oracle_tabulated_float_table16(const float* table, uint32_t n_in, uint16_t* out, uint32_t cap) {
+    cmsToneCurve* c = cmsBuildTabulatedToneCurveFloat(NULL, n_in, table);
+    if (!c) return -1;
+    uint32_t n = cmsGetToneCurveEstimatedTableEntries(c);
+    const uint16_t* t = cmsGetToneCurveEstimatedTable(c);
+    if (n > cap) { cmsFreeToneCurve(c); return -1; }
+    for (uint32_t i = 0; i < n; i++) out[i] = t[i];
+    cmsFreeToneCurve(c);
+    return (int32_t) n;
+}
 
 /* Fixed-point (cmsplugin.c:383). */
 int32_t rcms_oracle_double_to_s15f16(double v) { return (int32_t) _cmsDoubleTo15Fixed16(v); }
@@ -14,6 +112,82 @@ int32_t  rcms_oracle_from_fixed_domain(int32_t a) { return _cmsFromFixedDomain((
 int      rcms_oracle_quick_floor(double v)         { return _cmsQuickFloor(v); }
 uint16_t rcms_oracle_quick_floor_word(double d)    { return _cmsQuickFloorWord(d); }
 uint16_t rcms_oracle_quick_saturate_word(double d) { return _cmsQuickSaturateWord(d); }
+
+/* PCS conversions (cmspcs.c). White point + value passed as flat doubles. A NULL
+   white point is signalled by passing wp == NULL; lcms2 then defaults to D50. */
+void rcms_oracle_xyz2lab(const double* wp, const double xyz[3], double lab[3]) {
+    cmsCIEXYZ WP; cmsCIEXYZ XYZ; cmsCIELab Lab;
+    XYZ.X = xyz[0]; XYZ.Y = xyz[1]; XYZ.Z = xyz[2];
+    if (wp) { WP.X = wp[0]; WP.Y = wp[1]; WP.Z = wp[2]; cmsXYZ2Lab(&WP, &Lab, &XYZ); }
+    else    { cmsXYZ2Lab(NULL, &Lab, &XYZ); }
+    lab[0] = Lab.L; lab[1] = Lab.a; lab[2] = Lab.b;
+}
+void rcms_oracle_lab2xyz(const double* wp, const double lab[3], double xyz[3]) {
+    cmsCIEXYZ WP; cmsCIEXYZ XYZ; cmsCIELab Lab;
+    Lab.L = lab[0]; Lab.a = lab[1]; Lab.b = lab[2];
+    if (wp) { WP.X = wp[0]; WP.Y = wp[1]; WP.Z = wp[2]; cmsLab2XYZ(&WP, &XYZ, &Lab); }
+    else    { cmsLab2XYZ(NULL, &XYZ, &Lab); }
+    xyz[0] = XYZ.X; xyz[1] = XYZ.Y; xyz[2] = XYZ.Z;
+}
+void rcms_oracle_xyz2xyy(const double xyz[3], double xyy[3]) {
+    cmsCIEXYZ XYZ; cmsCIExyY xyY;
+    XYZ.X = xyz[0]; XYZ.Y = xyz[1]; XYZ.Z = xyz[2];
+    cmsXYZ2xyY(&xyY, &XYZ);
+    xyy[0] = xyY.x; xyy[1] = xyY.y; xyy[2] = xyY.Y;
+}
+void rcms_oracle_xyy2xyz(const double xyy[3], double xyz[3]) {
+    cmsCIEXYZ XYZ; cmsCIExyY xyY;
+    xyY.x = xyy[0]; xyY.y = xyy[1]; xyY.Y = xyy[2];
+    cmsxyY2XYZ(&XYZ, &xyY);
+    xyz[0] = XYZ.X; xyz[1] = XYZ.Y; xyz[2] = XYZ.Z;
+}
+void rcms_oracle_lab2lch(const double lab[3], double lch[3]) {
+    cmsCIELab Lab; cmsCIELCh LCh;
+    Lab.L = lab[0]; Lab.a = lab[1]; Lab.b = lab[2];
+    cmsLab2LCh(&LCh, &Lab);
+    lch[0] = LCh.L; lch[1] = LCh.C; lch[2] = LCh.h;
+}
+void rcms_oracle_lch2lab(const double lch[3], double lab[3]) {
+    cmsCIELab Lab; cmsCIELCh LCh;
+    LCh.L = lch[0]; LCh.C = lch[1]; LCh.h = lch[2];
+    cmsLCh2Lab(&Lab, &LCh);
+    lab[0] = Lab.L; lab[1] = Lab.a; lab[2] = Lab.b;
+}
+/* Lab v4 / v2 encodings (16-bit). */
+void rcms_oracle_lab_enc2float_v4(const uint16_t wlab[3], double lab[3]) {
+    cmsCIELab Lab; cmsUInt16Number w[3] = { wlab[0], wlab[1], wlab[2] };
+    cmsLabEncoded2Float(&Lab, w);
+    lab[0] = Lab.L; lab[1] = Lab.a; lab[2] = Lab.b;
+}
+void rcms_oracle_float2lab_enc_v4(const double lab[3], uint16_t wlab[3]) {
+    cmsCIELab Lab; cmsUInt16Number w[3];
+    Lab.L = lab[0]; Lab.a = lab[1]; Lab.b = lab[2];
+    cmsFloat2LabEncoded(w, &Lab);
+    wlab[0] = w[0]; wlab[1] = w[1]; wlab[2] = w[2];
+}
+void rcms_oracle_lab_enc2float_v2(const uint16_t wlab[3], double lab[3]) {
+    cmsCIELab Lab; cmsUInt16Number w[3] = { wlab[0], wlab[1], wlab[2] };
+    cmsLabEncoded2FloatV2(&Lab, w);
+    lab[0] = Lab.L; lab[1] = Lab.a; lab[2] = Lab.b;
+}
+void rcms_oracle_float2lab_enc_v2(const double lab[3], uint16_t wlab[3]) {
+    cmsCIELab Lab; cmsUInt16Number w[3];
+    Lab.L = lab[0]; Lab.a = lab[1]; Lab.b = lab[2];
+    cmsFloat2LabEncodedV2(w, &Lab);
+    wlab[0] = w[0]; wlab[1] = w[1]; wlab[2] = w[2];
+}
+/* XYZ 1.15 fixed-point encoding. */
+void rcms_oracle_xyz_enc2float(const uint16_t wxyz[3], double xyz[3]) {
+    cmsCIEXYZ XYZ; cmsUInt16Number w[3] = { wxyz[0], wxyz[1], wxyz[2] };
+    cmsXYZEncoded2Float(&XYZ, w);
+    xyz[0] = XYZ.X; xyz[1] = XYZ.Y; xyz[2] = XYZ.Z;
+}
+void rcms_oracle_float2xyz_enc(const double xyz[3], uint16_t wxyz[3]) {
+    cmsCIEXYZ XYZ; cmsUInt16Number w[3];
+    XYZ.X = xyz[0]; XYZ.Y = xyz[1]; XYZ.Z = xyz[2];
+    cmsFloat2XYZEncoded(w, &XYZ);
+    wxyz[0] = w[0]; wxyz[1] = w[1]; wxyz[2] = w[2];
+}
 
 /* 3x3 matrix / 3-vector ops (cmsmtrx.c). */
 /* Mat3 row-major as 9 doubles; Vec3 as 3 doubles. */
@@ -38,6 +212,42 @@ int rcms_oracle_mat3_inverse(double out[9], const double a[9]) {
 int rcms_oracle_mat3_solve(double out[3], const double a[9], const double b[3]) {
     cmsMAT3 A; cmsVEC3 B,X; load_mat(&A,a); B.n[0]=b[0]; B.n[1]=b[1]; B.n[2]=b[2];
     if (!_cmsMAT3solve(&X,&A,&B)) return 0; out[0]=X.n[0]; out[1]=X.n[1]; out[2]=X.n[2]; return 1;
+}
+
+/* White point from temperature (cmswtpnt.c). Writes [x,y,Y] into out; returns
+   1 on success (temp in [4000,25000]) or 0. */
+int rcms_oracle_white_point_from_temp(double out[3], double temp_k) {
+    cmsCIExyY wp;
+    if (!cmsWhitePointFromTemp(&wp, temp_k)) return 0;
+    out[0] = wp.x; out[1] = wp.y; out[2] = wp.Y;
+    return 1;
+}
+
+/* Bradford chromatic adaptation: adapt a color from SourceWhitePt to Illuminant
+   (cmsAdaptToIlluminant). All white points / value as [X,Y,Z]. Writes the
+   adapted [X,Y,Z] into out; returns 1 on success or 0 (singular adaptation). */
+int rcms_oracle_adapt_to_illuminant(double out[3], const double src_wp[3],
+                                    const double illuminant[3], const double value[3]) {
+    cmsCIEXYZ SrcWP, Ill, Val, Res;
+    SrcWP.X = src_wp[0]; SrcWP.Y = src_wp[1]; SrcWP.Z = src_wp[2];
+    Ill.X   = illuminant[0]; Ill.Y = illuminant[1]; Ill.Z = illuminant[2];
+    Val.X   = value[0]; Val.Y = value[1]; Val.Z = value[2];
+    if (!cmsAdaptToIlluminant(&Res, &SrcWP, &Ill, &Val)) return 0;
+    out[0] = Res.X; out[1] = Res.Y; out[2] = Res.Z;
+    return 1;
+}
+
+/* Bradford adaptation matrix (_cmsAdaptationMatrix, NULL cone -> Bradford).
+   from/to as [X,Y,Z]; writes the 9 matrix entries (row-major) into out.
+   Returns 1 on success or 0 (singular). _cmsAdaptationMatrix is internal but
+   exported (CMSCHECKPOINT) so it links here. */
+int rcms_oracle_adaptation_matrix(double out[9], const double from[3], const double to[3]) {
+    cmsMAT3 M; cmsCIEXYZ From, To;
+    From.X = from[0]; From.Y = from[1]; From.Z = from[2];
+    To.X   = to[0];   To.Y   = to[1];   To.Z   = to[2];
+    if (!_cmsAdaptationMatrix(&M, NULL, &From, &To)) return 0;
+    store_mat(out, &M);
+    return 1;
 }
 
 /* IEEE half<->float (cmshalf.c, table-based van der Zijp method). */
@@ -644,4 +854,73 @@ int rcms_oracle_dict_entry(const uint8_t* buf, uint32_t len, uint32_t sig, uint3
     }
     cmsCloseProfile(p);
     return ok;
+}
+
+/* cmsReadTag of a curv/para tag -> a cmsToneCurve*, sampled via
+   cmsEvalToneCurveFloat at the n caller-supplied x points (xs[0..n]), written to
+   ys[0..n]. Returns 1 on success, 0 if the profile cannot be opened or the tag
+   is absent / not tone-curve-backed. cmsReadTag returns a pointer lcms2 owns
+   (freed with the profile), so we do NOT free it here. */
+int rcms_oracle_read_tag_curve(const uint8_t* buf, uint32_t len, uint32_t sig,
+                               const float* xs, uint32_t n, float* ys) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsToneCurve* c = (cmsToneCurve*) cmsReadTag(p, (cmsTagSignature) sig);
+    if (!c) { cmsCloseProfile(p); return 0; }
+    for (uint32_t i = 0; i < n; i++) ys[i] = cmsEvalToneCurveFloat(c, xs[i]);
+    cmsCloseProfile(p);
+    return 1;
+}
+
+/* cmsReadTag of a vcgt tag -> a cmsToneCurve** (array of 3 R/G/B curves), each
+   sampled via cmsEvalToneCurveFloat at the n caller-supplied x points
+   (xs[0..n]). Writes 3*n floats to ys row-major (channel 0 first, then 1, 2).
+   Returns 1 on success, 0 if the profile cannot be opened or the tag is absent /
+   not vcgt-backed. The cmsToneCurve** is owned by the profile (freed on close). */
+int rcms_oracle_read_tag_vcgt(const uint8_t* buf, uint32_t len, uint32_t sig,
+                              const float* xs, uint32_t n, float* ys) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsToneCurve** curves = (cmsToneCurve**) cmsReadTag(p, (cmsTagSignature) sig);
+    if (!curves) { cmsCloseProfile(p); return 0; }
+    for (int ch = 0; ch < 3; ch++) {
+        if (!curves[ch]) { cmsCloseProfile(p); return 0; }
+        for (uint32_t i = 0; i < n; i++)
+            ys[ch * n + i] = cmsEvalToneCurveFloat(curves[ch], xs[i]);
+    }
+    cmsCloseProfile(p);
+    return 1;
+}
+
+/* cmsReadTag of a bfd (UcrBg) tag -> a cmsUcrBg* { Ucr, Bg, Desc }. The Ucr and
+   Bg tone curves are each sampled via cmsEvalToneCurveFloat at the n x points,
+   written to ucr_ys[0..n] / bg_ys[0..n]. The Desc MLU's ASCII translation is
+   written (NUL-terminated, truncated to dcap) to desc, with the byte count
+   (excluding NUL) returned via *dused. Returns 1 on success, 0 otherwise. The
+   cmsUcrBg* is owned by the profile (freed on close). */
+int rcms_oracle_read_tag_ucrbg(const uint8_t* buf, uint32_t len, uint32_t sig,
+                               const float* xs, uint32_t n,
+                               float* ucr_ys, float* bg_ys,
+                               char* desc, uint32_t dcap, uint32_t* dused) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsUcrBg* v = (cmsUcrBg*) cmsReadTag(p, (cmsTagSignature) sig);
+    if (!v || !v->Ucr || !v->Bg) { cmsCloseProfile(p); return 0; }
+    for (uint32_t i = 0; i < n; i++) {
+        ucr_ys[i] = cmsEvalToneCurveFloat(v->Ucr, xs[i]);
+        bg_ys[i]  = cmsEvalToneCurveFloat(v->Bg, xs[i]);
+    }
+    uint32_t got = 0;
+    if (v->Desc) {
+        /* cmsMLUgetASCII returns the byte count INCLUDING the NUL terminator. */
+        uint32_t want = cmsMLUgetASCII(v->Desc, cmsNoLanguage, cmsNoCountry, NULL, 0);
+        if (want > dcap) want = dcap;
+        uint32_t wrote = cmsMLUgetASCII(v->Desc, cmsNoLanguage, cmsNoCountry, desc, want);
+        got = (wrote > 0) ? wrote - 1 : 0; /* strip the NUL from the reported count */
+    } else {
+        if (dcap > 0) desc[0] = 0;
+    }
+    *dused = got;
+    cmsCloseProfile(p);
+    return 1;
 }

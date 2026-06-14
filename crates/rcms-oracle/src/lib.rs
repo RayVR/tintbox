@@ -2,6 +2,22 @@
 //! for bit-for-bit comparison against `rcms`.
 
 unsafe extern "C" {
+    // TEMPORARY transcendental parity probe (slice 3 de-risk). KEPT.
+    fn rcms_oracle_pow(x: f64, y: f64) -> f64;
+    fn rcms_oracle_log(x: f64) -> f64;
+    fn rcms_oracle_log10(x: f64) -> f64;
+    fn rcms_oracle_eval_parametric(ty: i32, params: *const f64, nparams: i32, x: f32) -> f32;
+    fn rcms_oracle_tabulated16_eval16(table: *const u16, n: u32, v: u16) -> u16;
+    fn rcms_oracle_tabulated16_eval_float(table: *const u16, n: u32, x: f32) -> f32;
+    fn rcms_oracle_tabulated_float_eval_float(table: *const f32, n: u32, x: f32) -> f32;
+    fn rcms_oracle_parametric_eval_float(ty: i32, params: *const f64, x: f32) -> f32;
+    fn rcms_oracle_parametric_table16(ty: i32, params: *const f64, out: *mut u16, cap: u32) -> i32;
+    fn rcms_oracle_tabulated_float_table16(
+        table: *const f32,
+        n_in: u32,
+        out: *mut u16,
+        cap: u32,
+    ) -> i32;
     fn rcms_oracle_double_to_s15f16(v: f64) -> i32;
     fn rcms_oracle_s15f16_to_double(a: i32) -> f64;
     fn rcms_oracle_double_to_8fixed8(v: f64) -> u16;
@@ -10,10 +26,30 @@ unsafe extern "C" {
     fn rcms_oracle_quick_floor(v: f64) -> i32;
     fn rcms_oracle_quick_floor_word(d: f64) -> u16;
     fn rcms_oracle_quick_saturate_word(d: f64) -> u16;
+    fn rcms_oracle_xyz2lab(wp: *const f64, xyz: *const f64, lab: *mut f64);
+    fn rcms_oracle_lab2xyz(wp: *const f64, lab: *const f64, xyz: *mut f64);
+    fn rcms_oracle_xyz2xyy(xyz: *const f64, xyy: *mut f64);
+    fn rcms_oracle_xyy2xyz(xyy: *const f64, xyz: *mut f64);
+    fn rcms_oracle_lab2lch(lab: *const f64, lch: *mut f64);
+    fn rcms_oracle_lch2lab(lch: *const f64, lab: *mut f64);
+    fn rcms_oracle_lab_enc2float_v4(wlab: *const u16, lab: *mut f64);
+    fn rcms_oracle_float2lab_enc_v4(lab: *const f64, wlab: *mut u16);
+    fn rcms_oracle_lab_enc2float_v2(wlab: *const u16, lab: *mut f64);
+    fn rcms_oracle_float2lab_enc_v2(lab: *const f64, wlab: *mut u16);
+    fn rcms_oracle_xyz_enc2float(wxyz: *const u16, xyz: *mut f64);
+    fn rcms_oracle_float2xyz_enc(xyz: *const f64, wxyz: *mut u16);
     fn rcms_oracle_mat3_eval(out: *mut f64, m: *const f64, v: *const f64);
     fn rcms_oracle_mat3_per(out: *mut f64, a: *const f64, b: *const f64);
     fn rcms_oracle_mat3_inverse(out: *mut f64, a: *const f64) -> i32;
     fn rcms_oracle_mat3_solve(out: *mut f64, a: *const f64, b: *const f64) -> i32;
+    fn rcms_oracle_white_point_from_temp(out: *mut f64, temp_k: f64) -> i32;
+    fn rcms_oracle_adapt_to_illuminant(
+        out: *mut f64,
+        src_wp: *const f64,
+        illuminant: *const f64,
+        value: *const f64,
+    ) -> i32;
+    fn rcms_oracle_adaptation_matrix(out: *mut f64, from: *const f64, to: *const f64) -> i32;
     fn rcms_oracle_half_to_float(h: u16) -> f32;
     fn rcms_oracle_float_to_half(f: f32) -> u16;
     fn rcms_oracle_md5(out: *mut u8, buf: *const u8, len: u32);
@@ -120,6 +156,35 @@ unsafe extern "C" {
         cap: u32,
         used: *mut u32,
     ) -> i32;
+    fn rcms_oracle_read_tag_curve(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        xs: *const f32,
+        n: u32,
+        ys: *mut f32,
+    ) -> i32;
+    fn rcms_oracle_read_tag_vcgt(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        xs: *const f32,
+        n: u32,
+        ys: *mut f32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_read_tag_ucrbg(
+        buf: *const u8,
+        len: u32,
+        sig: u32,
+        xs: *const f32,
+        n: u32,
+        ucr_ys: *mut f32,
+        bg_ys: *mut f32,
+        desc: *mut u8,
+        dcap: u32,
+        dused: *mut u32,
+    ) -> i32;
     fn rcms_oracle_dict_count(buf: *const u8, len: u32, sig: u32) -> i32;
     fn rcms_oracle_dict_entry(
         buf: *const u8,
@@ -213,6 +278,128 @@ pub fn tag_signatures(buf: &[u8]) -> Option<Vec<u32>> {
     Some(sigs)
 }
 
+/// C libm `pow(x, y)` — the exact function lcms2's parametric curve evaluator
+/// calls. TEMPORARY transcendental parity probe (slice 3 de-risk); KEPT.
+pub fn libm_pow(x: f64, y: f64) -> f64 {
+    // SAFETY: pure C arithmetic, no pointers, no allocation.
+    unsafe { rcms_oracle_pow(x, y) }
+}
+/// C libm `log(x)` (natural log). TEMPORARY parity probe; KEPT.
+pub fn libm_log(x: f64) -> f64 {
+    // SAFETY: pure C arithmetic, no pointers, no allocation.
+    unsafe { rcms_oracle_log(x) }
+}
+/// C libm `log10(x)`. TEMPORARY parity probe; KEPT.
+pub fn libm_log10(x: f64) -> f64 {
+    // SAFETY: pure C arithmetic, no pointers, no allocation.
+    unsafe { rcms_oracle_log10(x) }
+}
+
+/// lcms2 `cmsBuildParametricToneCurve` + `cmsEvalToneCurveFloat`: builds a
+/// one-segment parametric curve of `ty` with `params` and evaluates it at `x`.
+/// Because the segment spans `(MINUS_INF, PLUS_INF]`, this dispatches straight
+/// to `DefaultEvalParametricFn` for any finite `x` (the only extra processing is
+/// `EvalSegmentedFn`'s infinity clamp to `±1E22` and the final `f32` cast).
+/// Returns `None` when lcms2 rejects the type/params (signalled as NaN by the
+/// shim), so callers skip those param sets.
+pub fn eval_parametric(ty: i32, params: &[f64], x: f32) -> Option<f32> {
+    // SAFETY: `params` is a valid readable slice of `params.len()` f64s; C reads
+    // exactly `ParameterCount[ty]` of them (the test always supplies at least
+    // that many). The curve handle is built and freed entirely inside the call.
+    let y = unsafe { rcms_oracle_eval_parametric(ty, params.as_ptr(), params.len() as i32, x) };
+    if y.is_nan() {
+        None
+    } else {
+        Some(y)
+    }
+}
+
+/// lcms2 `cmsBuildTabulatedToneCurve16` + `cmsEvalToneCurve16`: builds a 16-bit
+/// tabulated curve from `table` and evaluates it at `v`.
+pub fn tabulated16_eval16(table: &[u16], v: u16) -> u16 {
+    // SAFETY: `table` is a valid readable slice of `table.len()` u16s C only reads
+    // (copied into a curve handle built and freed inside the call).
+    unsafe { rcms_oracle_tabulated16_eval16(table.as_ptr(), table.len() as u32, v) }
+}
+
+/// lcms2 `cmsBuildTabulatedToneCurve16` + `cmsEvalToneCurveFloat` at `x`.
+pub fn tabulated16_eval_float(table: &[u16], x: f32) -> f32 {
+    // SAFETY: `table` is a valid readable slice C only reads; the curve handle is
+    // built and freed inside the call.
+    unsafe { rcms_oracle_tabulated16_eval_float(table.as_ptr(), table.len() as u32, x) }
+}
+
+/// lcms2 `cmsBuildTabulatedToneCurveFloat` + `cmsEvalToneCurveFloat` at `x`.
+/// Returns `None` when lcms2 rejects the table (empty), signalled as NaN.
+pub fn tabulated_float_eval_float(table: &[f32], x: f32) -> Option<f32> {
+    // SAFETY: `table` is a valid readable slice C only reads; the curve handle is
+    // built and freed inside the call.
+    let y =
+        unsafe { rcms_oracle_tabulated_float_eval_float(table.as_ptr(), table.len() as u32, x) };
+    if y.is_nan() {
+        None
+    } else {
+        Some(y)
+    }
+}
+
+/// lcms2 `cmsBuildParametricToneCurve` + `cmsEvalToneCurveFloat` at `x`. Returns
+/// `None` when lcms2 rejects the type/params (signalled as NaN).
+pub fn parametric_eval_float(ty: i32, params: &[f64], x: f32) -> Option<f32> {
+    // SAFETY: `params` is a valid readable slice; C reads exactly
+    // `ParameterCount[ty]` of them. The curve handle is built and freed inside.
+    let y = unsafe { rcms_oracle_parametric_eval_float(ty, params.as_ptr(), x) };
+    if y.is_nan() {
+        None
+    } else {
+        Some(y)
+    }
+}
+
+/// lcms2 `cmsBuildParametricToneCurve` + `cmsGetToneCurveEstimatedTable`: the
+/// materialised 16-bit approximation table, or `None` when lcms2 rejects the
+/// type/params.
+pub fn parametric_table16(ty: i32, params: &[f64]) -> Option<Vec<u16>> {
+    let cap = 4096usize; // lcms2's max grid points for a curve.
+    let mut out = vec![0u16; cap];
+    // SAFETY: `params` is a valid readable slice C reads `ParameterCount[ty]` of;
+    // `out` has `cap` u16 of room, which exceeds any table lcms2 materialises. C
+    // writes at most `cap` entries and returns the count, or -1 on reject.
+    let n = unsafe {
+        rcms_oracle_parametric_table16(ty, params.as_ptr(), out.as_mut_ptr(), cap as u32)
+    };
+    if n < 0 {
+        None
+    } else {
+        out.truncate(n as usize);
+        Some(out)
+    }
+}
+
+/// lcms2 `cmsBuildTabulatedToneCurveFloat` + `cmsGetToneCurveEstimatedTable`: the
+/// materialised 16-bit table, or `None` when lcms2 rejects the table.
+pub fn tabulated_float_table16(table: &[f32]) -> Option<Vec<u16>> {
+    let cap = 4096usize;
+    let mut out = vec![0u16; cap];
+    // SAFETY: `table` is a valid readable slice C only reads; `out` has `cap` u16,
+    // exceeding any table lcms2 materialises. C writes at most `cap` and returns
+    // the count, or -1 on reject.
+    let n = unsafe {
+        rcms_oracle_tabulated_float_table16(
+            table.as_ptr(),
+            table.len() as u32,
+            out.as_mut_ptr(),
+            cap as u32,
+        )
+    };
+    if n < 0 {
+        None
+    } else {
+        out.truncate(n as usize);
+        Some(out)
+    }
+}
+
 /// lcms2 `_cmsDoubleTo15Fixed16`.
 pub fn double_to_s15f16(v: f64) -> i32 {
     // SAFETY: pure C arithmetic, no pointers, no allocation.
@@ -249,6 +436,96 @@ pub fn quick_floor_word(d: f64) -> u16 {
 pub fn quick_saturate_word(d: f64) -> u16 {
     // SAFETY: pure C arithmetic, no pointers, no allocation.
     unsafe { rcms_oracle_quick_saturate_word(d) }
+}
+
+/// lcms2 `cmsXYZ2Lab`. `wp == None` lets lcms2 default to D50 (it sees a NULL
+/// white point). Returns `[L, a, b]`.
+pub fn xyz2lab(wp: Option<[f64; 3]>, xyz: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    let wp_ptr = wp.as_ref().map_or(core::ptr::null(), |w| w.as_ptr());
+    // SAFETY: xyz/out are valid 3-double arrays C reads/writes; wp_ptr is either
+    // null (C defaults to D50) or points at a valid 3-double array C only reads.
+    unsafe { rcms_oracle_xyz2lab(wp_ptr, xyz.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsLab2XYZ`. `wp == None` → D50. Returns `[X, Y, Z]`.
+pub fn lab2xyz(wp: Option<[f64; 3]>, lab: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    let wp_ptr = wp.as_ref().map_or(core::ptr::null(), |w| w.as_ptr());
+    // SAFETY: lab/out are valid 3-double arrays C reads/writes; wp_ptr is null or
+    // a valid 3-double array C only reads.
+    unsafe { rcms_oracle_lab2xyz(wp_ptr, lab.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsXYZ2xyY`. Returns `[x, y, Y]`.
+pub fn xyz2xyy(xyz: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: xyz/out are valid 3-double arrays C reads/writes.
+    unsafe { rcms_oracle_xyz2xyy(xyz.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsxyY2XYZ`. Returns `[X, Y, Z]`.
+pub fn xyy2xyz(xyy: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: xyy/out are valid 3-double arrays C reads/writes.
+    unsafe { rcms_oracle_xyy2xyz(xyy.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsLab2LCh`. Returns `[L, C, h]`.
+pub fn lab2lch(lab: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: lab/out are valid 3-double arrays C reads/writes.
+    unsafe { rcms_oracle_lab2lch(lab.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsLCh2Lab`. Returns `[L, a, b]`.
+pub fn lch2lab(lch: &[f64; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: lch/out are valid 3-double arrays C reads/writes.
+    unsafe { rcms_oracle_lch2lab(lch.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsLabEncoded2Float` (v4). Returns `[L, a, b]`.
+pub fn lab_enc2float_v4(wlab: &[u16; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: wlab is a valid 3-u16 array C reads; out a valid 3-double array C writes.
+    unsafe { rcms_oracle_lab_enc2float_v4(wlab.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsFloat2LabEncoded` (v4). Returns `[L, a, b]` u16.
+pub fn float2lab_enc_v4(lab: &[f64; 3]) -> [u16; 3] {
+    let mut out = [0u16; 3];
+    // SAFETY: lab is a valid 3-double array C reads; out a valid 3-u16 array C writes.
+    unsafe { rcms_oracle_float2lab_enc_v4(lab.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsLabEncoded2FloatV2`. Returns `[L, a, b]`.
+pub fn lab_enc2float_v2(wlab: &[u16; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: wlab is a valid 3-u16 array C reads; out a valid 3-double array C writes.
+    unsafe { rcms_oracle_lab_enc2float_v2(wlab.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsFloat2LabEncodedV2`. Returns `[L, a, b]` u16.
+pub fn float2lab_enc_v2(lab: &[f64; 3]) -> [u16; 3] {
+    let mut out = [0u16; 3];
+    // SAFETY: lab is a valid 3-double array C reads; out a valid 3-u16 array C writes.
+    unsafe { rcms_oracle_float2lab_enc_v2(lab.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsXYZEncoded2Float`. Returns `[X, Y, Z]`.
+pub fn xyz_enc2float(wxyz: &[u16; 3]) -> [f64; 3] {
+    let mut out = [0.0f64; 3];
+    // SAFETY: wxyz is a valid 3-u16 array C reads; out a valid 3-double array C writes.
+    unsafe { rcms_oracle_xyz_enc2float(wxyz.as_ptr(), out.as_mut_ptr()) };
+    out
+}
+/// lcms2 `cmsFloat2XYZEncoded`. Returns `[X, Y, Z]` u16.
+pub fn float2xyz_enc(xyz: &[f64; 3]) -> [u16; 3] {
+    let mut out = [0u16; 3];
+    // SAFETY: xyz is a valid 3-double array C reads; out a valid 3-u16 array C writes.
+    unsafe { rcms_oracle_float2xyz_enc(xyz.as_ptr(), out.as_mut_ptr()) };
+    out
 }
 
 /// lcms2 `_cmsMAT3eval`.
@@ -289,6 +566,59 @@ pub fn mat3_solve(a: &[f64; 9], b: &[f64; 3]) -> Option<[f64; 3]> {
     // SAFETY: out/a/b are valid fixed-size local arrays; their pointers are valid for
     // the 9/3 doubles C reads. C writes 3 doubles to out only when it returns nonzero.
     let ok = unsafe { rcms_oracle_mat3_solve(out.as_mut_ptr(), a.as_ptr(), b.as_ptr()) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsWhitePointFromTemp`. Returns `Some([x, y, Y])` for a temperature in
+/// `[4000, 25000]`, else `None`.
+pub fn white_point_from_temp(temp_k: f64) -> Option<[f64; 3]> {
+    let mut out = [0.0f64; 3];
+    // SAFETY: out is a valid 3-double array C writes; temp_k is a plain scalar.
+    // C writes 3 doubles to out only when it returns nonzero.
+    let ok = unsafe { rcms_oracle_white_point_from_temp(out.as_mut_ptr(), temp_k) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsAdaptToIlluminant`. Adapts `value` (XYZ) from `src_wp` to
+/// `illuminant` via Bradford. Returns `None` on singular adaptation.
+pub fn adapt_to_illuminant(
+    src_wp: &[f64; 3],
+    illuminant: &[f64; 3],
+    value: &[f64; 3],
+) -> Option<[f64; 3]> {
+    let mut out = [0.0f64; 3];
+    // SAFETY: out/src_wp/illuminant/value are valid 3-double arrays C reads/writes.
+    // C writes 3 doubles to out only when it returns nonzero.
+    let ok = unsafe {
+        rcms_oracle_adapt_to_illuminant(
+            out.as_mut_ptr(),
+            src_wp.as_ptr(),
+            illuminant.as_ptr(),
+            value.as_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `_cmsAdaptationMatrix` with a NULL cone matrix (Bradford). Returns the
+/// 9 row-major matrix entries, or `None` on singular adaptation.
+pub fn adaptation_matrix(from: &[f64; 3], to: &[f64; 3]) -> Option<[f64; 9]> {
+    let mut out = [0.0f64; 9];
+    // SAFETY: out is a valid 9-double array C writes; from/to are valid 3-double
+    // arrays C reads. C writes 9 doubles to out only when it returns nonzero.
+    let ok = unsafe { rcms_oracle_adaptation_matrix(out.as_mut_ptr(), from.as_ptr(), to.as_ptr()) };
     if ok != 0 {
         Some(out)
     } else {
@@ -976,6 +1306,112 @@ pub fn read_tag_dict(buf: &[u8], sig: u32) -> Option<OracleDict> {
     Some(OracleDict { entries })
 }
 
+/// lcms2 `cmsReadTag` of a `curv`/`para` tag -> a `cmsToneCurve*`, sampled via
+/// `cmsEvalToneCurveFloat` at each `x` in `xs`. Returns the per-point samples (one
+/// per `x`), or `None` if lcms2 cannot open the profile or the tag is absent / not
+/// tone-curve-backed. This is the bit-exact reference for an rcms `Tag::Curve`'s
+/// `eval_float` at the same points.
+pub fn read_tag_curve(buf: &[u8], sig: u32, xs: &[f32]) -> Option<Vec<f32>> {
+    let mut ys = vec![0.0f32; xs.len()];
+    // SAFETY: buf/len describe a valid readable slice C only reads; xs is a valid
+    // readable slice of `xs.len()` f32, and ys has exactly that many f32 of room,
+    // which is what C writes when it returns nonzero. The cmsToneCurve* C samples
+    // is owned by the profile (freed on cmsCloseProfile inside the call).
+    let ok = unsafe {
+        rcms_oracle_read_tag_curve(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            xs.as_ptr(),
+            xs.len() as u32,
+            ys.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(ys)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsReadTag` of a `vcgt` tag -> a `cmsToneCurve**` (3 R/G/B curves),
+/// each sampled via `cmsEvalToneCurveFloat` at every `x` in `xs`. Returns one
+/// `Vec<f32>` of length `xs.len()` per channel (`[r, g, b]`), or `None` if lcms2
+/// cannot open the profile or the tag is absent / not vcgt-backed.
+pub fn read_tag_vcgt(buf: &[u8], sig: u32, xs: &[f32]) -> Option<[Vec<f32>; 3]> {
+    let mut ys = vec![0.0f32; xs.len() * 3];
+    // SAFETY: buf/len describe a valid readable slice C only reads; xs is a valid
+    // readable slice of `xs.len()` f32, and ys has room for 3*xs.len() f32, which
+    // is exactly what C writes (row-major, 3 channels) when it returns nonzero.
+    // The cmsToneCurve** C samples is owned by the profile (freed on close).
+    let ok = unsafe {
+        rcms_oracle_read_tag_vcgt(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            xs.as_ptr(),
+            xs.len() as u32,
+            ys.as_mut_ptr(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let n = xs.len();
+    Some([
+        ys[0..n].to_vec(),
+        ys[n..2 * n].to_vec(),
+        ys[2 * n..3 * n].to_vec(),
+    ])
+}
+
+/// A `cmsUcrBg` as lcms2 exposes it: the Ucr/Bg curves sampled at the requested
+/// points and the ASCII `Desc` string (`cmsMLUgetASCII` of the no-language entry).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OracleUcrBg {
+    pub ucr: Vec<f32>,
+    pub bg: Vec<f32>,
+    pub desc: String,
+}
+
+/// lcms2 `cmsReadTag` of a `bfd ` (UcrBg) tag -> the Ucr/Bg curves sampled via
+/// `cmsEvalToneCurveFloat` at every `x` in `xs`, plus the ASCII `Desc`. Returns
+/// `None` if lcms2 cannot open the profile or the tag is absent / not UcrBg-backed.
+pub fn read_tag_ucrbg(buf: &[u8], sig: u32, xs: &[f32]) -> Option<OracleUcrBg> {
+    let mut ucr = vec![0.0f32; xs.len()];
+    let mut bg = vec![0.0f32; xs.len()];
+    let dcap = 1usize << 16;
+    let mut desc = vec![0u8; dcap];
+    let mut dused = 0u32;
+    // SAFETY: buf/len describe a valid readable slice C only reads; xs is a valid
+    // readable slice; ucr/bg have room for xs.len() f32 each (what C writes); desc
+    // has `dcap` bytes and C writes at most `dcap` (NUL-terminated), reporting the
+    // byte count (sans NUL) via dused. The cmsUcrBg* is owned by the profile.
+    let ok = unsafe {
+        rcms_oracle_read_tag_ucrbg(
+            buf.as_ptr(),
+            buf.len() as u32,
+            sig,
+            xs.as_ptr(),
+            xs.len() as u32,
+            ucr.as_mut_ptr(),
+            bg.as_mut_ptr(),
+            desc.as_mut_ptr(),
+            dcap as u32,
+            &mut dused,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    desc.truncate(dused as usize);
+    Some(OracleUcrBg {
+        ucr,
+        bg,
+        desc: desc.iter().map(|&b| b as char).collect(),
+    })
+}
+
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.
 pub struct Rng(u64);
 impl Rng {
@@ -1010,5 +1446,159 @@ mod tests {
     #[test]
     fn oracle_links() {
         assert_eq!(super::double_to_s15f16(1.0), 65536); // 1.0 -> 65536 in 15.16
+    }
+}
+
+/// TEMPORARY transcendental parity probe (slice 3 de-risk). Sweeps millions of
+/// inputs comparing Rust std math (`f64::powf`/`ln`/`log10`) against the C libm
+/// the lcms2 oracle links. Run with:
+///   cargo test -p rcms-oracle --release transcendental_parity_probe -- --nocapture --ignored
+/// Marked `#[ignore]` so it does not run in the normal suite (it is a one-shot
+/// architectural probe, not a regression test). Safe to delete once slice 3 has
+/// committed to a math strategy.
+#[cfg(test)]
+mod transcendental_probe {
+    use super::{libm_log, libm_log10, libm_pow, Rng};
+
+    /// ULP distance between two finite f64 by their bit representations, using
+    /// the IEEE-754 total-order mapping so the integer subtraction is a genuine
+    /// ULP count even across the sign boundary.
+    fn ulp_delta(a: f64, b: f64) -> u64 {
+        monotone(a).wrapping_sub(monotone(b)).unsigned_abs()
+    }
+
+    /// Map an f64 to a monotonically increasing i64 (IEEE-754 total order), so
+    /// integer difference == ULP count. NaNs are not expected on our inputs.
+    fn monotone(x: f64) -> i64 {
+        let b = x.to_bits() as i64;
+        // For negatives, IEEE bit order runs backwards; flip to a continuous line.
+        if b < 0 {
+            i64::MIN.wrapping_sub(b)
+        } else {
+            b
+        }
+    }
+
+    struct Stats {
+        total: u64,
+        mismatches: u64,
+        max_ulp: u64,
+        examples: Vec<(String, u64, u64)>, // (input desc, rust_bits, c_bits)
+    }
+    impl Stats {
+        fn new() -> Self {
+            Stats {
+                total: 0,
+                mismatches: 0,
+                max_ulp: 0,
+                examples: Vec::new(),
+            }
+        }
+        fn record(&mut self, desc: impl FnOnce() -> String, rust: f64, c: f64) {
+            self.total += 1;
+            if rust.to_bits() != c.to_bits() {
+                self.mismatches += 1;
+                let d = ulp_delta(rust, c);
+                if d > self.max_ulp {
+                    self.max_ulp = d;
+                }
+                if self.examples.len() < 3 {
+                    self.examples.push((desc(), rust.to_bits(), c.to_bits()));
+                }
+            }
+        }
+        fn report(&self, name: &str) {
+            println!(
+                "=== {name}: total={} mismatches={} max_ulp={}",
+                self.total, self.mismatches, self.max_ulp
+            );
+            for (i, (d, rb, cb)) in self.examples.iter().enumerate() {
+                println!(
+                    "    example[{i}] input={d} rust_bits=0x{rb:016x} c_bits=0x{cb:016x} (ulp={})",
+                    ulp_delta(f64::from_bits(*rb), f64::from_bits(*cb))
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "one-shot architectural probe; run explicitly with --nocapture --ignored"]
+    fn transcendental_parity_probe() {
+        let n_per: u64 = 3_000_000;
+        let mut rng = Rng::new(0x0511_33DE_0000_0003_u64 ^ 0x9E37_79B9_7F4A_7C15);
+
+        // ---- pow: x in (0,4], y in [0.2,5.0] ----
+        let mut pow_stats = Stats::new();
+        for _ in 0..n_per {
+            let x = rng.next_f64_unit() * 4.0; // (0,4]
+            let x = if x == 0.0 { f64::MIN_POSITIVE } else { x };
+            let y = 0.2 + rng.next_f64_unit() * (5.0 - 0.2); // [0.2,5.0]
+            let r = x.powf(y);
+            let c = libm_pow(x, y);
+            pow_stats.record(|| format!("pow(x={x:e}, y={y:e})"), r, c);
+        }
+        // Edge cases.
+        let pow_edges: &[(f64, f64)] = &[
+            (1.0, 1.0),
+            (1.0, 2.4),
+            (1.0, 1.0 / 2.4),
+            (0.0, 2.4),
+            (f64::MIN_POSITIVE, 2.4),
+            (1e-300, 2.4),
+            (0.5, 2.4),
+            (0.5, 1.0 / 2.4),
+            (2.0, 2.4),
+            (4.0, 5.0),
+            (0.04045, 2.4),
+            (0.0031308, 1.0 / 2.4),
+        ];
+        for &(x, y) in pow_edges {
+            let r = x.powf(y);
+            let c = libm_pow(x, y);
+            pow_stats.record(|| format!("pow_edge(x={x:e}, y={y:e})"), r, c);
+        }
+        pow_stats.report("pow  (x in (0,4], y in [0.2,5.0])");
+
+        // ---- log (natural): x in (0,10] ----
+        let mut log_stats = Stats::new();
+        for _ in 0..n_per {
+            let x = rng.next_f64_unit() * 10.0;
+            let x = if x == 0.0 { f64::MIN_POSITIVE } else { x };
+            let r = x.ln();
+            let c = libm_log(x);
+            log_stats.record(|| format!("log(x={x:e})"), r, c);
+        }
+        for &x in &[1.0_f64, 2.0, std::f64::consts::E, 0.5, 1e-300, 10.0] {
+            let r = x.ln();
+            let c = libm_log(x);
+            log_stats.record(|| format!("log_edge(x={x:e})"), r, c);
+        }
+        log_stats.report("log  (x in (0,10])");
+
+        // ---- log10: x in (0,10] ----
+        let mut log10_stats = Stats::new();
+        for _ in 0..n_per {
+            let x = rng.next_f64_unit() * 10.0;
+            let x = if x == 0.0 { f64::MIN_POSITIVE } else { x };
+            let r = x.log10();
+            let c = libm_log10(x);
+            log10_stats.record(|| format!("log10(x={x:e})"), r, c);
+        }
+        for &x in &[1.0_f64, 10.0, 100.0, 0.1, 0.5, 1e-300] {
+            let r = x.log10();
+            let c = libm_log10(x);
+            log10_stats.record(|| format!("log10_edge(x={x:e})"), r, c);
+        }
+        log10_stats.report("log10 (x in (0,10])");
+
+        println!(
+            "\n=== VERDICT: pow_mismatch={}/{} log_mismatch={}/{} log10_mismatch={}/{} ===",
+            pow_stats.mismatches,
+            pow_stats.total,
+            log_stats.mismatches,
+            log_stats.total,
+            log10_stats.mismatches,
+            log10_stats.total
+        );
     }
 }
