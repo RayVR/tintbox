@@ -19,6 +19,14 @@ unsafe extern "C" {
     fn rcms_oracle_md5(out: *mut u8, buf: *const u8, len: u32);
     fn rcms_oracle_read_u16(buf: *const u8, len: u32, out: *mut u16) -> i32;
     fn rcms_oracle_read_u32(buf: *const u8, len: u32, out: *mut u32) -> i32;
+    fn rcms_oracle_read_u8(buf: *const u8, len: u32, out: *mut u8) -> i32;
+    fn rcms_oracle_read_u64(buf: *const u8, len: u32, out: *mut u64) -> i32;
+    fn rcms_oracle_read_s15f16(buf: *const u8, len: u32, out: *mut i32) -> i32;
+    fn rcms_oracle_read_xyz(buf: *const u8, len: u32, out: *mut f64) -> i32;
+    fn rcms_oracle_read_u16_array(buf: *const u8, len: u32, n: u32, out: *mut u16) -> i32;
+    fn rcms_oracle_read_type_base(buf: *const u8, len: u32, out: *mut u32) -> i32;
+    fn rcms_oracle_read_alignment(buf: *const u8, len: u32, offset: u32, out_tell: *mut u32)
+        -> i32;
 }
 
 /// lcms2 `_cmsDoubleTo15Fixed16`.
@@ -146,6 +154,83 @@ pub fn read_u32(buf: &[u8]) -> Option<u32> {
     } else {
         None
     }
+}
+
+/// lcms2 `_cmsReadUInt8Number` over an in-memory IOHANDLER.
+pub fn read_u8(buf: &[u8]) -> Option<u8> {
+    let mut out = 0u8;
+    // SAFETY: buf/len describe a valid slice; out is a valid u8; C writes out only when it returns nonzero.
+    let ok = unsafe { rcms_oracle_read_u8(buf.as_ptr(), buf.len() as u32, &mut out) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+/// lcms2 `_cmsReadUInt64Number` over an in-memory IOHANDLER (big-endian).
+pub fn read_u64(buf: &[u8]) -> Option<u64> {
+    let mut out = 0u64;
+    // SAFETY: buf/len describe a valid slice; out is a valid u64; C writes out only when it returns nonzero.
+    let ok = unsafe { rcms_oracle_read_u64(buf.as_ptr(), buf.len() as u32, &mut out) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+/// lcms2 `_cmsRead15Fixed16Number` over an in-memory IOHANDLER; returns the raw
+/// wire i32 (the s15Fixed16 value), recovered from the double the C primitive yields.
+pub fn read_s15f16(buf: &[u8]) -> Option<i32> {
+    let mut out = 0i32;
+    // SAFETY: buf/len describe a valid slice; out is a valid i32; C writes out only when it returns nonzero.
+    let ok = unsafe { rcms_oracle_read_s15f16(buf.as_ptr(), buf.len() as u32, &mut out) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+/// lcms2 `_cmsReadXYZNumber` over an in-memory IOHANDLER; returns `[X, Y, Z]` doubles.
+pub fn read_xyz(buf: &[u8]) -> Option<[f64; 3]> {
+    let mut out = [0.0f64; 3];
+    // SAFETY: buf/len describe a valid slice; out is a valid 3-double array C writes when it returns nonzero.
+    let ok = unsafe { rcms_oracle_read_xyz(buf.as_ptr(), buf.len() as u32, out.as_mut_ptr()) };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+/// lcms2 `_cmsReadUInt16Array` over an in-memory IOHANDLER; reads `n` big-endian u16.
+pub fn read_u16_array(buf: &[u8], n: usize) -> Option<Vec<u16>> {
+    let mut out = vec![0u16; n];
+    // SAFETY: buf/len describe a valid slice; out has capacity for n u16, which is exactly
+    // what C writes when it returns nonzero.
+    let ok = unsafe {
+        rcms_oracle_read_u16_array(buf.as_ptr(), buf.len() as u32, n as u32, out.as_mut_ptr())
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+/// lcms2 `_cmsReadTypeBase` over an in-memory IOHANDLER; returns the u32 type signature
+/// (0 if the underlying read failed — matching the C contract).
+pub fn read_type_base(buf: &[u8]) -> u32 {
+    let mut out = 0u32;
+    // SAFETY: buf/len describe a valid slice; out is a valid u32 C always writes.
+    unsafe { rcms_oracle_read_type_base(buf.as_ptr(), buf.len() as u32, &mut out) };
+    out
+}
+/// lcms2 `_cmsReadAlignment`: seeds the in-memory handler at `offset`, then aligns.
+/// Returns `(ok, new_tell)`.
+pub fn read_alignment(buf: &[u8], offset: u32) -> (bool, u32) {
+    let mut tell = 0u32;
+    // SAFETY: buf/len describe a valid slice; tell is a valid u32 C always writes (after Seek/align).
+    let ok =
+        unsafe { rcms_oracle_read_alignment(buf.as_ptr(), buf.len() as u32, offset, &mut tell) };
+    (ok != 0, tell)
 }
 
 /// Deterministic xorshift64* RNG — reproducible sweeps without a dependency.

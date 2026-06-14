@@ -69,3 +69,58 @@ int rcms_oracle_read_u32(const uint8_t* buf, uint32_t len, uint32_t* out) {
     cmsUInt32Number v; int ok = _cmsReadUInt32Number(io, &v);
     cmsCloseIOhandler(io); *out = v; return ok;
 }
+int rcms_oracle_read_u8(const uint8_t* buf, uint32_t len, uint8_t* out) {
+    cmsIOHANDLER* io = cmsOpenIOhandlerFromMem(NULL, (void*)buf, len, "r");
+    if (!io) return 0;
+    cmsUInt8Number v; int ok = _cmsReadUInt8Number(io, &v);
+    cmsCloseIOhandler(io); *out = v; return ok;
+}
+int rcms_oracle_read_u64(const uint8_t* buf, uint32_t len, uint64_t* out) {
+    cmsIOHANDLER* io = cmsOpenIOhandlerFromMem(NULL, (void*)buf, len, "r");
+    if (!io) return 0;
+    cmsUInt64Number v; int ok = _cmsReadUInt64Number(io, &v);
+    cmsCloseIOhandler(io); *out = v; return ok;
+}
+/* Returns the raw i32 (s15Fixed16) by re-encoding the double through
+   _cmsDoubleTo15Fixed16 is lossy; instead we want the wire i32, so reconstruct
+   it: _cmsRead15Fixed16Number yields a double = raw/65536.0, multiply back. */
+int rcms_oracle_read_s15f16(const uint8_t* buf, uint32_t len, int32_t* out) {
+    cmsIOHANDLER* io = cmsOpenIOhandlerFromMem(NULL, (void*)buf, len, "r");
+    if (!io) return 0;
+    cmsFloat64Number v; int ok = _cmsRead15Fixed16Number(io, &v);
+    cmsCloseIOhandler(io);
+    /* v == raw / 65536.0 exactly (integer/65536); recover raw via rounding. */
+    *out = (int32_t) floor(v * 65536.0 + 0.5);
+    return ok;
+}
+int rcms_oracle_read_xyz(const uint8_t* buf, uint32_t len, double out[3]) {
+    cmsIOHANDLER* io = cmsOpenIOhandlerFromMem(NULL, (void*)buf, len, "r");
+    if (!io) return 0;
+    cmsCIEXYZ xyz; int ok = _cmsReadXYZNumber(io, &xyz);
+    cmsCloseIOhandler(io);
+    out[0] = xyz.X; out[1] = xyz.Y; out[2] = xyz.Z;
+    return ok;
+}
+int rcms_oracle_read_u16_array(const uint8_t* buf, uint32_t len, uint32_t n, uint16_t* out) {
+    cmsIOHANDLER* io = cmsOpenIOhandlerFromMem(NULL, (void*)buf, len, "r");
+    if (!io) return 0;
+    int ok = _cmsReadUInt16Array(io, n, out);
+    cmsCloseIOhandler(io); return ok;
+}
+int rcms_oracle_read_type_base(const uint8_t* buf, uint32_t len, uint32_t* out) {
+    cmsIOHANDLER* io = cmsOpenIOhandlerFromMem(NULL, (void*)buf, len, "r");
+    if (!io) return 0;
+    cmsTagTypeSignature sig = _cmsReadTypeBase(io);
+    cmsCloseIOhandler(io); *out = (uint32_t) sig; return 1;
+}
+/* Seed the handler at `offset` (via Seek) then call _cmsReadAlignment.
+   Returns ok flag; writes the resulting Tell into *out_tell. */
+int rcms_oracle_read_alignment(const uint8_t* buf, uint32_t len, uint32_t offset, uint32_t* out_tell) {
+    cmsIOHANDLER* io = cmsOpenIOhandlerFromMem(NULL, (void*)buf, len, "r");
+    if (!io) return 0;
+    if (!io->Seek(io, offset)) { cmsCloseIOhandler(io); return 0; }
+    int ok = _cmsReadAlignment(io);
+    *out_tell = io->Tell(io);
+    cmsCloseIOhandler(io);
+    return ok;
+}
