@@ -5,9 +5,14 @@
 //! PCS→device, and device-link LUT extraction that
 //! `_cmsReadInputLUT`/`_cmsReadOutputLUT`/`_cmsReadDevicelinkLUT` perform.
 
+pub mod black_point;
 pub mod intents;
 pub mod profile_lut;
 
+pub use black_point::{
+    compute_black_point_compensation, detect_black_point, detect_destination_black_point,
+    BlackPoint,
+};
 pub use intents::{
     add_conversion, compute_absolute_intent, compute_conversion, default_icc_intents,
     is_empty_layer, link_bpc_mutation, read_chad, read_media_white_point,

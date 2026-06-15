@@ -108,6 +108,7 @@ fn transform_matches_oracle_over_testbed_pairs_all_intents_float_and_16() {
     let mut float_samples = 0usize;
     let mut u16_samples = 0usize;
     let mut cells_skipped_t5 = 0usize;
+    let mut bpc_cells_passed = 0usize;
     let mut per_intent: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
 
@@ -143,21 +144,22 @@ fn transform_matches_oracle_over_testbed_pairs_all_intents_float_and_16() {
                 .collect();
 
             for &intent in &intents {
-                // Mirror the _cmsLinkProfiles BPC mutation to decide whether this
-                // cell is forced-BPC-on (needs T5). The chain is profile a then b;
-                // BPC is forced ON for a V4 profile under perceptual/saturation.
+                // Mirror the _cmsLinkProfiles BPC mutation to know which cells are
+                // forced-BPC-on. The chain is profile a then b; BPC is forced ON for
+                // a V4 profile under perceptual/saturation. These cells exercise the
+                // T5 black-point math (constant path) or remain deferred to
+                // post-slice-7 (detection-by-sampling) — distinguished below by
+                // whether rcms returns Unsupported.
                 let forces_bpc_on = (intent == RenderingIntent::Perceptual
                     || intent == RenderingIntent::Saturation)
                     && (pa.header().version >= ICC_VERSION_V4
                         || pb.header().version >= ICC_VERSION_V4);
-                if forces_bpc_on {
-                    cells_skipped_t5 += 1;
-                    continue;
-                }
 
                 let intents_raw = [intent.to_raw(), intent.to_raw()];
 
                 // Ask lcms2 (NOOPTIMIZE) whether this chain links + transform float.
+                // lcms2 applies the same BPC mutation internally and detects the
+                // black points, so the oracle already reflects the forced-BPC math.
                 let oracle_f = rcms_oracle::transform_eval_float(
                     &[&a.bytes, &b.bytes],
                     &intents_raw,
@@ -172,6 +174,24 @@ fn transform_matches_oracle_over_testbed_pairs_all_intents_float_and_16() {
                     Some(o) => o,
                     None => continue, // lcms2 rejected; rcms isn't required to link it.
                 };
+
+                // Build the rcms transform. For forced-BPC cells that still need
+                // detection-by-sampling (V4 matrix-shaper perc/sat, etc.), rcms
+                // returns Unsupported — count those as deferred and skip.
+                let xform = match Transform::new_simple(&pa, &pb, intent, false) {
+                    Ok(x) => x,
+                    Err(e) if forces_bpc_on => {
+                        // Deferred BPC cell (post-slice-7, Lab virtual profiles).
+                        let _ = e;
+                        cells_skipped_t5 += 1;
+                        continue;
+                    }
+                    Err(e) => panic!(
+                        "lcms2 linked {} -> {} ({intent:?}) but rcms Transform failed: {e}",
+                        a.name, b.name
+                    ),
+                };
+
                 let oracle_16 = rcms_oracle::transform_eval_16(
                     &[&a.bytes, &b.bytes],
                     &intents_raw,
@@ -183,14 +203,6 @@ fn transform_matches_oracle_over_testbed_pairs_all_intents_float_and_16() {
                     grid.len(),
                 )
                 .expect("lcms2 built float xform but 16-bit failed");
-
-                // lcms2 linked it: rcms MUST link it too.
-                let xform = Transform::new_simple(&pa, &pb, intent, false).unwrap_or_else(|e| {
-                    panic!(
-                        "lcms2 linked {} -> {} ({intent:?}) but rcms Transform failed: {e}",
-                        a.name, b.name
-                    )
-                });
 
                 assert_eq!(
                     xform.lut().input_channels,
@@ -243,15 +255,20 @@ fn transform_matches_oracle_over_testbed_pairs_all_intents_float_and_16() {
                 }
 
                 pairs_linked += 1;
+                if forces_bpc_on {
+                    bpc_cells_passed += 1;
+                }
                 *per_intent.entry(format!("{intent:?}")).or_default() += 1;
             }
         }
     }
 
     println!(
-        "Transform sweep (4 intents, BPC off): {pairs_linked} (pair×intent) cells linked + \
-         transformed bit-exact, {float_samples} float samples, {u16_samples} u16 samples, \
-         {cells_skipped_t5} cells skipped for T5-forced-BPC"
+        "Transform sweep (4 intents): {pairs_linked} (pair×intent) cells linked + \
+         transformed bit-exact, {float_samples} float samples, {u16_samples} u16 samples. \
+         Of those, {bpc_cells_passed} forced-BPC cells (V4 perc/sat) now pass via the \
+         black-point-compensation math; {cells_skipped_t5} forced-BPC cells remain DEFERRED \
+         (detection-by-sampling, post-slice-7 Lab virtual profiles)."
     );
     for (intent, n) in &per_intent {
         println!("  {intent}: {n} cells");

@@ -9,15 +9,22 @@
 //! (`read_input_lut` / `read_output_lut` / `read_devicelink_lut`), inserting the
 //! PCS-adaptation stages between profiles, and concatenating.
 //!
-//! Scope (slice-5 T2): the **relative-colorimetric, no-BPC, non-absolute** path
-//! only. `compute_conversion` produces an identity matrix + zero offset (still
-//! dividing the offset by `MAX_ENCODEABLE_XYZ` to match the C code path). The
-//! absolute-colorimetric branch (`ComputeAbsoluteIntent`, T3) and the
-//! black-point-compensation branch (`ComputeBlackPointCompensation`, T5) are
-//! left as TODO hooks.
+//! `compute_conversion` covers the relative (identity) path, the
+//! absolute-colorimetric branch (`ComputeAbsoluteIntent`), and the
+//! black-point-compensation branch (`ComputeBlackPointCompensation` +
+//! `cmsDetectBlackPoint`/`...Destination...`) for the no-sampling subset (the
+//! V4-perceptual-black constant or a `{0,0,0}` black point). It still divides the
+//! offset by `MAX_ENCODEABLE_XYZ` to match the C code path. The
+//! detection-by-sampling BPC cases (V2, V4 matrix-shaper perc/sat, rel-col, ink
+//! output, destination round-trip) are deferred to post-slice-7 (Lab virtual
+//! profiles) and surface as `Error::Unsupported`.
 
 use crate::color::CIEXYZ;
 use crate::error::{Error, Result};
+use crate::link::black_point::{
+    compute_black_point_compensation, detect_black_point, detect_destination_black_point,
+    BlackPoint,
+};
 use crate::link::profile_lut::{read_devicelink_lut, read_input_lut, read_output_lut};
 use crate::math::matrix::{Mat3, Vec3};
 use crate::math::whitepoint::D50;
@@ -245,17 +252,41 @@ pub fn is_empty_layer(m: &Mat3, off: &Vec3) -> bool {
     diff < 0.002
 }
 
+/// Map a [`BlackPoint`] detection outcome to the concrete XYZ that
+/// `ComputeConversion` (cmscnvrt.c:389-392) would use, mirroring how the C reads
+/// the `{0,0,0}`-initialized out-parameter regardless of the boolean return:
+/// - [`BlackPoint::Resolved`] → that XYZ (the V4 perceptual constant);
+/// - [`BlackPoint::Zero`] → `{0,0,0}` (the C `return FALSE` with the zeroed
+///   out-param — e.g. inadequate class/intent);
+/// - [`BlackPoint::NeedsSampling`] → [`Error::Unsupported`] (detection-by-sampling
+///   deferred to post-slice-7: V2 BPC, V4 matrix-shaper perc/sat, rel-col, ink
+///   output, destination round-trip).
+fn resolve_black_point(bp: BlackPoint) -> Result<CIEXYZ> {
+    match bp {
+        BlackPoint::Resolved(xyz) => Ok(xyz),
+        BlackPoint::Zero => Ok(CIEXYZ {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        }),
+        BlackPoint::NeedsSampling => Err(Error::Unsupported(
+            "black-point detection-by-sampling not implemented (deferred to post-slice-7)",
+        )),
+    }
+}
+
 /// lcms2 `ComputeConversion` (`cmscnvrt.c:353-416`): compute the PCS-adaptation
 /// matrix `m` and offset `off` between profile `i-1` (the current PCS) and
 /// profile `i`.
 ///
-/// **Slice-5 T2 scope:** only the NON-absolute, NON-BPC path is implemented — `m`
-/// is the identity and `off` is zero. The absolute-colorimetric branch
-/// (`ComputeAbsoluteIntent`, T3) and the BPC branch
-/// (`ComputeBlackPointCompensation`, T5) are TODO hooks below. Regardless of the
-/// branch, the C unconditionally divides every offset component by
-/// `MAX_ENCODEABLE_XYZ` at the end (a no-op for the zero offset here, but the same
-/// code path); we replicate that.
+/// Implemented branches: the relative (identity) path, the absolute-colorimetric
+/// branch (`ComputeAbsoluteIntent`), and the black-point-compensation branch
+/// (`ComputeBlackPointCompensation`) for the cases where both black points resolve
+/// without sampling (V4-perceptual-black constant or `{0,0,0}`). BPC cells that
+/// need detection-by-sampling surface as [`Error::Unsupported`] via
+/// [`resolve_black_point`] (deferred to post-slice-7). Regardless of the branch,
+/// the C unconditionally divides every offset component by `MAX_ENCODEABLE_XYZ` at
+/// the end; we replicate that.
 pub fn compute_conversion(
     i: usize,
     profiles: &[&Profile],
@@ -285,13 +316,23 @@ pub fn compute_conversion(
             &chad_out,
         )?;
     } else if bpc {
-        // TODO(T5): black-point compensation → cmsDetectBlackPoint /
-        // cmsDetectDestinationBlackPoint + ComputeBlackPointCompensation
-        // (cmscnvrt.c:387-399, :169-200). Not yet implemented; T2 runs with BPC
-        // forced off.
-        return Err(Error::Unsupported(
-            "black-point-compensation conversion not implemented (T5)",
-        ));
+        // Black-point compensation (cmscnvrt.c:387-399). Detect both black points;
+        // if they differ, build the diagonal scaling + offset.
+        //
+        // cmsDetectBlackPoint / ...Destination... init their out-param to {0,0,0}
+        // and `return FALSE` (leaving it zero) for inadequate class/intent. We map
+        // that FALSE-with-zero to BlackPoint::Zero ⇒ CIEXYZ{0,0,0}. The
+        // detection-by-sampling paths are deferred (post-slice-7); they surface as
+        // BlackPoint::NeedsSampling ⇒ Error::Unsupported.
+        let bp_in = resolve_black_point(detect_black_point(profiles[i - 1], intent))?;
+        let bp_out = resolve_black_point(detect_destination_black_point(profiles[i], intent))?;
+
+        // If black points are equal, then do nothing (cmscnvrt.c:394-398).
+        if bp_in.x != bp_out.x || bp_in.y != bp_out.y || bp_in.z != bp_out.z {
+            let (bpc_m, bpc_off) = compute_black_point_compensation(&bp_in, &bp_out);
+            m = bpc_m;
+            off = bpc_off;
+        }
     }
 
     // Offset should be adjusted because of the encoding (cmscnvrt.c:402-413).
