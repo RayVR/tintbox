@@ -76,6 +76,7 @@ pub fn read_named_color2<R: ProfileReader>(r: &mut R, _size: u32) -> Result<Tag>
         prefix,
         suffix,
         colors,
+        colorant_count: n_device_coords as usize,
     }))
 }
 

@@ -535,6 +535,18 @@ impl Transform {
         self.gamut_check.as_ref()
     }
 
+    /// lcms2 `cmsGetNamedColorList` (cmsnamed.c:975): the named-color list of a
+    /// named-color transform. lcms2 returns it only when the *first* pipeline
+    /// stage is a `cmsSigNamedColorElemType`; we mirror that, returning `None`
+    /// for any non-named transform. (Slice9-named: the named-color transform
+    /// path.)
+    pub fn named_color_list(&self) -> Option<&crate::named::NamedColorList> {
+        match self.lut.stages().first() {
+            Some(crate::pipeline::Stage::NamedColor { list, .. }) => Some(list),
+            _ => None,
+        }
+    }
+
     /// lcms2 `FloatXFORM` (`cmsxform.c:258-322`): for each of `n_pixels`, read
     /// `in_channels` floats, `eval_float`, write `out_channels` floats. No
     /// pixel-format packing (slice 6). `input` is `n_pixels * in_channels` f32;

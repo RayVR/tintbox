@@ -7,8 +7,10 @@
 //! in a later task; the variant set is intentionally left open.
 
 use crate::color::{CIELab, CIEXYZ};
+use crate::compat::floor::{FloorStrategy, Lcms2Floor};
 use crate::curve::ToneCurve;
 use crate::pcs::{lab_to_xyz, xyz_to_lab};
+use crate::profile::tag::NamedColorList;
 
 use super::clut::Clut;
 
@@ -68,6 +70,15 @@ pub enum Stage {
     /// `cmsSigLabV4toV2` matrix form (`_cmsStageAllocLabV4ToV2`, cmslut.c:1043).
     /// 3 -> 3 diagonal scale by `65280/65535`.
     LabV4ToV2,
+
+    /// `cmsSigNamedColorElemType` (`_cmsStageAllocNamedColor`, cmsnamed.c:961):
+    /// a 1-input named-color lookup. The single input is a color INDEX (0..1.0
+    /// notation); the output is either the 3-channel PCS Lab triple
+    /// (`use_pcs == true`, `EvalNamedColorPCS`) or the `ColorantCount`-channel
+    /// device colorants (`use_pcs == false`, `EvalNamedColor`). The list carries
+    /// every spot color's PCS + device coordinates as raw u16, mapped to the
+    /// 0..1.0 float domain by `/ 65535.0` exactly as the C does.
+    NamedColor { list: NamedColorList, use_pcs: bool },
 }
 
 impl Stage {
@@ -79,6 +90,8 @@ impl Stage {
             Stage::Identity(n) => *n,
             Stage::Clut(c) => c.input_channels(),
             Stage::Lab2Xyz | Stage::Xyz2Lab | Stage::LabV2ToV4 | Stage::LabV4ToV2 => 3,
+            // `_cmsStageAllocNamedColor` allocates `1 -> ...` (cmsnamed.c:964).
+            Stage::NamedColor { .. } => 1,
         }
     }
 
@@ -90,6 +103,14 @@ impl Stage {
             Stage::Identity(n) => *n,
             Stage::Clut(c) => c.output_channels(),
             Stage::Lab2Xyz | Stage::Xyz2Lab | Stage::LabV2ToV4 | Stage::LabV4ToV2 => 3,
+            // `UsePCS ? 3 : ColorantCount` (cmsnamed.c:965).
+            Stage::NamedColor { list, use_pcs } => {
+                if *use_pcs {
+                    3
+                } else {
+                    list.colorant_count()
+                }
+            }
         }
     }
 
@@ -183,6 +204,42 @@ impl Stage {
                 for i in 0..3 {
                     let tmp: f64 = input[i] as f64 * V4_TO_V2;
                     output[i] = tmp as f32;
+                }
+            }
+
+            // `EvalNamedColorPCS` (cmsnamed.c:921) / `EvalNamedColor`
+            // (cmsnamed.c:940). The input is a color index in 0..1.0 notation;
+            // recover it as `_cmsQuickSaturateWord(In[0] * 65535.0)` (In[0] is
+            // f32, 65535.0 is f64, so the product widens to f64). An
+            // out-of-range index yields zeros (the C signals an error and zeroes
+            // the outputs); we mirror the zero-fill without signaling. Each
+            // stored u16 maps to the float domain by `value / 65535.0` (f64
+            // division cast to f32), exactly as the C.
+            Stage::NamedColor { list, use_pcs } => {
+                let index = Lcms2Floor::quick_saturate_word(input[0] as f64 * 65535.0);
+                if *use_pcs {
+                    if (index as usize) >= list.colors.len() {
+                        output[0] = 0.0;
+                        output[1] = 0.0;
+                        output[2] = 0.0;
+                    } else {
+                        let pcs = &list.colors[index as usize].pcs;
+                        output[0] = (pcs[0] as f64 / 65535.0) as f32;
+                        output[1] = (pcs[1] as f64 / 65535.0) as f32;
+                        output[2] = (pcs[2] as f64 / 65535.0) as f32;
+                    }
+                } else {
+                    let n = list.colorant_count();
+                    if (index as usize) >= list.colors.len() {
+                        for o in output.iter_mut().take(n) {
+                            *o = 0.0;
+                        }
+                    } else {
+                        let dev = &list.colors[index as usize].device;
+                        for (j, o) in output.iter_mut().take(n).enumerate() {
+                            *o = (dev[j] as f64 / 65535.0) as f32;
+                        }
+                    }
                 }
             }
         }

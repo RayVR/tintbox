@@ -507,6 +507,13 @@ pub fn default_icc_intents(
     // CurrentColorSpace = cmsGetColorSpace(hProfiles[0]) (cmscnvrt.c:535).
     let mut current_color_space = profiles[0].header().color_space;
     let mut color_space_out = ColorSpace::Lab; // initialized as in the C (:524).
+                                               // Whether the final leg is a single named-color profile producing DEVICE
+                                               // colorants. lcms2's bookkeeping `ColorSpaceOut` for that leg is the PCS
+                                               // (cmscnvrt.c:560), but `_cmsReadDevicelinkLUT` builds a UsePCS=FALSE named
+                                               // stage whose output is the device space — so the pipeline's true output
+                                               // width is the colorant count, not the PCS channel count. We skip the final
+                                               // width guard in that case (lcms2 has no such explicit guard).
+    let mut final_is_named_device = false;
 
     for i in 0..n_profiles {
         let profile = profiles[i];
@@ -540,6 +547,7 @@ pub fn default_icc_intents(
         // the LUT to be applied. Settings don't apply here (cmscnvrt.c:576). We
         // also route a single named-color profile through here (nProfiles == 1).
         let single_named = class_sig == ProfileClass::NamedColor && n_profiles == 1;
+        final_is_named_device = single_named;
 
         let lut = if l_is_device_link || single_named {
             let lut = read_devicelink_lut(profile, intent.to_raw())?;
@@ -590,11 +598,13 @@ pub fn default_icc_intents(
     // implicitly through cmsPipelineCat/BlessLUT as stages are appended; we assert
     // it explicitly to catch a mis-built chain early. (NONEGATIVES clipping,
     // cmscnvrt.c:626-640, is out of T2 scope.)
-    if let Some(n) = channels_of_color_space(color_space_out) {
-        if result.output_channels != n {
-            return Err(Error::Corrupt(
-                "final pipeline output width does not match output color space channels",
-            ));
+    if !final_is_named_device {
+        if let Some(n) = channels_of_color_space(color_space_out) {
+            if result.output_channels != n {
+                return Err(Error::Corrupt(
+                    "final pipeline output width does not match output color space channels",
+                ));
+            }
         }
     }
 
