@@ -219,6 +219,19 @@ impl Mlu {
         }
     }
 
+    /// A one-entry MLU carrying `text` under the given 2-byte language/country
+    /// codes, mirroring `cmsMLUsetWide(mlu, lang, country, text)` (the call lcms2's
+    /// virtual-profile `SetTextTags` uses with `"en"`/`"US"`).
+    pub fn from_wide(language: [u8; 2], country: [u8; 2], text: &str) -> Mlu {
+        Mlu {
+            entries: vec![MluEntry {
+                language,
+                country,
+                text: text.to_string(),
+            }],
+        }
+    }
+
     /// The entry lcms2 `_cmsMLUgetWide` selects for `(lang, country)`: an exact
     /// `language == lang` match (preferring an exact country too), else the first
     /// entry. `lang`/`country` are the raw 2-byte codes (`cmsNoLanguage` is

@@ -48,7 +48,8 @@ use crate::pipeline::clut::ClutTable;
 use crate::pipeline::{Pipeline, Stage};
 use crate::profile::header::{DateTime, Header};
 use crate::profile::tag::{
-    Cicp, ColorantTableEntry, Measurement, Mlu, ProfileSequenceItem, Tag, ViewingConditions,
+    Cicp, ColorantTableEntry, Measurement, Mlu, ProfileIdItem, ProfileSequenceItem, Tag,
+    ViewingConditions,
 };
 use crate::sig::Signature;
 
@@ -312,6 +313,7 @@ const SIG_LUT_BTOA_TYPE: Signature = Signature::from_raw(0x6D424120); // 'mBA '
 const SIG_CURVE_TYPE: Signature = Signature::from_raw(0x6375_7276); // 'curv'
 const SIG_PARAMETRIC_TYPE: Signature = Signature::from_raw(0x7061_7261); // 'para'
 const SIG_PSEQ_TYPE: Signature = Signature::from_raw(0x7073_6571); // 'pseq'
+const SIG_PSID_TYPE: Signature = Signature::from_raw(0x7073_6964); // 'psid'
 
 // Tag signatures (`cmsTagSignature`, include/lcms2.h) needed by the descriptor
 // table — only those whose default type or decider is non-obvious from the value.
@@ -389,6 +391,10 @@ fn write_type_for(sig: Signature, value: &Tag, version: f64) -> Result<Signature
         // ProfileSequenceDescType has a fixed type signature ('pseq'); the embedded
         // per-item descriptions select desc/mluc by version inside the writer.
         Tag::ProfileSequenceDesc(_) => Ok(SIG_PSEQ_TYPE),
+
+        // ProfileSequenceIdType has a fixed type signature ('psid'); the embedded
+        // per-item descriptions select desc/mluc by version inside the writer.
+        Tag::ProfileSequenceId(_) => Ok(SIG_PSID_TYPE),
 
         // LUT type selection is DecideLUTtypeA2B/B2A (version + pipeline shape, T3).
         Tag::Lut(_) => Ok(decide_lut(sig, version)),
@@ -538,6 +544,7 @@ fn write_tag_body<W: ProfileWriter>(
         Tag::Cicp(c) => write_cicp(w, c),
         Tag::Curve(c) => write_curve(w, ty, c),
         Tag::ProfileSequenceDesc(items) => write_pseq(w, items, version),
+        Tag::ProfileSequenceId(items) => write_psid(w, items, version),
         Tag::Lut(lut) => write_lut(w, ty, lut),
         _ => Err(Error::Unsupported("tag type writer not yet implemented")),
     }
@@ -914,6 +921,44 @@ fn write_embedded_description<W: ProfileWriter>(w: &mut W, mlu: &Mlu, version: f
         w.write_type_base(SIG_MLUC_TYPE)?;
         write_mlu(w, mlu)
     }
+}
+
+/// `Type_ProfileSequenceId_Write` (cmstypes.c:3739) via `WritePositionTable`
+/// (cmstypes.c:273) + `WriteSeqID` (cmstypes.c:3719): a u32 record count, then a
+/// per-item position directory of `(offset, size)` pairs (offsets are
+/// type-base-relative), then each item — a 16-byte raw profile ID followed by the
+/// item's `SaveDescription` (`desc` at v2, `mluc` at v4). No per-item alignment
+/// padding is applied (matching `WriteSeqID`), so the directory back-patch uses
+/// the exact element sizes.
+fn write_psid<W: ProfileWriter>(w: &mut W, items: &[ProfileIdItem], version: f64) -> Result<()> {
+    // BaseOffset = Tell - sizeof(_cmsTagBase): the 8-byte type base precedes us.
+    let base_offset = w.position() - 8;
+    let count = items.len();
+
+    w.write_u32(u32::try_from(count).map_err(|_| Error::Range)?)?;
+
+    // Placeholder position directory: (offset, size) per item.
+    let directory_pos = w.position();
+    for _ in 0..count {
+        w.write_u32(0)?;
+        w.write_u32(0)?;
+    }
+
+    let mut offsets = vec![0u32; count];
+    let mut sizes = vec![0u32; count];
+    for (i, item) in items.iter().enumerate() {
+        offsets[i] = u32::try_from(w.position() - base_offset).map_err(|_| Error::Range)?;
+        let before = w.position();
+        w.write_all(&item.profile_id)?;
+        write_embedded_description(w, &item.description, version)?;
+        sizes[i] = u32::try_from(w.position() - before).map_err(|_| Error::Range)?;
+    }
+
+    for i in 0..count {
+        w.patch_u32(directory_pos + i * 8, offsets[i])?;
+        w.patch_u32(directory_pos + i * 8 + 4, sizes[i])?;
+    }
+    Ok(())
 }
 
 // ---- T3: LUT / MPE tag-body writers (cmstypes.c) ----

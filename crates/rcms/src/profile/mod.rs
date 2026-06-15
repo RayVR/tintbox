@@ -8,6 +8,7 @@ pub mod header;
 pub mod serialize;
 pub mod tag;
 pub mod types;
+pub mod virtuals;
 
 pub use directory::TagEntry;
 pub use header::{ColorSpace, DateTime, Header, ProfileClass, RenderingIntent};

@@ -83,6 +83,7 @@ unsafe extern "C" {
         cap: u32,
     ) -> u32;
     fn rcms_oracle_save_mpe_tag(out: *mut u8, cap: u32) -> u32;
+    fn rcms_oracle_save_virtual_profile(which: i32, out: *mut u8, cap: u32) -> u32;
     fn rcms_oracle_tetra16(
         grid: *const u32,
         n_out: u32,
@@ -3018,6 +3019,29 @@ pub fn save_mpe_tag() -> Option<Vec<u8>> {
     let mut out = vec![0u8; needed as usize];
     // SAFETY: `out` has exactly `needed` bytes; C writes at most `cap`.
     let written = unsafe { rcms_oracle_save_mpe_tag(out.as_mut_ptr(), needed) };
+    if written == 0 {
+        return None;
+    }
+    out.truncate(written as usize);
+    Some(out)
+}
+
+/// lcms2 builds a virtual / built-in profile with the real `cmsCreate*Profile`
+/// constructor selected by `which` (see the `RCMS_T4_*` enum in `shim.c`),
+/// overrides only the nondeterministic header fields (CMM/creator/platform/date)
+/// to fixed values, and serializes the whole profile with `cmsSaveProfileToMem`.
+/// Returns the bytes, or `None` on failure. rcms's `build_*` constructs the same
+/// in-memory structure; the two byte streams must match byte-for-byte.
+pub fn save_virtual_profile(which: i32) -> Option<Vec<u8>> {
+    // SAFETY: out=NULL size query; C only reads `which` and returns the length.
+    let needed = unsafe { rcms_oracle_save_virtual_profile(which, core::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return None;
+    }
+    let mut out = vec![0u8; needed as usize];
+    // SAFETY: `out` has exactly `needed` bytes; C writes at most `cap` and bails
+    // if needed > cap, returning the count written.
+    let written = unsafe { rcms_oracle_save_virtual_profile(which, out.as_mut_ptr(), needed) };
     if written == 0 {
         return None;
     }

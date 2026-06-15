@@ -2297,3 +2297,98 @@ uint32_t rcms_oracle_save_basic_profile(int link, uint8_t* out, uint32_t cap) {
     cmsCloseProfile(h);
     return needed;
 }
+
+/* ---- Virtual / built-in profile serializer oracle (slice 7 T4) -----------
+   Build a virtual profile with the REAL cmsCreate*Profile constructor, then
+   override ONLY the nondeterministic header fields (CMM/creator/platform set by
+   cmsCreateProfilePlaceholder, plus the wall-clock creation date) to fixed
+   values so the byte stream is reproducible. The constructor-set fields
+   (version/class/space/PCS/intent) and the tag set are left exactly as
+   cmsCreate* produced them. rcms builds the identical WritableProfile; the
+   whole-profile bytes must match byte-for-byte. */
+enum {
+    RCMS_T4_SRGB = 0,   /* cmsCreate_sRGBProfile               */
+    RCMS_T4_GRAY,       /* cmsCreateGrayProfileTHR (D50, gamma 2.2) */
+    RCMS_T4_LAB2,       /* cmsCreateLab2Profile(NULL)          */
+    RCMS_T4_LAB4,       /* cmsCreateLab4Profile(NULL)          */
+    RCMS_T4_XYZ,        /* cmsCreateXYZProfile                 */
+    RCMS_T4_NULL,       /* cmsCreateNULLProfile                */
+    RCMS_T4_RGB,        /* cmsCreateRGBProfile (Rec709/D65, gamma 2.2) */
+    RCMS_T4_LIN         /* cmsCreateLinearizationDeviceLink (RGB, gamma 2.2) */
+};
+
+/* Overwrite the placeholder-seeded nondeterministic header fields with the same
+   fixed values rcms uses. Does NOT touch version/class/space/PCS/intent (those
+   are the constructor's contract). */
+static void rcms_oracle_fix_virtual_header(cmsHPROFILE h) {
+    _cmsICCPROFILE* Icc = (_cmsICCPROFILE*) h;
+    Icc->CMM      = 0;
+    Icc->creator  = 0;
+    Icc->platform = (cmsPlatformSignature) 0;
+    Icc->Created.tm_year = 2026 - 1900;
+    Icc->Created.tm_mon  = 6 - 1;
+    Icc->Created.tm_mday = 15;
+    Icc->Created.tm_hour = 12;
+    Icc->Created.tm_min  = 34;
+    Icc->Created.tm_sec  = 56;
+}
+
+uint32_t rcms_oracle_save_virtual_profile(int which, uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = NULL;
+
+    switch (which) {
+    case RCMS_T4_SRGB:
+        h = cmsCreate_sRGBProfile();
+        break;
+    case RCMS_T4_GRAY: {
+        cmsCIExyY d50 = *cmsD50_xyY();
+        cmsToneCurve* g = cmsBuildGamma(NULL, 2.2);
+        if (!g) return 0;
+        h = cmsCreateGrayProfileTHR(NULL, &d50, g);
+        cmsFreeToneCurve(g);
+        break;
+    }
+    case RCMS_T4_LAB2:
+        h = cmsCreateLab2Profile(NULL);
+        break;
+    case RCMS_T4_LAB4:
+        h = cmsCreateLab4Profile(NULL);
+        break;
+    case RCMS_T4_XYZ:
+        h = cmsCreateXYZProfile();
+        break;
+    case RCMS_T4_NULL:
+        h = cmsCreateNULLProfile();
+        break;
+    case RCMS_T4_RGB: {
+        cmsCIExyY       d65 = { 0.3127, 0.3290, 1.0 };
+        cmsCIExyYTRIPLE prim = {
+            {0.6400, 0.3300, 1.0},
+            {0.3000, 0.6000, 1.0},
+            {0.1500, 0.0600, 1.0}
+        };
+        cmsToneCurve* g = cmsBuildGamma(NULL, 2.2);
+        cmsToneCurve* gamma3[3];
+        if (!g) return 0;
+        gamma3[0] = gamma3[1] = gamma3[2] = g;
+        h = cmsCreateRGBProfile(&d65, &prim, gamma3);
+        cmsFreeToneCurve(g);
+        break;
+    }
+    case RCMS_T4_LIN: {
+        cmsToneCurve* g = cmsBuildGamma(NULL, 2.2);
+        cmsToneCurve* gamma3[3];
+        if (!g) return 0;
+        gamma3[0] = gamma3[1] = gamma3[2] = g;
+        h = cmsCreateLinearizationDeviceLink(cmsSigRgbData, gamma3);
+        cmsFreeToneCurve(g);
+        break;
+    }
+    default:
+        return 0;
+    }
+
+    if (!h) return 0;
+    rcms_oracle_fix_virtual_header(h);
+    return rcms_oracle_finish_save(h, out, cap);
+}
