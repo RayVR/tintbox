@@ -98,6 +98,18 @@ fn atan2deg(a: f64, b: f64) -> f64 {
     h
 }
 
+/// `cmsDeltaE` (cmspcs.c): Euclidean ΔE76 between two Lab colors. Transcribed
+/// verbatim as `pow(dL² + da² + db², 0.5)` (NOT `sqrt`): lcms2 uses `pow(.,0.5)`
+/// over the absolute-valued component differences, and the `pow`/`sqrt` results
+/// can differ in the last bit, so the gamut sampler's verdict depends on keeping
+/// the `pow` form.
+pub fn delta_e(lab1: CIELab, lab2: CIELab) -> f64 {
+    let dl = (lab1.l - lab2.l).abs();
+    let da = (lab1.a - lab2.a).abs();
+    let db = (lab1.b - lab2.b).abs();
+    (dl * dl + da * da + db * db).powf(0.5)
+}
+
 /// `cmsLab2LCh` (cmspcs.c:349-354).
 pub fn lab_to_lch(lab: CIELab) -> CIELCh {
     CIELCh {

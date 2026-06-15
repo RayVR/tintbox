@@ -2422,3 +2422,363 @@ int rcms_oracle_detect_destination_black_point(const uint8_t* bytes, uint32_t le
     cmsCloseProfile(h);
     return ok ? 1 : 0;
 }
+
+// ==== slice9-cgats ====
+/* CGATS / IT8.7 measurement-file parser + writer (cmscgats.c).
+   These expose lcms2's cmsIT8LoadFromMem + read accessors + cmsIT8SaveToMem so
+   the Rust side can diff parse results and the byte-exact serialized output.
+
+   Handle model: rcms_oracle_it8_load returns the cmsHANDLE as a uintptr_t (0 on
+   reject). The caller passes it back to the accessor functions and must call
+   rcms_oracle_it8_free exactly once. lcms2 owns all returned string pointers for
+   the lifetime of the handle; the Rust side copies them out immediately. */
+
+uintptr_t rcms_oracle_it8_load(const uint8_t* bytes, uint32_t len) {
+    cmsHANDLE h = cmsIT8LoadFromMem(NULL, (const void*) bytes, len);
+    return (uintptr_t) h;
+}
+
+void rcms_oracle_it8_free(uintptr_t h) {
+    if (h) cmsIT8Free((cmsHANDLE) h);
+}
+
+uint32_t rcms_oracle_it8_table_count(uintptr_t h) {
+    return cmsIT8TableCount((cmsHANDLE) h);
+}
+
+/* Select active table; returns the resulting table index or -1 on error. */
+int32_t rcms_oracle_it8_set_table(uintptr_t h, uint32_t n) {
+    return cmsIT8SetTable((cmsHANDLE) h, n);
+}
+
+const char* rcms_oracle_it8_sheet_type(uintptr_t h) {
+    return cmsIT8GetSheetType((cmsHANDLE) h);
+}
+
+/* Property string value, or NULL if absent. */
+const char* rcms_oracle_it8_get_property(uintptr_t h, const char* key) {
+    return cmsIT8GetProperty((cmsHANDLE) h, key);
+}
+
+double rcms_oracle_it8_get_property_dbl(uintptr_t h, const char* key) {
+    return cmsIT8GetPropertyDbl((cmsHANDLE) h, key);
+}
+
+/* Number of fields / sets for the active table (mirrors NUMBER_OF_FIELDS/SETS). */
+int32_t rcms_oracle_it8_num_samples(uintptr_t h) {
+    return cmsIT8EnumDataFormat((cmsHANDLE) h, NULL);
+}
+
+/* Enumerate property names of the active table. Returns count; writes up to
+   `cap` borrowed name pointers into out[]. */
+uint32_t rcms_oracle_it8_enum_properties(uintptr_t h, const char** out, uint32_t cap) {
+    char** props = NULL;
+    uint32_t n = cmsIT8EnumProperties((cmsHANDLE) h, &props);
+    uint32_t i;
+    for (i = 0; i < n && i < cap; i++) out[i] = props[i];
+    return n;
+}
+
+/* DATA_FORMAT label for column `col`, or NULL. */
+const char* rcms_oracle_it8_data_format(uintptr_t h, int32_t col) {
+    char** names = NULL;
+    int n = cmsIT8EnumDataFormat((cmsHANDLE) h, &names);
+    if (!names || col < 0 || col >= n) return NULL;
+    return names[col];
+}
+
+const char* rcms_oracle_it8_get_data_rowcol(uintptr_t h, int32_t row, int32_t col) {
+    return cmsIT8GetDataRowCol((cmsHANDLE) h, row, col);
+}
+
+double rcms_oracle_it8_get_data_rowcol_dbl(uintptr_t h, int32_t row, int32_t col) {
+    return cmsIT8GetDataRowColDbl((cmsHANDLE) h, row, col);
+}
+
+const char* rcms_oracle_it8_get_data(uintptr_t h, const char* patch, const char* sample) {
+    return cmsIT8GetData((cmsHANDLE) h, patch, sample);
+}
+
+double rcms_oracle_it8_get_data_dbl(uintptr_t h, const char* patch, const char* sample) {
+    return cmsIT8GetDataDbl((cmsHANDLE) h, patch, sample);
+}
+
+/* cmsIT8GetPatchName for the active table; returns borrowed pointer or NULL. */
+const char* rcms_oracle_it8_patch_name(uintptr_t h, int32_t patch) {
+    return cmsIT8GetPatchName((cmsHANDLE) h, patch, NULL);
+}
+
+/* cmsIT8SaveToMem round-trip. Writes the serialized text (incl. trailing NUL)
+   into `out` (capacity `cap`) and returns the byte count lcms2 reports
+   (BytesNeeded, including the NUL). If `out` is NULL or too small, returns the
+   needed size without writing (so the caller can size its buffer). Returns 0 on
+   failure. */
+uint32_t rcms_oracle_it8_save(uintptr_t h, uint8_t* out, uint32_t cap) {
+    cmsUInt32Number needed = 0;
+    if (!cmsIT8SaveToMem((cmsHANDLE) h, NULL, &needed)) return 0;
+    if (out == NULL || cap < needed) return needed;
+    needed = cap;
+    if (!cmsIT8SaveToMem((cmsHANDLE) h, out, &needed)) return 0;
+    return needed;
+}
+
+// ==== slice9-cam02 ====
+/* CIECAM02 appearance model (cmscam02.c). The model handle is opaque; the Rust
+   side never dereferences it. Init takes the viewing conditions as 7 doubles
+   (whitepoint X,Y,Z, Yb, La, D_value) plus the surround as a u32; Forward maps
+   XYZ[3] -> JCh[3]; Reverse maps JCh[3] -> XYZ[3]; Done frees the handle. */
+
+void* rcms_oracle_cam02_init(double wp_x, double wp_y, double wp_z,
+                             double yb, double la, unsigned int surround,
+                             double d_value) {
+    cmsViewingConditions vc;
+    vc.whitePoint.X = wp_x;
+    vc.whitePoint.Y = wp_y;
+    vc.whitePoint.Z = wp_z;
+    vc.Yb = yb;
+    vc.La = la;
+    vc.surround = surround;
+    vc.D_value = d_value;
+    return (void*) cmsCIECAM02Init(NULL, &vc);
+}
+
+void rcms_oracle_cam02_forward(void* h, const double* xyz /* [3] */,
+                               double* jch /* [3] */) {
+    cmsCIEXYZ in;
+    cmsJCh out;
+    in.X = xyz[0]; in.Y = xyz[1]; in.Z = xyz[2];
+    cmsCIECAM02Forward((cmsHANDLE) h, &in, &out);
+    jch[0] = out.J; jch[1] = out.C; jch[2] = out.h;
+}
+
+void rcms_oracle_cam02_reverse(void* h, const double* jch /* [3] */,
+                               double* xyz /* [3] */) {
+    cmsJCh in;
+    cmsCIEXYZ out;
+    in.J = jch[0]; in.C = jch[1]; in.h = jch[2];
+    cmsCIECAM02Reverse((cmsHANDLE) h, &in, &out);
+    xyz[0] = out.X; xyz[1] = out.Y; xyz[2] = out.Z;
+}
+
+void rcms_oracle_cam02_done(void* h) {
+    cmsCIECAM02Done((cmsHANDLE) h);
+}
+
+/* ==== slice9-ps ==== */
+/* PostScript Color Space Array (CSA) and Color Rendering Dictionary (CRD)
+   generation (cmsps2.c). Open a profile from raw bytes, run
+   cmsGetPostScriptCSA / cmsGetPostScriptCRD with the given intent + flags, and
+   write the emitted PostScript bytes into `out`. Follows the two-call pattern:
+   pass out == NULL to obtain the required byte count, then a sufficiently large
+   buffer to receive the bytes. Returns the byte count (0 on any failure: profile
+   open, unsupported profile/intent, or insufficient capacity). */
+uint32_t rcms_oracle_get_postscript_csa(const uint8_t* bytes, uint32_t len,
+                                        uint32_t intent, uint32_t flags,
+                                        uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = cmsOpenProfileFromMem((const void*) bytes, len);
+    if (!h) return 0;
+    cmsUInt32Number needed = cmsGetPostScriptCSA(NULL, h, intent, flags, NULL, 0);
+    if (out == NULL) { cmsCloseProfile(h); return needed; }
+    if (needed == 0 || needed > cap) { cmsCloseProfile(h); return 0; }
+    cmsUInt32Number got = cmsGetPostScriptCSA(NULL, h, intent, flags, out, cap);
+    cmsCloseProfile(h);
+    return got;
+}
+
+uint32_t rcms_oracle_get_postscript_crd(const uint8_t* bytes, uint32_t len,
+                                        uint32_t intent, uint32_t flags,
+                                        uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = cmsOpenProfileFromMem((const void*) bytes, len);
+    if (!h) return 0;
+    cmsUInt32Number needed = cmsGetPostScriptCRD(NULL, h, intent, flags, NULL, 0);
+    if (out == NULL) { cmsCloseProfile(h); return needed; }
+    if (needed == 0 || needed > cap) { cmsCloseProfile(h); return 0; }
+    cmsUInt32Number got = cmsGetPostScriptCRD(NULL, h, intent, flags, out, cap);
+    cmsCloseProfile(h);
+    return got;
+}
+
+/* ==== slice9-named ====
+   Named-color transform (cmsnamed.c / cmsxform.c). Open a named-color profile
+   from `named_bytes` and, when `second_len > 0`, a second profile from
+   `second_bytes`. Build a transform whose INPUT format is
+   TYPE_NAMED_COLOR_INDEX (CHANNELS_SH(1)|BYTES_SH(2): one u16 color index per
+   pixel) and whose OUTPUT format is a generic `out_chans`-channel u16
+   (COLORSPACE_SH(PT_ANY)|CHANNELS_SH(out_chans)|BYTES_SH(2)). Forces
+   cmsFLAGS_NOOPTIMIZE so the unoptimized device link (with the
+   cmsSigNamedColorElemType stage + LabV2ToV4) runs as the differential
+   reference. Runs cmsDoTransform over the `n_pixels` indices, writing
+   n_pixels*out_chans u16 into `out_vals`. With one profile the output is the
+   named profile's device colorants (EvalNamedColor); with a second Lab profile
+   the output is the PCS Lab triple (EvalNamedColorPCS then the PCS chain).
+   Returns 1 on success, 0 if a profile fails to open or the transform cannot be
+   created. */
+int rcms_oracle_named_transform_16(const uint8_t* named_bytes, uint32_t named_len,
+                                   const uint8_t* second_bytes, uint32_t second_len,
+                                   uint32_t intent, const uint16_t* in_indices,
+                                   uint32_t n_pixels, uint16_t* out_vals,
+                                   uint32_t out_chans) {
+    cmsHPROFILE pn = cmsOpenProfileFromMem((const void*) named_bytes, named_len);
+    if (!pn) return 0;
+
+    uint32_t out_fmt = COLORSPACE_SH(PT_ANY) | CHANNELS_SH(out_chans) | BYTES_SH(2);
+    cmsHTRANSFORM xform = NULL;
+
+    if (second_len > 0) {
+        cmsHPROFILE ps = cmsOpenProfileFromMem((const void*) second_bytes, second_len);
+        if (!ps) { cmsCloseProfile(pn); return 0; }
+        cmsHPROFILE profiles[2] = { pn, ps };
+        cmsBool         bpcArr[2]  = { FALSE, FALSE };
+        cmsUInt32Number intArr[2]  = { intent, intent };
+        cmsFloat64Number adArr[2]  = { 1.0, 1.0 };
+        xform = cmsCreateExtendedTransform(
+            NULL, 2, profiles, bpcArr, intArr, adArr,
+            NULL, 0, TYPE_NAMED_COLOR_INDEX, out_fmt, cmsFLAGS_NOOPTIMIZE);
+        if (xform) cmsDoTransform(xform, in_indices, out_vals, n_pixels);
+        cmsCloseProfile(ps);
+    } else {
+        cmsHPROFILE profiles[1] = { pn };
+        cmsBool         bpcArr[1]  = { FALSE };
+        cmsUInt32Number intArr[1]  = { intent };
+        cmsFloat64Number adArr[1]  = { 1.0 };
+        xform = cmsCreateExtendedTransform(
+            NULL, 1, profiles, bpcArr, intArr, adArr,
+            NULL, 0, TYPE_NAMED_COLOR_INDEX, out_fmt, cmsFLAGS_NOOPTIMIZE);
+        if (xform) cmsDoTransform(xform, in_indices, out_vals, n_pixels);
+    }
+
+    int ok = xform != NULL ? 1 : 0;
+    if (xform) cmsDeleteTransform(xform);
+    cmsCloseProfile(pn);
+    return ok;
+}
+/* ==== end slice9-named ==== */
+
+// ==== slice9-gamut ====
+// Total area coverage, proofing transform (with/without gamut check), and the
+// gamut boundary descriptor check-point — references for the rcms `crate::gamut`
+// port. Each opens profiles from memory, drives the lcms2 primitive, and frees.
+
+double rcms_oracle_detect_tac(const uint8_t* bytes, uint32_t len) {
+    cmsHPROFILE h = cmsOpenProfileFromMem((const void*) bytes, len);
+    if (!h) return 0.0;
+    double tac = cmsDetectTAC(h);
+    cmsCloseProfile(h);
+    return tac;
+}
+
+// Proofing transform over packed byte buffers. `gamutcheck`/`softproofing`/`bpc`
+// select the dwFlags; `nIntent`/`proofIntent` the two intents. Always adds
+// cmsFLAGS_NOOPTIMIZE so the differential isolates the proofing/gamut-check math.
+int rcms_oracle_proofing_transform_packed(
+        const uint8_t* inBytes, uint32_t inLen,
+        const uint8_t* outBytes, uint32_t outLen,
+        const uint8_t* proofBytes, uint32_t proofLen,
+        uint32_t nIntent, uint32_t proofIntent,
+        int gamutcheck, int softproofing, int bpc,
+        uint32_t inFmt, uint32_t outFmt,
+        const uint8_t* inBuf, uint8_t* outBuf, uint32_t nPixels) {
+
+    // The alarm codes are a per-context global; reset to the lcms2 default so this
+    // call is deterministic regardless of any prior `...alarm` call (tests run in
+    // parallel threads sharing the NULL context).
+    cmsUInt16Number defAlarm[cmsMAXCHANNELS] = { 0x7F00, 0x7F00, 0x7F00 };
+    cmsSetAlarmCodes(defAlarm);
+
+    cmsHPROFILE hin = cmsOpenProfileFromMem((const void*) inBytes, inLen);
+    cmsHPROFILE hout = cmsOpenProfileFromMem((const void*) outBytes, outLen);
+    cmsHPROFILE hproof = cmsOpenProfileFromMem((const void*) proofBytes, proofLen);
+    int ok = (hin && hout && hproof) ? 1 : 0;
+
+    cmsUInt32Number flags = cmsFLAGS_NOOPTIMIZE;
+    if (gamutcheck) flags |= cmsFLAGS_GAMUTCHECK;
+    if (softproofing) flags |= cmsFLAGS_SOFTPROOFING;
+    if (bpc) flags |= cmsFLAGS_BLACKPOINTCOMPENSATION;
+
+    cmsHTRANSFORM xform = NULL;
+    if (ok) {
+        xform = cmsCreateProofingTransformTHR(
+            NULL, hin, inFmt, hout, outFmt, hproof,
+            nIntent, proofIntent, flags);
+    }
+    if (xform) {
+        cmsDoTransform(xform, inBuf, outBuf, nPixels);
+        cmsDeleteTransform(xform);
+    } else {
+        ok = 0;
+    }
+    if (hin) cmsCloseProfile(hin);
+    if (hout) cmsCloseProfile(hout);
+    if (hproof) cmsCloseProfile(hproof);
+    return ok;
+}
+
+// Set the (default-overriding) alarm codes before building a proofing transform,
+// so the gamut-check alarm path is exercised with known codes. The alarm codes
+// are a per-context global in lcms2; we set them on the NULL context here.
+int rcms_oracle_proofing_transform_packed_alarm(
+        const uint8_t* inBytes, uint32_t inLen,
+        const uint8_t* outBytes, uint32_t outLen,
+        const uint8_t* proofBytes, uint32_t proofLen,
+        uint32_t nIntent, uint32_t proofIntent,
+        int gamutcheck, int softproofing, int bpc,
+        const uint16_t* alarm /* [16] */,
+        uint32_t inFmt, uint32_t outFmt,
+        const uint8_t* inBuf, uint8_t* outBuf, uint32_t nPixels) {
+
+    cmsUInt16Number codes[cmsMAXCHANNELS];
+    for (int i = 0; i < cmsMAXCHANNELS; i++) codes[i] = alarm[i];
+    cmsSetAlarmCodes(codes);
+
+    cmsHPROFILE hin = cmsOpenProfileFromMem((const void*) inBytes, inLen);
+    cmsHPROFILE hout = cmsOpenProfileFromMem((const void*) outBytes, outLen);
+    cmsHPROFILE hproof = cmsOpenProfileFromMem((const void*) proofBytes, proofLen);
+    int ok = (hin && hout && hproof) ? 1 : 0;
+
+    cmsUInt32Number flags = cmsFLAGS_NOOPTIMIZE;
+    if (gamutcheck) flags |= cmsFLAGS_GAMUTCHECK;
+    if (softproofing) flags |= cmsFLAGS_SOFTPROOFING;
+    if (bpc) flags |= cmsFLAGS_BLACKPOINTCOMPENSATION;
+
+    cmsHTRANSFORM xform = NULL;
+    if (ok) {
+        xform = cmsCreateProofingTransformTHR(
+            NULL, hin, inFmt, hout, outFmt, hproof,
+            nIntent, proofIntent, flags);
+    }
+    if (xform) {
+        cmsDoTransform(xform, inBuf, outBuf, nPixels);
+        cmsDeleteTransform(xform);
+    } else {
+        ok = 0;
+    }
+    if (hin) cmsCloseProfile(hin);
+    if (hout) cmsCloseProfile(hout);
+    if (hproof) cmsCloseProfile(hproof);
+
+    // Restore the lcms2 default alarm codes for subsequent calls.
+    cmsUInt16Number def[cmsMAXCHANNELS] = { 0x7F00, 0x7F00, 0x7F00 };
+    cmsSetAlarmCodes(def);
+    return ok;
+}
+
+// Gamut boundary descriptor round-trip: add `nAdd` Lab points, compute, then
+// check `nCheck` Lab points, writing the boolean verdicts into `verdicts`.
+// `addLab`/`checkLab` are flat [L,a,b] triples.
+int rcms_oracle_gbd_check(const double* addLab, uint32_t nAdd,
+                          const double* checkLab, uint32_t nCheck,
+                          int32_t* verdicts /* [nCheck] */) {
+    cmsHANDLE gbd = cmsGBDAlloc(NULL);
+    if (!gbd) return 0;
+    for (uint32_t i = 0; i < nAdd; i++) {
+        cmsCIELab lab = { addLab[i*3+0], addLab[i*3+1], addLab[i*3+2] };
+        cmsGDBAddPoint(gbd, &lab);
+    }
+    cmsGDBCompute(gbd, 0);
+    for (uint32_t i = 0; i < nCheck; i++) {
+        cmsCIELab lab = { checkLab[i*3+0], checkLab[i*3+1], checkLab[i*3+2] };
+        verdicts[i] = cmsGDBCheckPoint(gbd, &lab) ? 1 : 0;
+    }
+    cmsGBDFree(gbd);
+    return 1;
+}

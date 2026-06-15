@@ -63,6 +63,17 @@ impl Flags {
     /// `cmsFLAGS_NOOPTIMIZE` (`0x0100`). Skip pipeline optimization.
     pub const NOOPTIMIZE: Flags = Flags { bits: 0x0100 };
 
+    /// `cmsFLAGS_GAMUTCHECK` (`0x1000`, lcms2.h:1751). Mark out-of-gamut colors in
+    /// the proofing transform with the alarm color.
+    pub const GAMUTCHECK: Flags = Flags { bits: 0x1000 };
+
+    /// `cmsFLAGS_SOFTPROOFING` (`0x4000`, lcms2.h:1754). Use the proofing profile
+    /// as the destination preview (the proofing 4-profile chain).
+    pub const SOFTPROOFING: Flags = Flags { bits: 0x4000 };
+
+    /// `cmsFLAGS_BLACKPOINTCOMPENSATION` (`0x2000`, lcms2.h:1752).
+    pub const BLACKPOINTCOMPENSATION: Flags = Flags { bits: 0x2000 };
+
     /// `cmsFLAGS_COPY_ALPHA` (`0x0400_0000`, lcms2.h:1773). Copy the extra
     /// (alpha) channels straight from input to output on `cmsDoTransform`,
     /// depth-converting but NOT color-transforming them.
@@ -129,9 +140,12 @@ pub struct Transform {
     entry_white_point: CIEXYZ,
     exit_white_point: CIEXYZ,
     rendering_intent: RenderingIntent,
-    // Gamut-check pipeline (lcms2 `GamutCheck`). Hook only for now — slice 5 does
-    // not build it, so it stays `None`.
+    // Gamut-check pipeline (lcms2 `GamutCheck`). Built by the proofing constructor
+    // ([`Transform::new_proofing`]); `None` otherwise.
     gamut_check: Option<Pipeline>,
+    // Alarm colors substituted for out-of-gamut pixels (lcms2 per-context
+    // `AlarmCodes`, default `{0x7F00, 0x7F00, 0x7F00, 0, ...}`).
+    alarm_codes: [u16; MAX_CHANNELS],
     // Packing layer (None for the flat-buffer constructors that bypass formatters).
     formatters: Option<Formatters>,
     // The pipeline-optimization strategy (swappable; default Accurate).
@@ -154,6 +168,16 @@ fn normalize_xyz(mut wp: CIEXYZ) -> CIEXYZ {
 }
 
 const SIG_MEDIA_WHITE_POINT: crate::sig::Signature = crate::sig::Signature::from_raw(0x7774_7074);
+
+/// `DEFAULT_ALARM_CODES_VALUE` (`cmsxform.c:87`): the alarm color used for
+/// out-of-gamut pixels by the gamut-check path.
+const DEFAULT_ALARM_CODES: [u16; MAX_CHANNELS] = {
+    let mut a = [0u16; MAX_CHANNELS];
+    a[0] = 0x7F00;
+    a[1] = 0x7F00;
+    a[2] = 0x7F00;
+    a
+};
 
 /// lcms2 `SetWhitePoint` (`cmsxform.c:1103-1119`) applied to
 /// `cmsReadTag(MediaWhitePoint)`. Note this is NOT `_cmsReadMediaWhitePoint`: it
@@ -316,6 +340,7 @@ impl Transform {
             // cmsxform.c:1218: RenderingIntent = Intents[nProfiles-1].
             rendering_intent: last_intent,
             gamut_check: None,
+            alarm_codes: DEFAULT_ALARM_CODES,
             formatters: None,
             strategy: OptimizationStrategy::Accurate,
             opt_eval: OptimizedEval::Pipeline,
@@ -535,6 +560,18 @@ impl Transform {
         self.gamut_check.as_ref()
     }
 
+    /// lcms2 `cmsGetNamedColorList` (cmsnamed.c:975): the named-color list of a
+    /// named-color transform. lcms2 returns it only when the *first* pipeline
+    /// stage is a `cmsSigNamedColorElemType`; we mirror that, returning `None`
+    /// for any non-named transform. (Slice9-named: the named-color transform
+    /// path.)
+    pub fn named_color_list(&self) -> Option<&crate::named::NamedColorList> {
+        match self.lut.stages().first() {
+            Some(crate::pipeline::Stage::NamedColor { list, .. }) => Some(list),
+            _ => None,
+        }
+    }
+
     /// lcms2 `FloatXFORM` (`cmsxform.c:258-322`): for each of `n_pixels`, read
     /// `in_channels` floats, `eval_float`, write `out_channels` floats. No
     /// pixel-format packing (slice 6). `input` is `n_pixels * in_channels` f32;
@@ -551,6 +588,20 @@ impl Transform {
 
         for i in 0..n_pixels {
             let pix = &input[i * in_ch..i * in_ch + in_ch];
+            // Gamut check (lcms2 `FloatXFORM`, cmsxform.c:288-312): all channels get
+            // the float-scaled alarm color when the marker is `> 0.0`.
+            if let Some(gamut) = &self.gamut_check {
+                let g_in = gamut.input_channels;
+                let mut padded = [0f32; MAX_CHANNELS];
+                padded[..in_ch].copy_from_slice(pix);
+                let out_of_gamut = gamut.eval_float(&padded[..g_in])[0];
+                if out_of_gamut > 0.0 {
+                    for c in 0..out_ch {
+                        output[i * out_ch + c] = self.alarm_codes[c] as f32 / 65535.0_f32;
+                    }
+                    continue;
+                }
+            }
             let res = self.lut.eval_float(pix);
             output[i * out_ch..i * out_ch + out_ch].copy_from_slice(&res);
         }
@@ -572,6 +623,19 @@ impl Transform {
 
         for i in 0..n_pixels {
             let pix = &input[i * in_ch..i * in_ch + in_ch];
+            // Gamut check (lcms2 `TransformOnePixelWithGamutCheck`,
+            // cmsxform.c:443-462): marker `>= 1` ⇒ emit the alarm color.
+            if let Some(gamut) = &self.gamut_check {
+                let g_in = gamut.input_channels;
+                let mut padded = [0u16; MAX_CHANNELS];
+                padded[..in_ch].copy_from_slice(pix);
+                let marker = gamut.eval_16(&padded[..g_in])[0];
+                if marker >= 1 {
+                    output[i * out_ch..i * out_ch + out_ch]
+                        .copy_from_slice(&self.alarm_codes[..out_ch]);
+                    continue;
+                }
+            }
             let res = self.lut.eval_16(pix);
             output[i * out_ch..i * out_ch + out_ch].copy_from_slice(&res);
         }
@@ -620,10 +684,26 @@ impl Transform {
                 let in_pixel = &input[i * in_stride..i * in_stride + in_stride];
                 let acc = in_pixel;
                 from_input(acc, &mut fin);
-                // Abstract eval (no inlined optimization — see module docs).
-                let res = self.lut.eval_float(&fin[..in_ch]);
                 let mut fout = [0f32; MAX_CHANNELS];
-                fout[..out_ch].copy_from_slice(&res);
+                // lcms2 `FloatXFORM` gamut check (cmsxform.c:288-312): evaluate the
+                // gamut marker; if `> 0.0`, fill ALL channels with the alarm color
+                // scaled to float, else run the LUT normally.
+                if let Some(gamut) = &self.gamut_check {
+                    let g_in = gamut.input_channels;
+                    let out_of_gamut = gamut.eval_float(&fin[..g_in])[0];
+                    if out_of_gamut > 0.0 {
+                        for (slot, &code) in fout.iter_mut().zip(self.alarm_codes.iter()) {
+                            *slot = code as f32 / 65535.0_f32;
+                        }
+                    } else {
+                        let res = self.lut.eval_float(&fin[..in_ch]);
+                        fout[..out_ch].copy_from_slice(&res);
+                    }
+                } else {
+                    // Abstract eval (no inlined optimization — see module docs).
+                    let res = self.lut.eval_float(&fin[..in_ch]);
+                    fout[..out_ch].copy_from_slice(&res);
+                }
                 {
                     let out = &mut output[i * out_stride..i * out_stride + out_stride];
                     to_output(&fout, out);
@@ -644,27 +724,42 @@ impl Transform {
                 let in_pixel = &input[i * in_stride..i * in_stride + in_stride];
                 from_input(in_pixel, &mut win);
                 let mut wout = [0u16; MAX_CHANNELS];
-                match &self.opt_eval {
-                    // lcms2 `MatShaperEval16`: the 1.14-fixed RGB matrix-shaper
-                    // evaluator (Lcms2Compat). Replaces the float pipeline eval.
-                    OptimizedEval::MatShaper(data) => {
-                        let res = data.eval(&[win[0], win[1], win[2]]);
-                        wout[..3].copy_from_slice(&res);
-                    }
-                    // lcms2 `FastEvaluateCurves8/16` / `FastIdentity16`
-                    // (OptimizeByJoiningCurves).
-                    OptimizedEval::Curves(c) => {
-                        c.eval(&win[..in_ch], &mut wout[..out_ch]);
-                    }
-                    // lcms2 `PrelinEval16` / `PrelinEval8` (the baked CLUT from
-                    // OptimizeByComputingLinearization / OptimizeByResampling).
-                    OptimizedEval::Baked(b) => {
-                        b.eval(&win[..in_ch], &mut wout[..out_ch]);
-                    }
-                    // The accurate in-place pipeline eval.
-                    OptimizedEval::Pipeline => {
+                // lcms2 `TransformOnePixelWithGamutCheck` (cmsxform.c:443-462): if a
+                // gamut-check pipeline is present, evaluate it on the (zero-extended)
+                // input pixel; if the marker is `>= 1`, emit the alarm color instead
+                // of running the LUT.
+                if let Some(gamut) = &self.gamut_check {
+                    let g_in = gamut.input_channels;
+                    let marker = gamut.eval_16(&win[..g_in])[0];
+                    if marker >= 1 {
+                        wout[..out_ch].copy_from_slice(&self.alarm_codes[..out_ch]);
+                    } else {
                         let res = self.lut.eval_16(&win[..in_ch]);
                         wout[..out_ch].copy_from_slice(&res);
+                    }
+                } else {
+                    match &self.opt_eval {
+                        // lcms2 `MatShaperEval16`: the 1.14-fixed RGB matrix-shaper
+                        // evaluator (Lcms2Compat). Replaces the float pipeline eval.
+                        OptimizedEval::MatShaper(data) => {
+                            let res = data.eval(&[win[0], win[1], win[2]]);
+                            wout[..3].copy_from_slice(&res);
+                        }
+                        // lcms2 `FastEvaluateCurves8/16` / `FastIdentity16`
+                        // (OptimizeByJoiningCurves).
+                        OptimizedEval::Curves(c) => {
+                            c.eval(&win[..in_ch], &mut wout[..out_ch]);
+                        }
+                        // lcms2 `PrelinEval16` / `PrelinEval8` (the baked CLUT from
+                        // OptimizeByComputingLinearization / OptimizeByResampling).
+                        OptimizedEval::Baked(b) => {
+                            b.eval(&win[..in_ch], &mut wout[..out_ch]);
+                        }
+                        // The accurate in-place pipeline eval.
+                        OptimizedEval::Pipeline => {
+                            let res = self.lut.eval_16(&win[..in_ch]);
+                            wout[..out_ch].copy_from_slice(&res);
+                        }
                     }
                 }
                 {
@@ -680,5 +775,134 @@ impl Transform {
                 }
             }
         }
+    }
+}
+
+// ============================================================================
+// Proofing transform (lcms2 `cmsCreateProofingTransform`) + gamut-check wiring.
+// Appended block (slice9-gamut): self-contained new constructors so the proofing
+// path merges cleanly with the parallel named-color work on this file.
+// ============================================================================
+
+impl Transform {
+    /// The transform's alarm colors (lcms2 `cmsGetAlarmCodes`).
+    pub fn alarm_codes(&self) -> &[u16; MAX_CHANNELS] {
+        &self.alarm_codes
+    }
+
+    /// Set the alarm colors substituted for out-of-gamut pixels (lcms2
+    /// `cmsSetAlarmCodes`). Only meaningful for a proofing transform built with
+    /// `cmsFLAGS_GAMUTCHECK`.
+    pub fn set_alarm_codes(&mut self, codes: [u16; MAX_CHANNELS]) {
+        self.alarm_codes = codes;
+    }
+
+    /// lcms2 `cmsCreateExtendedTransform` extended with a gamut-check profile +
+    /// position (the general entry point the proofing constructor routes through).
+    /// Builds the device-link as [`Transform::new_with_formats`] does, then — when
+    /// `flags` carries `cmsFLAGS_GAMUTCHECK` and `gamut_profile` is `Some` — builds
+    /// the gamut-check pipeline ([`crate::gamut::create_gamut_check_pipeline`]) from
+    /// the ORIGINAL (un-BPC-mutated) `bpc`/`intents`/`adaptation` arrays, exactly as
+    /// `cmsCreateExtendedTransform` passes them to `_cmsCreateGamutCheckPipeline`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_extended_with_formats(
+        profiles: &[&Profile],
+        intents: &[RenderingIntent],
+        bpc: &[bool],
+        adaptation: &[f64],
+        gamut_profile: Option<&Profile>,
+        n_gamut_pcs_position: usize,
+        flags: Flags,
+        in_fmt: u32,
+        out_fmt: u32,
+    ) -> Result<Transform> {
+        // If gamut check is requested but no gamut profile, drop the flag
+        // (cmsxform.c:1154-1156).
+        let do_gamut = flags.contains(Flags::GAMUTCHECK) && gamut_profile.is_some();
+
+        // Validate the gamut PCS position (cmsxform.c:1158-1161).
+        let n = profiles.len();
+        if do_gamut && (n_gamut_pcs_position == 0 || n_gamut_pcs_position >= n - 1) {
+            return Err(Error::Range);
+        }
+
+        let mut xform = Transform::new_with_formats(
+            profiles, intents, bpc, adaptation, flags, in_fmt, out_fmt,
+        )?;
+
+        if do_gamut {
+            let gamut = gamut_profile.unwrap();
+            xform.gamut_check = crate::gamut::create_gamut_check_pipeline(
+                profiles,
+                bpc,
+                intents,
+                adaptation,
+                n_gamut_pcs_position,
+                gamut,
+            )?;
+        }
+
+        Ok(xform)
+    }
+
+    /// lcms2 `cmsCreateProofingTransform` (`cmsxform.c:1365-1394`). Builds the
+    /// device → proof → proof → device chain with intents
+    /// `[nIntent, nIntent, REL_COL, proofing_intent]`, BPC `[doBPC, doBPC, 0, 0]`
+    /// (doBPC from `cmsFLAGS_BLACKPOINTCOMPENSATION`), adaptation all −1 (default
+    /// state), and the proofing profile as the gamut profile at position 1.
+    ///
+    /// When neither `cmsFLAGS_SOFTPROOFING` nor `cmsFLAGS_GAMUTCHECK` is set, this
+    /// degrades to a plain `input → output` transform (cmsxform.c:1388-1389).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_proofing(
+        input: &Profile,
+        in_fmt: u32,
+        output: &Profile,
+        out_fmt: u32,
+        proofing: &Profile,
+        n_intent: RenderingIntent,
+        proofing_intent: RenderingIntent,
+        flags: Flags,
+    ) -> Result<Transform> {
+        let do_bpc = flags.contains(Flags::BLACKPOINTCOMPENSATION);
+
+        // Not soft-proofing nor gamut-check: plain input→output (cmsxform.c:1388).
+        if !(flags.contains(Flags::SOFTPROOFING) || flags.contains(Flags::GAMUTCHECK)) {
+            return Transform::new_with_formats(
+                &[input, output],
+                &[n_intent, n_intent],
+                &[do_bpc, do_bpc],
+                // cmsCreateMultiprofileTransform default adaptation 1.0.
+                &[1.0, 1.0],
+                flags,
+                in_fmt,
+                out_fmt,
+            );
+        }
+
+        // The proofing chain (cmsxform.c:1382-1386).
+        let profiles = [input, proofing, proofing, output];
+        let intents = [
+            n_intent,
+            n_intent,
+            RenderingIntent::RelativeColorimetric,
+            proofing_intent,
+        ];
+        let bpc = [do_bpc, do_bpc, false, false];
+        // cmsSetAdaptationStateTHR(ContextID, -1) returns the global default
+        // adaptation state, which is 1.0 in stock lcms2 (matches the rest of rcms).
+        let adaptation = [1.0, 1.0, 1.0, 1.0];
+
+        Transform::new_extended_with_formats(
+            &profiles,
+            &intents,
+            &bpc,
+            &adaptation,
+            Some(proofing),
+            1,
+            flags,
+            in_fmt,
+            out_fmt,
+        )
     }
 }

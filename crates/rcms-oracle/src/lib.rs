@@ -525,6 +525,57 @@ unsafe extern "C" {
         flags: u32,
         out: *mut f64,
     ) -> i32;
+
+    // ==== slice9-cam02 ====
+    fn rcms_oracle_cam02_init(
+        wp_x: f64,
+        wp_y: f64,
+        wp_z: f64,
+        yb: f64,
+        la: f64,
+        surround: u32,
+        d_value: f64,
+    ) -> *mut core::ffi::c_void;
+    fn rcms_oracle_cam02_forward(h: *mut core::ffi::c_void, xyz: *const f64, jch: *mut f64);
+    fn rcms_oracle_cam02_reverse(h: *mut core::ffi::c_void, jch: *const f64, xyz: *mut f64);
+    fn rcms_oracle_cam02_done(h: *mut core::ffi::c_void);
+
+    // ==== slice9-ps ====
+    // PostScript CSA/CRD generation (cmsps2.c). Two-call: NULL out -> byte count.
+    fn rcms_oracle_get_postscript_csa(
+        bytes: *const u8,
+        len: u32,
+        intent: u32,
+        flags: u32,
+        out: *mut u8,
+        cap: u32,
+    ) -> u32;
+    fn rcms_oracle_get_postscript_crd(
+        bytes: *const u8,
+        len: u32,
+        intent: u32,
+        flags: u32,
+        out: *mut u8,
+        cap: u32,
+    ) -> u32;
+
+    // ==== slice9-named ====
+    // Named-color transform (cmsnamed.c / cmsxform.c): open a named-color profile
+    // (and optionally a second profile) from bytes, create a transform whose INPUT
+    // format is TYPE_NAMED_COLOR_INDEX, and run cmsDoTransform over the index
+    // buffer, producing `out_chans` u16 per pixel.
+    fn rcms_oracle_named_transform_16(
+        named_bytes: *const u8,
+        named_len: u32,
+        second_bytes: *const u8,
+        second_len: u32,
+        intent: u32,
+        in_indices: *const u16,
+        n_pixels: u32,
+        out_vals: *mut u16,
+        out_chans: u32,
+    ) -> i32;
+    // ==== end slice9-named ====
 }
 
 /// lcms2 `cmsDetectBlackPoint` over a profile loaded from `bytes` at `intent` +
@@ -558,6 +609,79 @@ pub fn detect_destination_black_point(bytes: &[u8], intent: u32, flags: u32) -> 
         )
     };
     (ok != 0, out)
+}
+
+// ==== slice9-ps ====
+
+/// Serializes the PostScript oracle calls. lcms2's `cmsps2.c` keeps a mutable
+/// `static int _cmsPSActualColumn` (the CLUT hex-dump column counter), so two
+/// concurrent `cmsGetPostScriptCSA/CRD` calls race on it and produce corrupted
+/// output. Tests run multi-threaded by default, so guard the C entry points here.
+static PS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// lcms2 `cmsGetPostScriptCSA` (Color Space Array) over a profile loaded from
+/// `bytes` at `intent` + `flags`. Returns the emitted PostScript as bytes, or
+/// `None` if lcms2 declined (profile open failure, unsupported colorspace/intent
+/// — the C returns a zero byte count).
+pub fn get_postscript_csa(bytes: &[u8], intent: u32, flags: u32) -> Option<Vec<u8>> {
+    get_postscript(bytes, intent, flags, false)
+}
+
+/// lcms2 `cmsGetPostScriptCRD` (Color Rendering Dictionary) over a profile loaded
+/// from `bytes` at `intent` + `flags`. Returns the emitted PostScript as bytes,
+/// or `None` if lcms2 declined.
+pub fn get_postscript_crd(bytes: &[u8], intent: u32, flags: u32) -> Option<Vec<u8>> {
+    get_postscript(bytes, intent, flags, true)
+}
+
+fn get_postscript(bytes: &[u8], intent: u32, flags: u32, crd: bool) -> Option<Vec<u8>> {
+    // Hold the lock for the whole two-call sequence (the static column counter is
+    // touched on every emit). Poisoning is irrelevant — the C call cannot panic.
+    let _guard = PS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: `bytes` is a valid readable slice; the C side only reads it (copied
+    // into an opened profile that it then closes). intent/flags are plain u32.
+    // First call passes a null `out` with cap 0 to obtain the required length.
+    let needed = unsafe {
+        let f = if crd {
+            rcms_oracle_get_postscript_crd
+        } else {
+            rcms_oracle_get_postscript_csa
+        };
+        f(
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            intent,
+            flags,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; needed as usize];
+    // SAFETY: `bytes` as above; `buf` is a freshly-allocated writable slice of
+    // exactly `needed` bytes, and `cap` describes its true length.
+    let got = unsafe {
+        let f = if crd {
+            rcms_oracle_get_postscript_crd
+        } else {
+            rcms_oracle_get_postscript_csa
+        };
+        f(
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            intent,
+            flags,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    };
+    if got == 0 {
+        return None;
+    }
+    buf.truncate(got as usize);
+    Some(buf)
 }
 
 /// Like [`do_transform_packed`] but with lcms2's **DEFAULT** optimizer enabled
@@ -3099,6 +3223,240 @@ pub fn save_virtual_profile(which: i32) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// ==== slice9-named ====
+/// Run lcms2's named-color transform over a list of color indices. The named-color
+/// profile (`named_bytes`) is the transform input with `TYPE_NAMED_COLOR_INDEX`;
+/// when `second` is `Some`, it is the second profile (e.g. a Lab profile so the
+/// output is the PCS Lab triple), otherwise the named-color profile alone produces
+/// its device colorants. `out_chans` is the number of u16 the output format
+/// carries per pixel. Returns the `n * out_chans` u16 outputs, or `None` if the
+/// transform could not be built.
+pub fn named_transform_16(
+    named_bytes: &[u8],
+    second: Option<&[u8]>,
+    intent: u32,
+    indices: &[u16],
+    out_chans: u32,
+) -> Option<Vec<u16>> {
+    let n = indices.len();
+    let mut out = vec![0u16; n * out_chans as usize];
+    let (sec_ptr, sec_len) = match second {
+        Some(b) => (b.as_ptr(), b.len() as u32),
+        None => (std::ptr::null(), 0u32),
+    };
+    // SAFETY: named_bytes/indices describe valid readable slices; `out` has
+    // exactly n*out_chans u16 the C writes into; sec_ptr/sec_len are either a
+    // valid slice or (null, 0) which the C treats as "no second profile".
+    let ok = unsafe {
+        rcms_oracle_named_transform_16(
+            named_bytes.as_ptr(),
+            named_bytes.len() as u32,
+            sec_ptr,
+            sec_len,
+            intent,
+            indices.as_ptr(),
+            n as u32,
+            out.as_mut_ptr(),
+            out_chans,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(out)
+}
+// ==== end slice9-named ====
+
+// ==== slice9-gamut ====
+// FFI + safe wrappers for `cmsDetectTAC`, the proofing transform
+// (`cmsCreateProofingTransform` + `cmsDoTransform`, with/without gamut check and
+// custom alarm codes), and the gamut boundary descriptor check
+// (`cmsGBDAlloc`/`cmsGDBAddPoint`/`cmsGDBCompute`/`cmsGDBCheckPoint`).
+
+unsafe extern "C" {
+    fn rcms_oracle_detect_tac(bytes: *const u8, len: u32) -> f64;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_proofing_transform_packed(
+        in_bytes: *const u8,
+        in_len: u32,
+        out_bytes: *const u8,
+        out_len: u32,
+        proof_bytes: *const u8,
+        proof_len: u32,
+        n_intent: u32,
+        proof_intent: u32,
+        gamutcheck: i32,
+        softproofing: i32,
+        bpc: i32,
+        in_fmt: u32,
+        out_fmt: u32,
+        in_buf: *const u8,
+        out_buf: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_proofing_transform_packed_alarm(
+        in_bytes: *const u8,
+        in_len: u32,
+        out_bytes: *const u8,
+        out_len: u32,
+        proof_bytes: *const u8,
+        proof_len: u32,
+        n_intent: u32,
+        proof_intent: u32,
+        gamutcheck: i32,
+        softproofing: i32,
+        bpc: i32,
+        alarm: *const u16,
+        in_fmt: u32,
+        out_fmt: u32,
+        in_buf: *const u8,
+        out_buf: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+
+    fn rcms_oracle_gbd_check(
+        add_lab: *const f64,
+        n_add: u32,
+        check_lab: *const f64,
+        n_check: u32,
+        verdicts: *mut i32,
+    ) -> i32;
+}
+
+/// Serializes the proofing-transform wrappers: lcms2's alarm codes live in a
+/// per-context global (the NULL context here), so concurrent calls that set them
+/// would race. The wrappers set + build + transform under this lock.
+static PROOFING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `cmsDetectTAC` over an in-memory profile. Returns 0.0 for non-output / failure
+/// (matching lcms2).
+pub fn detect_tac(bytes: &[u8]) -> f64 {
+    // SAFETY: `bytes` is a readable slice C only reads; the opened profile is
+    // freed inside the call.
+    unsafe { rcms_oracle_detect_tac(bytes.as_ptr(), bytes.len() as u32) }
+}
+
+/// `cmsCreateProofingTransform` + `cmsDoTransform` over packed byte buffers
+/// (always `cmsFLAGS_NOOPTIMIZE`). Returns `false` if the transform failed to
+/// build. `input`/`output` are sized per the in/out format bytes-per-pixel.
+#[allow(clippy::too_many_arguments)]
+pub fn proofing_transform_packed(
+    input_profile: &[u8],
+    output_profile: &[u8],
+    proofing_profile: &[u8],
+    n_intent: u32,
+    proof_intent: u32,
+    gamutcheck: bool,
+    softproofing: bool,
+    bpc: bool,
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    let _guard = PROOFING_LOCK.lock().unwrap();
+    // SAFETY: the three profile slices are readable, C only reads them and frees
+    // the opened handles; C reads `n_pixels` packed pixels of `in_fmt` from
+    // `input` and writes `n_pixels` packed pixels of `out_fmt` into `output`
+    // (the caller sizes both). The transform is freed inside the call. The lock
+    // serializes the global alarm-code state across parallel test threads.
+    let ok = unsafe {
+        rcms_oracle_proofing_transform_packed(
+            input_profile.as_ptr(),
+            input_profile.len() as u32,
+            output_profile.as_ptr(),
+            output_profile.len() as u32,
+            proofing_profile.as_ptr(),
+            proofing_profile.len() as u32,
+            n_intent,
+            proof_intent,
+            gamutcheck as i32,
+            softproofing as i32,
+            bpc as i32,
+            in_fmt,
+            out_fmt,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            n_pixels as u32,
+        )
+    };
+    ok != 0
+}
+
+/// Like [`proofing_transform_packed`] but sets custom `alarm` codes (16 entries)
+/// on the NULL context before building the transform, then restores the lcms2
+/// defaults. Exercises the gamut-check alarm-color substitution with known codes.
+#[allow(clippy::too_many_arguments)]
+pub fn proofing_transform_packed_alarm(
+    input_profile: &[u8],
+    output_profile: &[u8],
+    proofing_profile: &[u8],
+    n_intent: u32,
+    proof_intent: u32,
+    gamutcheck: bool,
+    softproofing: bool,
+    bpc: bool,
+    alarm: &[u16; 16],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    let _guard = PROOFING_LOCK.lock().unwrap();
+    // SAFETY: same contract as `proofing_transform_packed`; `alarm` is a readable
+    // 16-element array C copies into the context alarm codes before the build. The
+    // lock serializes the global alarm-code state across parallel test threads.
+    let ok = unsafe {
+        rcms_oracle_proofing_transform_packed_alarm(
+            input_profile.as_ptr(),
+            input_profile.len() as u32,
+            output_profile.as_ptr(),
+            output_profile.len() as u32,
+            proofing_profile.as_ptr(),
+            proofing_profile.len() as u32,
+            n_intent,
+            proof_intent,
+            gamutcheck as i32,
+            softproofing as i32,
+            bpc as i32,
+            alarm.as_ptr(),
+            in_fmt,
+            out_fmt,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            n_pixels as u32,
+        )
+    };
+    ok != 0
+}
+
+/// Gamut boundary descriptor round-trip: add `add_lab` points (flat `[L,a,b]`),
+/// `cmsGDBCompute`, then `cmsGDBCheckPoint` each of `check_lab`, returning one
+/// boolean verdict per checked point.
+pub fn gbd_check(add_lab: &[[f64; 3]], check_lab: &[[f64; 3]]) -> Vec<bool> {
+    let add_flat: Vec<f64> = add_lab.iter().flat_map(|p| p.iter().copied()).collect();
+    let check_flat: Vec<f64> = check_lab.iter().flat_map(|p| p.iter().copied()).collect();
+    let mut verdicts = vec![0i32; check_lab.len()];
+    // SAFETY: `add_flat`/`check_flat` are readable `nAdd*3`/`nCheck*3` f64 arrays;
+    // `verdicts` is a writable `nCheck` i32 array. The descriptor is freed inside.
+    let ok = unsafe {
+        rcms_oracle_gbd_check(
+            add_flat.as_ptr(),
+            add_lab.len() as u32,
+            check_flat.as_ptr(),
+            check_lab.len() as u32,
+            verdicts.as_mut_ptr(),
+        )
+    };
+    assert!(ok != 0, "rcms_oracle_gbd_check failed");
+    verdicts.into_iter().map(|v| v != 0).collect()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -3258,5 +3616,263 @@ mod transcendental_probe {
             log10_stats.mismatches,
             log10_stats.total
         );
+    }
+}
+
+// ==== slice9-cgats ====
+// CGATS / IT8.7 measurement-file parser + writer oracle (cmscgats.c).
+
+use std::ffi::{CStr, CString};
+
+unsafe extern "C" {
+    fn rcms_oracle_it8_load(bytes: *const u8, len: u32) -> usize;
+    fn rcms_oracle_it8_free(h: usize);
+    fn rcms_oracle_it8_table_count(h: usize) -> u32;
+    fn rcms_oracle_it8_set_table(h: usize, n: u32) -> i32;
+    fn rcms_oracle_it8_sheet_type(h: usize) -> *const std::os::raw::c_char;
+    fn rcms_oracle_it8_get_property(
+        h: usize,
+        key: *const std::os::raw::c_char,
+    ) -> *const std::os::raw::c_char;
+    fn rcms_oracle_it8_get_property_dbl(h: usize, key: *const std::os::raw::c_char) -> f64;
+    fn rcms_oracle_it8_num_samples(h: usize) -> i32;
+    fn rcms_oracle_it8_enum_properties(
+        h: usize,
+        out: *mut *const std::os::raw::c_char,
+        cap: u32,
+    ) -> u32;
+    fn rcms_oracle_it8_data_format(h: usize, col: i32) -> *const std::os::raw::c_char;
+    fn rcms_oracle_it8_get_data_rowcol(h: usize, row: i32, col: i32)
+        -> *const std::os::raw::c_char;
+    fn rcms_oracle_it8_get_data_rowcol_dbl(h: usize, row: i32, col: i32) -> f64;
+    fn rcms_oracle_it8_get_data(
+        h: usize,
+        patch: *const std::os::raw::c_char,
+        sample: *const std::os::raw::c_char,
+    ) -> *const std::os::raw::c_char;
+    fn rcms_oracle_it8_get_data_dbl(
+        h: usize,
+        patch: *const std::os::raw::c_char,
+        sample: *const std::os::raw::c_char,
+    ) -> f64;
+    fn rcms_oracle_it8_patch_name(h: usize, patch: i32) -> *const std::os::raw::c_char;
+    fn rcms_oracle_it8_save(h: usize, out: *mut u8, cap: u32) -> u32;
+}
+
+/// Owning RAII handle around a loaded lcms2 `cmsHANDLE` IT8 object. `Drop` calls
+/// `cmsIT8Free` exactly once. All accessor strings are copied out (lcms2 owns the
+/// underlying storage for the lifetime of the handle, so we copy immediately).
+pub struct It8 {
+    h: usize,
+}
+
+/// Helper: copy a (possibly null) borrowed C string into an owned `String`.
+///
+/// # Safety
+/// `p` must be null or a valid NUL-terminated C string owned by lcms2 for the
+/// duration of this call.
+unsafe fn opt_cstr(p: *const std::os::raw::c_char) -> Option<String> {
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+    }
+}
+
+impl It8 {
+    /// lcms2 `cmsIT8LoadFromMem`. `None` if lcms2 rejects the buffer (the
+    /// accept/reject decision rcms must agree with).
+    pub fn load(bytes: &[u8]) -> Option<It8> {
+        // SAFETY: `bytes` is a readable slice C only reads (it copies it into an
+        // owned in-memory buffer). The returned handle (or 0) is owned by us.
+        let h = unsafe { rcms_oracle_it8_load(bytes.as_ptr(), bytes.len() as u32) };
+        if h == 0 {
+            None
+        } else {
+            Some(It8 { h })
+        }
+    }
+
+    /// `cmsIT8TableCount`.
+    pub fn table_count(&self) -> u32 {
+        // SAFETY: `self.h` is a live handle owned by `self`.
+        unsafe { rcms_oracle_it8_table_count(self.h) }
+    }
+
+    /// `cmsIT8SetTable`; returns the new index or `-1`.
+    pub fn set_table(&self, n: u32) -> i32 {
+        // SAFETY: live handle.
+        unsafe { rcms_oracle_it8_set_table(self.h, n) }
+    }
+
+    /// `cmsIT8GetSheetType` for the active table.
+    pub fn sheet_type(&self) -> Option<String> {
+        // SAFETY: live handle; the returned pointer is borrowed and copied here.
+        unsafe { opt_cstr(rcms_oracle_it8_sheet_type(self.h)) }
+    }
+
+    /// `cmsIT8GetProperty` (string), `None` if absent.
+    pub fn get_property(&self, key: &str) -> Option<String> {
+        let k = CString::new(key).ok()?;
+        // SAFETY: live handle; `k` is a valid NUL-terminated string C only reads;
+        // the result pointer is borrowed and copied here.
+        unsafe { opt_cstr(rcms_oracle_it8_get_property(self.h, k.as_ptr())) }
+    }
+
+    /// `cmsIT8GetPropertyDbl`.
+    pub fn get_property_dbl(&self, key: &str) -> f64 {
+        let k = CString::new(key).unwrap();
+        // SAFETY: live handle; `k` is a valid NUL-terminated string C only reads.
+        unsafe { rcms_oracle_it8_get_property_dbl(self.h, k.as_ptr()) }
+    }
+
+    /// `cmsIT8EnumDataFormat` field count for the active table.
+    pub fn num_samples(&self) -> i32 {
+        // SAFETY: live handle.
+        unsafe { rcms_oracle_it8_num_samples(self.h) }
+    }
+
+    /// `cmsIT8EnumProperties` — property keyword names of the active table.
+    pub fn enum_properties(&self) -> Vec<String> {
+        // First count.
+        // SAFETY: live handle; null out-pointer makes C only return the count.
+        let n = unsafe { rcms_oracle_it8_enum_properties(self.h, std::ptr::null_mut(), 0) };
+        let mut ptrs: Vec<*const std::os::raw::c_char> = vec![std::ptr::null(); n as usize];
+        // SAFETY: live handle; `ptrs` has capacity `n`, C writes up to `n`
+        // borrowed name pointers.
+        unsafe { rcms_oracle_it8_enum_properties(self.h, ptrs.as_mut_ptr(), n) };
+        ptrs.into_iter()
+            // SAFETY: each pointer is a borrowed lcms2 string copied here.
+            .map(|p| unsafe { opt_cstr(p) }.unwrap_or_default())
+            .collect()
+    }
+
+    /// DATA_FORMAT label for column `col`, `None` if out of range.
+    pub fn data_format(&self, col: i32) -> Option<String> {
+        // SAFETY: live handle; borrowed result copied here.
+        unsafe { opt_cstr(rcms_oracle_it8_data_format(self.h, col)) }
+    }
+
+    /// `cmsIT8GetDataRowCol` (string), `None` if out of range.
+    pub fn get_data_rowcol(&self, row: i32, col: i32) -> Option<String> {
+        // SAFETY: live handle; borrowed result copied here.
+        unsafe { opt_cstr(rcms_oracle_it8_get_data_rowcol(self.h, row, col)) }
+    }
+
+    /// `cmsIT8GetDataRowColDbl`.
+    pub fn get_data_rowcol_dbl(&self, row: i32, col: i32) -> f64 {
+        // SAFETY: live handle.
+        unsafe { rcms_oracle_it8_get_data_rowcol_dbl(self.h, row, col) }
+    }
+
+    /// `cmsIT8GetData` by patch + sample name (string), `None` if not found.
+    pub fn get_data(&self, patch: &str, sample: &str) -> Option<String> {
+        let p = CString::new(patch).ok()?;
+        let s = CString::new(sample).ok()?;
+        // SAFETY: live handle; `p`/`s` are valid NUL-terminated strings C only
+        // reads; the result pointer is borrowed and copied here.
+        unsafe { opt_cstr(rcms_oracle_it8_get_data(self.h, p.as_ptr(), s.as_ptr())) }
+    }
+
+    /// `cmsIT8GetDataDbl` by patch + sample name.
+    pub fn get_data_dbl(&self, patch: &str, sample: &str) -> f64 {
+        let p = CString::new(patch).unwrap();
+        let s = CString::new(sample).unwrap();
+        // SAFETY: live handle; `p`/`s` are valid NUL-terminated strings C reads.
+        unsafe { rcms_oracle_it8_get_data_dbl(self.h, p.as_ptr(), s.as_ptr()) }
+    }
+
+    /// `cmsIT8GetPatchName` for the active table, `None` if no SAMPLE_ID data.
+    pub fn patch_name(&self, patch: i32) -> Option<String> {
+        // SAFETY: live handle; borrowed result copied here.
+        unsafe { opt_cstr(rcms_oracle_it8_patch_name(self.h, patch)) }
+    }
+
+    /// `cmsIT8SaveToMem` round-trip — the byte-exact serialized text INCLUDING
+    /// the trailing NUL byte that lcms2 writes. `None` on failure.
+    pub fn save(&self) -> Option<Vec<u8>> {
+        // SAFETY: live handle; null out-pointer returns the needed size.
+        let needed = unsafe { rcms_oracle_it8_save(self.h, std::ptr::null_mut(), 0) };
+        if needed == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        // SAFETY: live handle; `buf` has `needed` bytes of capacity, C writes
+        // exactly `needed` bytes (incl. trailing NUL).
+        let written = unsafe { rcms_oracle_it8_save(self.h, buf.as_mut_ptr(), needed) };
+        if written == 0 {
+            return None;
+        }
+        buf.truncate(written as usize);
+        Some(buf)
+    }
+}
+
+impl Drop for It8 {
+    fn drop(&mut self) {
+        // SAFETY: `self.h` is a live handle owned by `self`, freed exactly once.
+        unsafe { rcms_oracle_it8_free(self.h) }
+    }
+}
+
+// ==== slice9-cam02 ====
+
+/// An lcms2 CIECAM02 model handle (`cmsHANDLE` from `cmsCIECAM02Init`). Owns the
+/// underlying allocation; freed via `cmsCIECAM02Done` on `Drop`.
+pub struct OracleCam02 {
+    handle: *mut core::ffi::c_void,
+}
+
+impl OracleCam02 {
+    /// Initialize an lcms2 CIECAM02 model. `surround` is one of `AVG_SURROUND` …
+    /// `CUTSHEET_SURROUND`; pass `d_value = -1.0` for `D_CALCULATE`.
+    pub fn new(
+        white_point: [f64; 3],
+        yb: f64,
+        la: f64,
+        surround: u32,
+        d_value: f64,
+    ) -> OracleCam02 {
+        // SAFETY: all arguments are plain scalars passed by value; lcms2 copies
+        // them into a heap-allocated model and returns its pointer (or null on
+        // OOM, which does not occur for these tiny allocations under test).
+        let handle = unsafe {
+            rcms_oracle_cam02_init(
+                white_point[0],
+                white_point[1],
+                white_point[2],
+                yb,
+                la,
+                surround,
+                d_value,
+            )
+        };
+        OracleCam02 { handle }
+    }
+
+    /// lcms2 `cmsCIECAM02Forward`: XYZ → (J, C, h).
+    pub fn forward(&self, xyz: [f64; 3]) -> [f64; 3] {
+        let mut out = [0.0f64; 3];
+        // SAFETY: `handle` is a live model from `new`; `xyz` is a readable [3]
+        // the C only reads, and `out` is a writable [3] the C fills.
+        unsafe { rcms_oracle_cam02_forward(self.handle, xyz.as_ptr(), out.as_mut_ptr()) };
+        out
+    }
+
+    /// lcms2 `cmsCIECAM02Reverse`: (J, C, h) → XYZ.
+    pub fn reverse(&self, jch: [f64; 3]) -> [f64; 3] {
+        let mut out = [0.0f64; 3];
+        // SAFETY: `handle` is a live model from `new`; `jch` is a readable [3]
+        // the C only reads, and `out` is a writable [3] the C fills.
+        unsafe { rcms_oracle_cam02_reverse(self.handle, jch.as_ptr(), out.as_mut_ptr()) };
+        out
+    }
+}
+
+impl Drop for OracleCam02 {
+    fn drop(&mut self) {
+        // SAFETY: `handle` came from `cmsCIECAM02Init` and is freed exactly once
+        // here. lcms2's `cmsCIECAM02Done` tolerates a null handle.
+        unsafe { rcms_oracle_cam02_done(self.handle) };
     }
 }

@@ -152,6 +152,20 @@ fn normalize_from_xyz_float() -> Stage {
     }
 }
 
+/// Read the `ncl2` named-color list from a named-color profile (cmsio1.c:320/723:
+/// `cmsReadTag(hProfile, cmsSigNamedColor2Tag)`). lcms2 returns NULL — building
+/// the LUT then fails — when the tag is absent or not an ncl2; we surface that as
+/// [`Error::Corrupt`].
+fn read_named_color_list(profile: &Profile) -> Result<crate::named::NamedColorList> {
+    if !profile.has_tag(TAG_NAMED_COLOR2) {
+        return Err(Error::Corrupt("named-color profile lacks ncl2"));
+    }
+    match profile.read_tag(TAG_NAMED_COLOR2)? {
+        Tag::NamedColor2(list) => Ok(list),
+        _ => Err(Error::Corrupt("ncl2 tag is not a named-color list")),
+    }
+}
+
 /// Clone the LUT pipeline a tag decodes to, or error if it is not a `Tag::Lut`.
 fn read_lut_pipeline(profile: &Profile, sig: Signature) -> Result<Pipeline> {
     match profile.read_tag(sig)? {
@@ -170,12 +184,18 @@ fn read_lut_pipeline(profile: &Profile, sig: Signature) -> Result<Pipeline> {
 pub fn read_input_lut(profile: &Profile, intent: u32) -> Result<Pipeline> {
     let header = profile.header();
 
-    // Named color: route without panicking (full named transforms deferred).
+    // Named color (cmsio1.c:317): a NamedColor(UsePCS=TRUE) stage producing PCS
+    // Lab, then a LabV2ToV4 matrix. The named color list always uses Lab.
     if header.device_class == ProfileClass::NamedColor {
-        if !profile.has_tag(TAG_NAMED_COLOR2) {
-            return Err(Error::Corrupt("named-color profile lacks ncl2"));
-        }
-        return Err(Error::Unsupported("named-color input LUT"));
+        let nc = read_named_color_list(profile)?;
+        let mut lut = Pipeline::new(0, 0);
+        // cmsAT_BEGIN: BlessLUT sets the pipeline's input width from this stage.
+        lut.prepend_stage(Stage::NamedColor {
+            list: nc,
+            use_pcs: true,
+        })?;
+        lut.insert_stage_at_end(Stage::LabV2ToV4)?;
+        return Ok(lut);
     }
 
     if intent <= INTENT_ABSOLUTE_COLORIMETRIC {
@@ -450,12 +470,21 @@ pub fn read_devicelink_lut(profile: &Profile, intent: u32) -> Result<Pipeline> {
     let mut tag16 = DEVICE2PCS16[idx];
     let tag_float = DEVICE2PCS_FLOAT[idx];
 
-    // Named color (cmsio1.c:721).
+    // Named color (cmsio1.c:721): a NamedColor(UsePCS=FALSE) stage producing the
+    // device colorants. If the profile's color space is Lab, also append a
+    // LabV2ToV4 matrix (the device output is then a Lab triple).
     if header.device_class == ProfileClass::NamedColor {
-        if !profile.has_tag(TAG_NAMED_COLOR2) {
-            return Err(Error::Corrupt("named-color profile lacks ncl2"));
+        let nc = read_named_color_list(profile)?;
+        let mut lut = Pipeline::new(0, 0);
+        // cmsAT_BEGIN: BlessLUT sets the pipeline's input width from this stage.
+        lut.prepend_stage(Stage::NamedColor {
+            list: nc,
+            use_pcs: false,
+        })?;
+        if header.color_space == ColorSpace::Lab {
+            lut.insert_stage_at_end(Stage::LabV2ToV4)?;
         }
-        return Err(Error::Unsupported("named-color devicelink LUT"));
+        return Ok(lut);
     }
 
     // Float tag for the intent takes precedence (cmsio1.c:745).
