@@ -102,9 +102,15 @@ mod tests {
 
     #[test]
     fn s15f16_from_f64_matches_oracle() {
+        // Sweep only the REPRESENTABLE s15Fixed16 domain (±32767.99998). Outside
+        // it, `v * 65536` overflows i32 and lcms2's `(cmsS15Fixed16Number)` cast is
+        // undefined behavior in C — x86-64 yields i32::MIN (cvttsd2si), ARM64
+        // saturates to i32::MAX — so "bit-identical to lcms2" is not even defined
+        // there (and rcms's saturating `as i32` would match only some platforms).
+        // Within range the conversion is bit-identical on every platform.
         let mut rng = rcms_oracle::Rng::new(0xF1_4ED);
         for _ in 0..1_000_000 {
-            let v = (rng.next_f64_unit() - 0.5) * 80_000.0;
+            let v = (rng.next_f64_unit() - 0.5) * 65_535.0; // ±32767.5, in range
             assert_eq!(
                 S15Fixed16::from_f64(v).to_raw(),
                 rcms_oracle::double_to_s15f16(v),
