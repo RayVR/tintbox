@@ -1234,6 +1234,78 @@ int rcms_oracle_pipeline_clut_curves_matrix_eval_float(
     return 1;
 }
 
+/* ---- cmsPipelineCat / cmsPipelineInsertStage(AT_BEGIN) (slice 5 task 0) -----
+   Exercise the pipeline-construction API that transform building relies on. */
+
+/* Build pipeline A = [ ToneCurves(3, tblLen) -> Matrix(3x3, matA[,offA]) ] and
+   pipeline B = [ CLut16(3->3, grid/clutTable) ], then cmsPipelineCat(A, B) and
+   evaluate `in` (3 f32) via cmsPipelineEvalFloat, writing 3 f32 to `out`. This
+   mirrors the rcms `a.concat(&b)` test: A is 3->3, B is 3->3, so the cat chains
+   3==3 and the result is 3->3. Returns 1 on success, 0 on any allocation /
+   insert / cat failure. */
+int rcms_oracle_pipeline_cat_eval_float(
+        uint32_t tblLen, const uint16_t* curveTables,
+        const double* matA, const double* offA,
+        const uint32_t* grid, const uint16_t* clutTable,
+        const float* in, float* out) {
+    cmsPipeline* A = cmsPipelineAlloc(NULL, 3, 3);
+    cmsPipeline* B = cmsPipelineAlloc(NULL, 3, 3);
+    if (!A || !B) { if (A) cmsPipelineFree(A); if (B) cmsPipelineFree(B); return 0; }
+
+    cmsStage* curves = build_curves_stage(3, tblLen, curveTables);
+    cmsStage* mat = curves ? cmsStageAllocMatrix(NULL, 3, 3, matA, offA) : NULL;
+    cmsStage* clut = mat ? cmsStageAllocCLut16bitGranular(NULL, grid, 3, 3, clutTable) : NULL;
+    if (!curves || !mat || !clut) {
+        if (curves) cmsStageFree(curves);
+        if (mat) cmsStageFree(mat);
+        if (clut) cmsStageFree(clut);
+        cmsPipelineFree(A); cmsPipelineFree(B);
+        return 0;
+    }
+
+    int ok = 0;
+    if (cmsPipelineInsertStage(A, cmsAT_END, curves) &&
+        cmsPipelineInsertStage(A, cmsAT_END, mat) &&
+        cmsPipelineInsertStage(B, cmsAT_END, clut) &&
+        cmsPipelineCat(A, B)) {
+        cmsPipelineEvalFloat(in, out, A);
+        ok = 1;
+    }
+    cmsPipelineFree(A);
+    cmsPipelineFree(B);
+    return ok;
+}
+
+/* Build pipeline P = [ ToneCurves(3, tblLen) ] then prepend a 3x3 Matrix stage
+   via cmsPipelineInsertStage(P, cmsAT_BEGIN, mat). The result is
+   [ Matrix -> ToneCurves ]. Evaluate `in` (3 f32) via cmsPipelineEvalFloat into
+   `out` (3 f32). Mirrors rcms `p.prepend_stage(matrix)`. Returns 1/0. */
+int rcms_oracle_pipeline_prepend_eval_float(
+        uint32_t tblLen, const uint16_t* curveTables,
+        const double* matA, const double* offA,
+        const float* in, float* out) {
+    cmsPipeline* P = cmsPipelineAlloc(NULL, 3, 3);
+    if (!P) return 0;
+
+    cmsStage* curves = build_curves_stage(3, tblLen, curveTables);
+    cmsStage* mat = curves ? cmsStageAllocMatrix(NULL, 3, 3, matA, offA) : NULL;
+    if (!curves || !mat) {
+        if (curves) cmsStageFree(curves);
+        if (mat) cmsStageFree(mat);
+        cmsPipelineFree(P);
+        return 0;
+    }
+
+    int ok = 0;
+    if (cmsPipelineInsertStage(P, cmsAT_END, curves) &&
+        cmsPipelineInsertStage(P, cmsAT_BEGIN, mat)) {
+        cmsPipelineEvalFloat(in, out, P);
+        ok = 1;
+    }
+    cmsPipelineFree(P);
+    return ok;
+}
+
 /* ---- LUT8 / LUT16 tag readers (Type_LUT8_Read / Type_LUT16_Read) -----------
    cmsReadTag of an mft1/mft2 tag returns a cmsPipeline*. These extractors let
    the differential test build the SAME pipeline lcms2 builds and evaluate input
@@ -1304,5 +1376,182 @@ int rcms_oracle_tag_read_succeeds(const uint8_t* buf, uint32_t len, uint32_t sig
     void* v = cmsReadTag(p, (cmsTagSignature) sig);
     int ok = (v != NULL);
     cmsCloseProfile(p);
+    return ok;
+}
+
+/* ---- Profile -> pipeline LUT extraction (cmsio1.c) --------------------------
+   _cmsReadInputLUT / _cmsReadOutputLUT / _cmsReadDevicelinkLUT are CMSCHECKPOINT-
+   exported internals (lcms2_internal.h:964-966). These shims open a profile from
+   memory, build the requested LUT for `intent`, and evaluate `nSamples` input
+   vectors through it via cmsPipelineEvalFloat. `which`: 0 = input, 1 = output,
+   2 = devicelink. `inputs` is `nSamples * nIn` f32 row-major; `out` receives
+   `nSamples * nOut` f32 row-major. `nInOut[0]/[1]` receive the pipeline's in/out
+   channel counts. Returns 1 on success (LUT built), 0 if the profile cannot be
+   opened or lcms2 returns NULL for the requested LUT. */
+static cmsPipeline* read_lut_which(cmsHPROFILE p, uint32_t which, uint32_t intent) {
+    switch (which) {
+        case 0:  return _cmsReadInputLUT(p, intent);
+        case 1:  return _cmsReadOutputLUT(p, intent);
+        case 2:  return _cmsReadDevicelinkLUT(p, intent);
+        default: return NULL;
+    }
+}
+
+/* Report whether lcms2 builds a LUT for (which, intent) and its channel counts. */
+int rcms_oracle_read_lut_channels(const uint8_t* buf, uint32_t len, uint32_t which,
+                                  uint32_t intent, uint32_t* nIn, uint32_t* nOut) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsPipeline* lut = read_lut_which(p, which, intent);
+    int ok = 0;
+    if (lut) {
+        *nIn = cmsPipelineInputChannels(lut);
+        *nOut = cmsPipelineOutputChannels(lut);
+        cmsPipelineFree(lut);
+        ok = 1;
+    }
+    cmsCloseProfile(p);
+    return ok;
+}
+
+/* Build the LUT for (which, intent) and evaluate nSamples input vectors through
+   it in the float domain. Returns 1 on success, 0 if no LUT. */
+int rcms_oracle_read_lut_eval_float(const uint8_t* buf, uint32_t len, uint32_t which,
+                                    uint32_t intent, const float* inputs,
+                                    uint32_t nSamples, float* out) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsPipeline* lut = read_lut_which(p, which, intent);
+    if (!lut) { cmsCloseProfile(p); return 0; }
+    uint32_t nIn = cmsPipelineInputChannels(lut);
+    uint32_t nOut = cmsPipelineOutputChannels(lut);
+    for (uint32_t s = 0; s < nSamples; s++) {
+        cmsPipelineEvalFloat(inputs + (size_t) s * nIn, out + (size_t) s * nOut, lut);
+    }
+    cmsPipelineFree(lut);
+    cmsCloseProfile(p);
+    return 1;
+}
+
+/* ---- cmsReverseToneCurve (cmsgamma.c) --------------------------------------
+   Build a 16-bit tabulated tone curve from `table` (length n), reverse it via
+   cmsReverseToneCurve, and evaluate the reversed curve via cmsEvalToneCurveFloat
+   at the `nx` points in `xs`, writing `nx` floats into `ys`. Returns 1 on
+   success, 0 on allocation failure. */
+int rcms_oracle_reverse_tabulated16_eval_float(const uint16_t* table, uint32_t n,
+                                               const float* xs, uint32_t nx,
+                                               float* ys) {
+    cmsToneCurve* c = cmsBuildTabulatedToneCurve16(NULL, n, table);
+    if (!c) return 0;
+    cmsToneCurve* rev = cmsReverseToneCurve(c);
+    if (!rev) { cmsFreeToneCurve(c); return 0; }
+    for (uint32_t i = 0; i < nx; i++) ys[i] = cmsEvalToneCurveFloat(rev, xs[i]);
+    cmsFreeToneCurve(rev);
+    cmsFreeToneCurve(c);
+    return 1;
+}
+
+/* ---- Multiprofile transform (cmsxform.c / cmscnvrt.c) ----------------------
+   Build an N-profile transform via cmsCreateExtendedTransform with EXPLICIT
+   intents, BPC, and adaptation-state arrays, forcing cmsFLAGS_NOOPTIMIZE so the
+   un-optimized device-link pipeline runs (the slice-5 differential reference).
+   Input/output formats are generic float (FLOAT_SH(1)|PT_ANY|CHANNELS_SH(n)|
+   BYTES_SH(4)) so packing/unpacking is the identity FloatXFORM path. Each
+   profile is opened from its own memory block (bufs[i], lens[i]); `inChans`/
+   `outChans` are the first/last device channel counts; `in`/`out` carry
+   nPixels*inChans / nPixels*outChans floats row-major. Returns 1 on success,
+   0 if any profile fails to open or the transform cannot be created. */
+static uint32_t float_format(uint32_t nChans) {
+    return FLOAT_SH(1) | COLORSPACE_SH(PT_ANY) | CHANNELS_SH(nChans) | BYTES_SH(4);
+}
+
+int rcms_oracle_transform_eval_float(const uint8_t* const* bufs, const uint32_t* lens,
+                                     uint32_t n, const uint32_t* intents,
+                                     const int32_t* bpc, const double* adaptation,
+                                     const float* in, uint32_t inChans,
+                                     float* out, uint32_t outChans, uint32_t nPixels) {
+    if (n == 0 || n > 255) return 0;
+    cmsHPROFILE* profiles = (cmsHPROFILE*) calloc(n, sizeof(cmsHPROFILE));
+    cmsBool*     bpcArr    = (cmsBool*)    calloc(n, sizeof(cmsBool));
+    cmsUInt32Number* intArr = (cmsUInt32Number*) calloc(n, sizeof(cmsUInt32Number));
+    cmsFloat64Number* adArr = (cmsFloat64Number*) calloc(n, sizeof(cmsFloat64Number));
+    if (!profiles || !bpcArr || !intArr || !adArr) {
+        free(profiles); free(bpcArr); free(intArr); free(adArr);
+        return 0;
+    }
+    int ok = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        profiles[i] = cmsOpenProfileFromMem((const void*) bufs[i], lens[i]);
+        if (!profiles[i]) ok = 0;
+        bpcArr[i] = bpc[i] ? TRUE : FALSE;
+        intArr[i] = intents[i];
+        adArr[i]  = adaptation[i];
+    }
+
+    cmsHTRANSFORM xform = NULL;
+    if (ok) {
+        xform = cmsCreateExtendedTransform(
+            NULL, n, profiles, bpcArr, intArr, adArr,
+            NULL, 0, float_format(inChans), float_format(outChans),
+            cmsFLAGS_NOOPTIMIZE);
+    }
+    if (xform) {
+        cmsDoTransform(xform, in, out, nPixels);
+        cmsDeleteTransform(xform);
+    } else {
+        ok = 0;
+    }
+    for (uint32_t i = 0; i < n; i++) if (profiles[i]) cmsCloseProfile(profiles[i]);
+    free(profiles); free(bpcArr); free(intArr); free(adArr);
+    return ok;
+}
+
+/* Same as rcms_oracle_transform_eval_float but 16-bit: input/output formats are
+   generic 16-bit (FLOAT_SH(0)|PT_ANY|CHANNELS_SH(n)|BYTES_SH(2)), so the
+   PrecalculatedXFORM/CachedXFORM path runs and cmsDoTransform reads/writes u16.
+   `in`/`out` carry nPixels*inChans / nPixels*outChans uint16 row-major. Returns 1
+   on success, 0 on failure. */
+static uint32_t u16_format(uint32_t nChans) {
+    return COLORSPACE_SH(PT_ANY) | CHANNELS_SH(nChans) | BYTES_SH(2);
+}
+
+int rcms_oracle_transform_eval_16(const uint8_t* const* bufs, const uint32_t* lens,
+                                  uint32_t n, const uint32_t* intents,
+                                  const int32_t* bpc, const double* adaptation,
+                                  const uint16_t* in, uint32_t inChans,
+                                  uint16_t* out, uint32_t outChans, uint32_t nPixels) {
+    if (n == 0 || n > 255) return 0;
+    cmsHPROFILE* profiles = (cmsHPROFILE*) calloc(n, sizeof(cmsHPROFILE));
+    cmsBool*     bpcArr    = (cmsBool*)    calloc(n, sizeof(cmsBool));
+    cmsUInt32Number* intArr = (cmsUInt32Number*) calloc(n, sizeof(cmsUInt32Number));
+    cmsFloat64Number* adArr = (cmsFloat64Number*) calloc(n, sizeof(cmsFloat64Number));
+    if (!profiles || !bpcArr || !intArr || !adArr) {
+        free(profiles); free(bpcArr); free(intArr); free(adArr);
+        return 0;
+    }
+    int ok = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        profiles[i] = cmsOpenProfileFromMem((const void*) bufs[i], lens[i]);
+        if (!profiles[i]) ok = 0;
+        bpcArr[i] = bpc[i] ? TRUE : FALSE;
+        intArr[i] = intents[i];
+        adArr[i]  = adaptation[i];
+    }
+
+    cmsHTRANSFORM xform = NULL;
+    if (ok) {
+        xform = cmsCreateExtendedTransform(
+            NULL, n, profiles, bpcArr, intArr, adArr,
+            NULL, 0, u16_format(inChans), u16_format(outChans),
+            cmsFLAGS_NOOPTIMIZE);
+    }
+    if (xform) {
+        cmsDoTransform(xform, in, out, nPixels);
+        cmsDeleteTransform(xform);
+    } else {
+        ok = 0;
+    }
+    for (uint32_t i = 0; i < n; i++) if (profiles[i]) cmsCloseProfile(profiles[i]);
+    free(profiles); free(bpcArr); free(intArr); free(adArr);
     return ok;
 }

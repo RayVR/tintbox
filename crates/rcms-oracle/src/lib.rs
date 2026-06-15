@@ -322,6 +322,25 @@ unsafe extern "C" {
         input: *const f32,
         out: *mut f32,
     ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_pipeline_cat_eval_float(
+        tbl_len: u32,
+        curve_tables: *const u16,
+        mat_a: *const f64,
+        off_a: *const f64,
+        grid: *const u32,
+        clut_table: *const u16,
+        input: *const f32,
+        out: *mut f32,
+    ) -> i32;
+    fn rcms_oracle_pipeline_prepend_eval_float(
+        tbl_len: u32,
+        curve_tables: *const u16,
+        mat_a: *const f64,
+        off_a: *const f64,
+        input: *const f32,
+        out: *mut f32,
+    ) -> i32;
     fn rcms_oracle_lut_channels(
         buf: *const u8,
         len: u32,
@@ -344,6 +363,58 @@ unsafe extern "C" {
         inputs: *const f32,
         n_samples: u32,
         out: *mut f32,
+    ) -> i32;
+    fn rcms_oracle_read_lut_channels(
+        buf: *const u8,
+        len: u32,
+        which: u32,
+        intent: u32,
+        n_in: *mut u32,
+        n_out: *mut u32,
+    ) -> i32;
+    fn rcms_oracle_read_lut_eval_float(
+        buf: *const u8,
+        len: u32,
+        which: u32,
+        intent: u32,
+        inputs: *const f32,
+        n_samples: u32,
+        out: *mut f32,
+    ) -> i32;
+    fn rcms_oracle_reverse_tabulated16_eval_float(
+        table: *const u16,
+        n: u32,
+        xs: *const f32,
+        nx: u32,
+        ys: *mut f32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_transform_eval_float(
+        bufs: *const *const u8,
+        lens: *const u32,
+        n: u32,
+        intents: *const u32,
+        bpc: *const i32,
+        adaptation: *const f64,
+        input: *const f32,
+        in_chans: u32,
+        out: *mut f32,
+        out_chans: u32,
+        n_pixels: u32,
+    ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_transform_eval_16(
+        bufs: *const *const u8,
+        lens: *const u32,
+        n: u32,
+        intents: *const u32,
+        bpc: *const i32,
+        adaptation: *const f64,
+        input: *const u16,
+        in_chans: u32,
+        out: *mut u16,
+        out_chans: u32,
+        n_pixels: u32,
     ) -> i32;
 }
 
@@ -957,6 +1028,81 @@ pub fn pipeline_clut_curves_matrix_eval_float(
             curve_tables.as_ptr(),
             rows as u32,
             matrix.as_ptr(),
+            off_ptr,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsPipelineCat`: builds A = `[ToneCurves(3, tbl_len) -> Matrix(3x3)]`
+/// and B = `[CLut16(3->3)]`, runs `cmsPipelineCat(A, B)`, then evaluates `input`
+/// (3 f32) through the catenated A via `cmsPipelineEvalFloat`. `curve_tables` is
+/// `3 * tbl_len` u16 (3 contiguous 16-bit tabulated curves); `mat` is 9 row-major
+/// f64; `offset` is 3 f64 or `None`; `grid` is 3 per-axis sample counts; the CLUT
+/// `table` is `grid-product * 3` u16. Returns the 3 f32 outputs, or `None` on any
+/// lcms2 failure.
+#[allow(clippy::too_many_arguments)]
+pub fn pipeline_cat_eval_float(
+    tbl_len: usize,
+    curve_tables: &[u16],
+    mat: &[f64],
+    offset: Option<&[f64]>,
+    grid: &[u32],
+    clut_table: &[u16],
+    input: &[f32],
+) -> Option<[f32; 3]> {
+    let mut out = [0f32; 3];
+    let off_ptr = offset.map_or(core::ptr::null(), |o| o.as_ptr());
+    // SAFETY: `curve_tables` is `3 * tbl_len` readable u16; `mat` is 9 readable
+    // f64; `off_ptr` is null or 3 readable f64; `grid` is 3 readable u32;
+    // `clut_table` is grid-product*3 readable u16; `input` is 3 readable f32;
+    // `out` has 3 f32. C only reads inputs and writes exactly 3 outputs; the two
+    // pipelines and all stages are allocated and freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_pipeline_cat_eval_float(
+            tbl_len as u32,
+            curve_tables.as_ptr(),
+            mat.as_ptr(),
+            off_ptr,
+            grid.as_ptr(),
+            clut_table.as_ptr(),
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsPipelineInsertStage(.., cmsAT_BEGIN, ..)`: builds
+/// `P = [ToneCurves(3, tbl_len)]`, prepends a 3x3 Matrix stage (so the pipeline
+/// becomes `[Matrix -> ToneCurves]`), then evaluates `input` (3 f32) via
+/// `cmsPipelineEvalFloat`. Arguments as `pipeline_cat_eval_float`. Returns the 3
+/// f32 outputs, or `None` on lcms2 failure.
+pub fn pipeline_prepend_eval_float(
+    tbl_len: usize,
+    curve_tables: &[u16],
+    mat: &[f64],
+    offset: Option<&[f64]>,
+    input: &[f32],
+) -> Option<[f32; 3]> {
+    let mut out = [0f32; 3];
+    let off_ptr = offset.map_or(core::ptr::null(), |o| o.as_ptr());
+    // SAFETY: as `pipeline_cat_eval_float`, minus the CLUT inputs.
+    let ok = unsafe {
+        rcms_oracle_pipeline_prepend_eval_float(
+            tbl_len as u32,
+            curve_tables.as_ptr(),
+            mat.as_ptr(),
             off_ptr,
             input.as_ptr(),
             out.as_mut_ptr(),
@@ -2104,6 +2250,218 @@ pub fn lut_eval_float(
             inputs.as_ptr(),
             n_samples as u32,
             out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Which LUT-extraction entry point to drive in [`read_lut_channels`] /
+/// [`read_lut_eval_float`]: 0 = `_cmsReadInputLUT`, 1 = `_cmsReadOutputLUT`,
+/// 2 = `_cmsReadDevicelinkLUT` (all `cmsio1.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadLut {
+    Input = 0,
+    Output = 1,
+    Devicelink = 2,
+}
+
+/// lcms2 `_cmsReadInputLUT` / `_cmsReadOutputLUT` / `_cmsReadDevicelinkLUT`
+/// (`cmsio1.c`) for `intent`: report whether lcms2 builds a LUT and its
+/// `(input_channels, output_channels)`, or `None` if the profile cannot be
+/// opened or lcms2 returns NULL for the requested LUT.
+pub fn read_lut_channels(buf: &[u8], which: ReadLut, intent: u32) -> Option<(u32, u32)> {
+    let mut n_in = 0u32;
+    let mut n_out = 0u32;
+    // SAFETY: buf/len describe a valid readable slice C only reads; n_in/n_out are
+    // valid u32 the C writes only when it returns nonzero. The profile and the
+    // built pipeline are opened and freed entirely inside the call.
+    let ok = unsafe {
+        rcms_oracle_read_lut_channels(
+            buf.as_ptr(),
+            buf.len() as u32,
+            which as u32,
+            intent,
+            &mut n_in,
+            &mut n_out,
+        )
+    };
+    if ok != 0 {
+        Some((n_in, n_out))
+    } else {
+        None
+    }
+}
+
+/// Build the LUT lcms2's `_cmsRead{Input,Output,Devicelink}LUT` produces for
+/// `intent` and evaluate `n_samples` input vectors (`inputs` is
+/// `n_samples * n_in` f32 row-major) through it via `cmsPipelineEvalFloat`.
+/// Returns the `n_samples * n_out` f32 outputs row-major, or `None` if no LUT.
+/// `n_in`/`n_out` must match [`read_lut_channels`].
+pub fn read_lut_eval_float(
+    buf: &[u8],
+    which: ReadLut,
+    intent: u32,
+    inputs: &[f32],
+    n_samples: usize,
+    n_out: usize,
+) -> Option<Vec<f32>> {
+    let mut out = vec![0f32; n_samples * n_out];
+    // SAFETY: buf/len describe a valid readable slice C only reads; `inputs` is
+    // `n_samples * n_in` readable f32; `out` has `n_samples * n_out` f32 of room
+    // (the pipeline output width). C reads inputs and writes exactly that many
+    // outputs; the profile and pipeline are opened and freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_read_lut_eval_float(
+            buf.as_ptr(),
+            buf.len() as u32,
+            which as u32,
+            intent,
+            inputs.as_ptr(),
+            n_samples as u32,
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsBuildTabulatedToneCurve16(table)` + `cmsReverseToneCurve` +
+/// `cmsEvalToneCurveFloat`: reverse a 16-bit tabulated curve and evaluate the
+/// reversed curve at each `x` in `xs`. Returns the `xs.len()` outputs, or `None`
+/// on allocation failure.
+pub fn reverse_tabulated16_eval_float(table: &[u16], xs: &[f32]) -> Option<Vec<f32>> {
+    let mut ys = vec![0f32; xs.len()];
+    // SAFETY: `table` is `n` readable u16, `xs` is `nx` readable f32, `ys` has `nx`
+    // f32 of room. C builds/reverses/evaluates a curve and frees it inside the call.
+    let ok = unsafe {
+        rcms_oracle_reverse_tabulated16_eval_float(
+            table.as_ptr(),
+            table.len() as u32,
+            xs.as_ptr(),
+            xs.len() as u32,
+            ys.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(ys)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsCreateExtendedTransform` (NOOPTIMIZE) over `profiles` (each a raw
+/// profile byte block) with the per-link `intents`, `bpc`, and `adaptation`
+/// arrays, then `cmsDoTransform` over `n_pixels` float pixels. The input/output
+/// formats are generic float (PT_ANY, identity FloatXFORM packing), so this is
+/// the bit-exact reference for an rcms transform built from the same chain.
+/// `in_chans`/`out_chans` are the first/last device channel counts; `input` is
+/// `n_pixels * in_chans` f32 row-major. Returns the `n_pixels * out_chans` f32
+/// outputs, or `None` if any profile fails to open or the transform cannot be
+/// created.
+#[allow(clippy::too_many_arguments)]
+pub fn transform_eval_float(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    input: &[f32],
+    in_chans: usize,
+    out_chans: usize,
+    n_pixels: usize,
+) -> Option<Vec<f32>> {
+    let n = profiles.len();
+    assert_eq!(intents.len(), n);
+    assert_eq!(bpc.len(), n);
+    assert_eq!(adaptation.len(), n);
+    assert_eq!(input.len(), n_pixels * in_chans);
+
+    let bufs: Vec<*const u8> = profiles.iter().map(|p| p.as_ptr()).collect();
+    let lens: Vec<u32> = profiles.iter().map(|p| p.len() as u32).collect();
+    let bpc_i: Vec<i32> = bpc.iter().map(|&b| b as i32).collect();
+    let mut out = vec![0f32; n_pixels * out_chans];
+
+    // SAFETY: `bufs`/`lens` describe `n` valid readable profile slices C only
+    // reads (each copied into an in-memory profile, opened and closed inside the
+    // call). `intents`/`bpc_i`/`adaptation` are `n`-element readable arrays. C
+    // reads `n_pixels * in_chans` f32 from `input` and writes exactly
+    // `n_pixels * out_chans` f32 into `out`. The transform and all profiles are
+    // freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_transform_eval_float(
+            bufs.as_ptr(),
+            lens.as_ptr(),
+            n as u32,
+            intents.as_ptr(),
+            bpc_i.as_ptr(),
+            adaptation.as_ptr(),
+            input.as_ptr(),
+            in_chans as u32,
+            out.as_mut_ptr(),
+            out_chans as u32,
+            n_pixels as u32,
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// 16-bit counterpart of [`transform_eval_float`]: lcms2
+/// `cmsCreateExtendedTransform` (NOOPTIMIZE) with generic 16-bit input/output
+/// formats, then `cmsDoTransform` over `n_pixels` u16 pixels. `input` is
+/// `n_pixels * in_chans` u16 row-major; returns the `n_pixels * out_chans` u16
+/// outputs, or `None` if any profile fails to open or the transform cannot be
+/// created.
+#[allow(clippy::too_many_arguments)]
+pub fn transform_eval_16(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    input: &[u16],
+    in_chans: usize,
+    out_chans: usize,
+    n_pixels: usize,
+) -> Option<Vec<u16>> {
+    let n = profiles.len();
+    assert_eq!(intents.len(), n);
+    assert_eq!(bpc.len(), n);
+    assert_eq!(adaptation.len(), n);
+    assert_eq!(input.len(), n_pixels * in_chans);
+
+    let bufs: Vec<*const u8> = profiles.iter().map(|p| p.as_ptr()).collect();
+    let lens: Vec<u32> = profiles.iter().map(|p| p.len() as u32).collect();
+    let bpc_i: Vec<i32> = bpc.iter().map(|&b| b as i32).collect();
+    let mut out = vec![0u16; n_pixels * out_chans];
+
+    // SAFETY: identical contract to `transform_eval_float`, but the pixel buffers
+    // are u16: `bufs`/`lens` describe `n` valid readable profile slices C only
+    // reads; `intents`/`bpc_i`/`adaptation` are `n`-element readable arrays. C
+    // reads `n_pixels * in_chans` u16 from `input` and writes exactly
+    // `n_pixels * out_chans` u16 into `out`. The transform and all profiles are
+    // freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_transform_eval_16(
+            bufs.as_ptr(),
+            lens.as_ptr(),
+            n as u32,
+            intents.as_ptr(),
+            bpc_i.as_ptr(),
+            adaptation.as_ptr(),
+            input.as_ptr(),
+            in_chans as u32,
+            out.as_mut_ptr(),
+            out_chans as u32,
+            n_pixels as u32,
         )
     };
     if ok != 0 {

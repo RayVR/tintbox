@@ -385,6 +385,7 @@ fn clut_stage_u16_3d_and_4d() {
             let clut = Clut {
                 table: ClutTable::U16(table.clone()),
                 params: InterpParams::new(grid, n_in, n_out),
+                is_trilinear: false,
             };
             let mut pl = Pipeline::new(n_in, n_out);
             pl.insert_stage_at_end(Stage::Clut(clut)).unwrap();
@@ -422,6 +423,7 @@ fn clut_stage_f32_3d() {
             let clut = Clut {
                 table: ClutTable::F32(table.clone()),
                 params: InterpParams::new(grid, n_in, n_out),
+                is_trilinear: false,
             };
             let mut pl = Pipeline::new(n_in, n_out);
             pl.insert_stage_at_end(Stage::Clut(clut)).unwrap();
@@ -506,6 +508,7 @@ fn pipeline_clut_curves_matrix_float() {
         pl.insert_stage_at_end(Stage::Clut(Clut {
             table: ClutTable::U16(clut_table.clone()),
             params: InterpParams::new(grid, n_in, n_out),
+            is_trilinear: false,
         }))
         .unwrap();
         pl.insert_stage_at_end(Stage::ToneCurves(curves)).unwrap();
@@ -540,4 +543,169 @@ fn pipeline_clut_curves_matrix_float() {
             );
         }
     }
+}
+
+/// `Pipeline::concat` (cmsPipelineCat): build A = [curves -> matrix] (3->3) and
+/// B = [clut] (3->3) in rcms, `a.concat(&b)`, and diff the catenated eval against
+/// lcms2 building the same two pipelines and calling `cmsPipelineCat`.
+#[test]
+fn concat_curves_matrix_then_clut_float() {
+    let mut rng = Rng::new(0xCA7_C0DE);
+
+    let n = 3usize; // A and B are both 3->3 so the cat chains.
+    let tbl_len = 33usize;
+    let grid: &[u32] = &[5, 6, 7];
+
+    for trial in 0..500 {
+        let (curves, curve_tables) = build_random_curves(&mut rng, n, tbl_len);
+        let m: Vec<f64> = (0..n * n).map(|_| rand_m(&mut rng)).collect();
+        let offset: Option<Vec<f64>> = if trial % 3 == 0 {
+            None
+        } else {
+            Some((0..n).map(|_| rand_off(&mut rng)).collect())
+        };
+        let clut_len = cube_size(grid) * n;
+        let clut_table: Vec<u16> = (0..clut_len).map(|_| rng.next_u64() as u16).collect();
+
+        // Pipeline A: curves -> matrix.
+        let mut a = Pipeline::new(n, n);
+        a.insert_stage_at_end(Stage::ToneCurves(curves)).unwrap();
+        a.insert_stage_at_end(Stage::Matrix {
+            rows: n,
+            cols: n,
+            m: m.clone(),
+            offset: offset.clone(),
+        })
+        .unwrap();
+
+        // Pipeline B: clut.
+        let mut b = Pipeline::new(n, n);
+        b.insert_stage_at_end(Stage::Clut(Clut {
+            table: ClutTable::U16(clut_table.clone()),
+            params: InterpParams::new(grid, n, n),
+            is_trilinear: false,
+        }))
+        .unwrap();
+
+        a.concat(&b).unwrap();
+        assert_eq!(a.input_channels, n, "concat input_channels");
+        assert_eq!(a.output_channels, n, "concat output_channels");
+        assert_eq!(a.stages().len(), 3, "concat stage count");
+
+        let input: Vec<f32> = (0..n).map(|_| rand_in_f32(&mut rng)).collect();
+        let got = a.eval_float(&input);
+        let exp = rcms_oracle::pipeline_cat_eval_float(
+            tbl_len,
+            &curve_tables,
+            &m,
+            offset.as_deref(),
+            grid,
+            &clut_table,
+            &input,
+        )
+        .expect("oracle pipeline cat");
+        for i in 0..n {
+            assert_f32_bits(got[i], exp[i], &format!("concat trial={trial} out={i}"));
+        }
+    }
+}
+
+/// `Pipeline::prepend_stage` (cmsPipelineInsertStage AT_BEGIN): build a curves
+/// pipeline, prepend a 3x3 matrix stage, and diff vs lcms2's AT_BEGIN insert.
+#[test]
+fn prepend_matrix_before_curves_float() {
+    let mut rng = Rng::new(0x9EE_DEAD);
+
+    let n = 3usize;
+    let tbl_len = 33usize;
+
+    for trial in 0..500 {
+        let (curves, curve_tables) = build_random_curves(&mut rng, n, tbl_len);
+        let m: Vec<f64> = (0..n * n).map(|_| rand_m(&mut rng)).collect();
+        let offset: Option<Vec<f64>> = if trial % 2 == 0 {
+            None
+        } else {
+            Some((0..n).map(|_| rand_off(&mut rng)).collect())
+        };
+
+        let mut p = Pipeline::new(n, n);
+        p.insert_stage_at_end(Stage::ToneCurves(curves)).unwrap();
+        p.prepend_stage(Stage::Matrix {
+            rows: n,
+            cols: n,
+            m: m.clone(),
+            offset: offset.clone(),
+        })
+        .unwrap();
+        assert_eq!(p.input_channels, n, "prepend input_channels");
+        assert_eq!(p.output_channels, n, "prepend output_channels");
+        assert_eq!(p.stages().len(), 2, "prepend stage count");
+
+        let input: Vec<f32> = (0..n).map(|_| rand_in_f32(&mut rng)).collect();
+        let got = p.eval_float(&input);
+        let exp = rcms_oracle::pipeline_prepend_eval_float(
+            tbl_len,
+            &curve_tables,
+            &m,
+            offset.as_deref(),
+            &input,
+        )
+        .expect("oracle pipeline prepend");
+        for i in 0..n {
+            assert_f32_bits(got[i], exp[i], &format!("prepend trial={trial} out={i}"));
+        }
+    }
+}
+
+/// `concat` of incompatible pipelines fails like lcms2's `cmsPipelineCat` (BlessLUT
+/// returns FALSE on a junction channel mismatch).
+#[test]
+fn concat_channel_mismatch_errors() {
+    // A is 3->2, B is 3->3: the junction (B's first stage takes 3) does not
+    // match A's output width (2).
+    let mut a = Pipeline::new(3, 2);
+    a.insert_stage_at_end(Stage::Matrix {
+        rows: 2,
+        cols: 3,
+        m: vec![0.0; 6],
+        offset: None,
+    })
+    .unwrap();
+
+    let mut b = Pipeline::new(3, 3);
+    b.insert_stage_at_end(Stage::Identity(3)).unwrap();
+
+    assert!(a.concat(&b).is_err(), "incompatible concat must error");
+    // A is left unchanged on the failed junction (no stage from B appended).
+    assert_eq!(a.stages().len(), 1);
+}
+
+/// `concat` where `self` is empty adopts `other`'s channel counts, even when they
+/// differ from `self`'s declared widths (cmsPipelineCat: BlessLUT sets
+/// InputChannels/OutputChannels from the appended stages).
+#[test]
+fn concat_empty_adopts_channels() {
+    // Empty self with mismatched declared widths; other is 4->2.
+    let mut a = Pipeline::new(3, 3);
+    let mut b = Pipeline::new(4, 2);
+    b.insert_stage_at_end(Stage::Matrix {
+        rows: 2,
+        cols: 4,
+        m: vec![0.0; 8],
+        offset: None,
+    })
+    .unwrap();
+
+    a.concat(&b).unwrap();
+    assert_eq!(a.input_channels, 4, "empty concat adopts input");
+    assert_eq!(a.output_channels, 2, "empty concat adopts output");
+    assert_eq!(a.stages().len(), 1);
+
+    // Both empty: inherit other's declared channel counts with no stages.
+    let mut c = Pipeline::new(3, 3);
+    let d = Pipeline::new(5, 6);
+    c.concat(&d).unwrap();
+    assert_eq!(c.input_channels, 5);
+    assert_eq!(c.output_channels, 6);
+    assert_eq!(c.stages().len(), 0);
 }

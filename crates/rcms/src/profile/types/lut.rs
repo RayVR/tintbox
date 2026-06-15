@@ -207,6 +207,7 @@ fn read_clut<R: ProfileReader>(
     lut.insert_stage_at_end(Stage::Clut(Clut {
         table: ClutTable::U16(table),
         params,
+        is_trilinear: false,
     }))
 }
 
@@ -429,6 +430,7 @@ fn read_clut_at<R: ProfileReader>(
     lut.insert_stage_at_end(Stage::Clut(Clut {
         table: ClutTable::U16(table),
         params,
+        is_trilinear: false,
     }))
 }
 

@@ -341,6 +341,127 @@ impl ToneCurve {
     }
 }
 
+/// lcms2 `GetInterval` (cmsgamma.c:1015-1067): find the table interval whose
+/// `[y0, y1]` (or `[y1, y0]` when locally decreasing) brackets `inp`. `lut_table`
+/// is the source curve's 16-bit table; `domain` is `nEntries - 1`. Returns the
+/// interval index `j` (so `[lut_table[j], lut_table[j+1]]` brackets `inp`), or
+/// `-1` if none. The overall-ascending case scans high→low; the
+/// overall-descending case scans low→high — transcribed verbatim.
+fn get_interval(inp: f64, lut_table: &[u16], domain: usize) -> i32 {
+    // A 1 point table is not allowed.
+    if domain < 1 {
+        return -1;
+    }
+
+    if lut_table[0] < lut_table[domain] {
+        // Table is overall ascending: scan from Domain-1 down to 0.
+        let mut i = domain as i32 - 1;
+        while i >= 0 {
+            let y0 = lut_table[i as usize] as i32;
+            let y1 = lut_table[i as usize + 1] as i32;
+            let ii = inp as i32;
+            if y0 <= y1 {
+                if ii >= y0 && ii <= y1 {
+                    return i;
+                }
+            } else if y1 < y0 && ii >= y1 && ii <= y0 {
+                return i;
+            }
+            i -= 1;
+        }
+    } else {
+        // Table is overall descending: scan from 0 up to Domain-1.
+        for i in 0..domain {
+            let y0 = lut_table[i] as i32;
+            let y1 = lut_table[i + 1] as i32;
+            let ii = inp as i32;
+            if y0 <= y1 {
+                if ii >= y0 && ii <= y1 {
+                    return i as i32;
+                }
+            } else if y1 < y0 && ii >= y1 && ii <= y0 {
+                return i as i32;
+            }
+        }
+    }
+
+    -1
+}
+
+/// lcms2 `cmsReverseToneCurve` (cmsgamma.c:1137-1141): reverse with 4096 result
+/// samples.
+pub fn reverse_tone_curve(curve: &ToneCurve) -> ToneCurve {
+    reverse_tone_curve_ex(4096, curve)
+}
+
+/// lcms2 `cmsReverseToneCurveEx` (cmsgamma.c:1070-1134).
+///
+/// If the curve is a single parametric segment of a recognised type, the inverse
+/// is built analytically as `build_parametric(-type, params)` (the negative type
+/// the parametric evaluator already handles). Otherwise the 16-bit table is
+/// reversed numerically: for each result sample `i`, find the interval bracketing
+/// `y = i*65535/(n-1)` via [`get_interval`] and linearly interpolate the inverse.
+///
+/// # Panics
+/// Panics if `n_result_samples < 2` (lcms2 divides by `n - 1`).
+pub fn reverse_tone_curve_ex(n_result_samples: u32, curve: &ToneCurve) -> ToneCurve {
+    // Analytic reversal whenever possible: one parametric segment of a known type.
+    if curve.segments.len() == 1
+        && curve.segments[0].seg_type > 0
+        && parametric_param_count(curve.segments[0].seg_type).is_some()
+    {
+        let seg = &curve.segments[0];
+        if let Some(c) = build_parametric(-seg.seg_type, &seg.params) {
+            return c;
+        }
+    }
+
+    // Numeric reversal of the table.
+    let n = n_result_samples as usize;
+    let mut out = vec![0u16; n];
+
+    let src = &curve.table16;
+    let n_entries = src.len();
+    // Domain[0] of the SOURCE curve = nEntries - 1.
+    let domain = n_entries.saturating_sub(1);
+
+    // Ascending = !cmsIsToneCurveDescending; cmsIsToneCurveDescending is
+    // `Table16[0] > Table16[nEntries-1]` (cmsgamma.c:1393), so Ascending is the
+    // negation: `Table16[0] <= Table16[nEntries-1]`.
+    let descending = src[0] > src[n_entries - 1];
+    let ascending = !descending;
+
+    let mut a = 0.0f64;
+    let mut b = 0.0f64;
+
+    for (i, slot) in out.iter_mut().enumerate() {
+        let y = i as f64 * 65535.0 / (n_result_samples - 1) as f64;
+
+        let j = get_interval(y, src, domain);
+        if j >= 0 {
+            let j = j as usize;
+            let x1 = src[j] as f64;
+            let x2 = src[j + 1] as f64;
+
+            let y1 = (j as f64 * 65535.0) / (n_entries - 1) as f64;
+            let y2 = ((j + 1) as f64 * 65535.0) / (n_entries - 1) as f64;
+
+            if x1 == x2 {
+                // Collapsed interval: use either endpoint per direction.
+                *slot = Lcms2Floor::quick_saturate_word(if ascending { y2 } else { y1 });
+                continue;
+            } else {
+                a = (y2 - y1) / (x2 - x1);
+                b = y2 - a * x2;
+            }
+        }
+
+        *slot = Lcms2Floor::quick_saturate_word(a * y + b);
+    }
+
+    build_tabulated_16(&out)
+}
+
 /// lcms2 `_cmsQuantizeVal` (cmslut.c:737-743): the ideal `i`-th node of an
 /// `MaxSamples`-entry linear ramp, `(i * 65535) / (MaxSamples - 1)` saturated.
 fn quantize_val(i: f64, max_samples: u32) -> u16 {
