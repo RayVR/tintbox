@@ -146,6 +146,19 @@ fn scenarios() -> Vec<Scenario> {
             in_fmt: TYPE_RGB_8,
             out_fmt: TYPE_RGB_8,
         },
+        // F: a GENUINE non-identity RGB matrix-shaper pair (crayons -> test5), so
+        // the merged matrix is NOT identity and the matrix-shaper fast paths
+        // actually fire. Scenario E above degenerates to a curves-only pipeline
+        // (sRGB -> sRGB merges to the identity matrix, dropped by pre_optimize),
+        // which exercises curve-join, not the matrix shaper. F is the worst-gap
+        // case the lossless AccurateFast targets.
+        Scenario {
+            name: "F_rgb8_to_rgb8_matrix_shaper_real",
+            in_bytes: cmyk_bytes("crayons.icc"),
+            out_bytes: cmyk_bytes("test5.icc"),
+            in_fmt: TYPE_RGB_8,
+            out_fmt: TYPE_RGB_8,
+        },
     ]
 }
 
@@ -203,6 +216,17 @@ fn bench(c: &mut Criterion) {
             sc.out_fmt,
             OptimizationStrategy::Lcms2Compat,
         );
+        // The LOSSLESS AccurateFast path: byte-identical to tintbox-Accurate, but
+        // installs the exact-LUT matrix-shaper fast path for the RGB 8-bit-input
+        // matrix-shaper shape (scenario E) and the exact input-curve LUT elsewhere
+        // (falls back to Pipeline where the shape does not match).
+        let tb_accurate_fast = build_tintbox(
+            &in_prof,
+            &out_prof,
+            sc.in_fmt,
+            sc.out_fmt,
+            OptimizationStrategy::AccurateFast,
+        );
         let lcms_noopt = OracleTransform::create(
             &sc.in_bytes,
             sc.in_fmt,
@@ -234,6 +258,11 @@ fn bench(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new(sc.name, "tintbox-Lcms2Compat"), |b| {
             b.iter(|| {
                 tb_compat.do_transform(black_box(&input), black_box(&mut output), N_PIXELS);
+            })
+        });
+        group.bench_function(BenchmarkId::new(sc.name, "tintbox-AccurateFast"), |b| {
+            b.iter(|| {
+                tb_accurate_fast.do_transform(black_box(&input), black_box(&mut output), N_PIXELS);
             })
         });
         group.bench_function(BenchmarkId::new(sc.name, "lcms2-NOOPTIMIZE"), |b| {

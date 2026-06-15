@@ -532,7 +532,23 @@ impl Transform {
             OptimizedEval::MatShaper(_) => "matshaper",
             OptimizedEval::Curves(_) => "curves",
             OptimizedEval::Baked(_) => "baked",
+            OptimizedEval::LosslessMatShaper(_) => "lossless-matshaper",
+            OptimizedEval::Batched(_) => "batched",
         }
+    }
+
+    /// Whether the LOSSLESS BATCHED general/CLUT fast path fired for this transform
+    /// (true only under [`OptimizationStrategy::AccurateFast`] for a general/CLUT
+    /// pipeline the matrix-shaper fast path does not cover).
+    pub fn batched_fired(&self) -> bool {
+        matches!(self.opt_eval, OptimizedEval::Batched(_))
+    }
+
+    /// Whether the LOSSLESS matrix-shaper fast path fired for this transform
+    /// (true only under [`OptimizationStrategy::AccurateFast`] when the RGB 8-bit
+    /// matrix-shaper shape matched).
+    pub fn lossless_matshaper_fired(&self) -> bool {
+        matches!(self.opt_eval, OptimizedEval::LosslessMatShaper(_))
     }
 
     /// Convenience 2-profile constructor (lcms2 `cmsCreateTransform`, which routes
@@ -669,6 +685,105 @@ impl Transform {
         }
     }
 
+    /// The LOSSLESS BATCHED general/CLUT eval over packed byte buffers
+    /// ([`OptimizedEval::Batched`], `AccurateFast`). Unpacks a CHUNK of pixels into
+    /// a contiguous channel buffer, runs the batched stage-by-stage eval (CLUT
+    /// interpolator resolved once + memoized 8-bit input curves), and packs the
+    /// chunk back out. Byte-for-byte identical to the per-pixel
+    /// `eval_16`/`eval_float` Pipeline path — only the loop nesting + cached
+    /// build-time work differ. Extra (alpha) channels are copied exactly as the
+    /// per-pixel path (`_cmsHandleExtraChannels`).
+    fn do_transform_batched(
+        &self,
+        fmts: &Formatters,
+        batched: &crate::opt::batched::BatchedPipeline,
+        input: &[u8],
+        output: &mut [u8],
+        n_pixels: usize,
+    ) {
+        // Pixels per unpack/eval/pack tile. Matches the eval's internal CHUNK so
+        // the whole pipeline stays in cache; the eval itself re-tiles internally.
+        const TILE: usize = 8192;
+
+        let in_ch = self.lut.input_channels;
+        let out_ch = self.lut.output_channels;
+        let in_stride = pixel_bytes(fmts.in_fmt);
+        let out_stride = pixel_bytes(fmts.out_fmt);
+
+        if fmts.is_float {
+            let from_input = fmts.from_input_float.as_ref().unwrap();
+            let to_output = fmts.to_output_float.as_ref().unwrap();
+            // Contiguous channel scratch for one tile (in/out widths).
+            let mut chan_in = vec![0f32; TILE * in_ch];
+            let mut chan_out = vec![0f32; TILE * out_ch];
+            // Per-pixel unpack target (the formatter writes MAX_CHANNELS slots).
+            let mut fin = [0f32; MAX_CHANNELS];
+
+            let mut base = 0usize;
+            while base < n_pixels {
+                let m = (n_pixels - base).min(TILE);
+                // Unpack the tile into the contiguous channel buffer.
+                for p in 0..m {
+                    let in_pixel =
+                        &input[(base + p) * in_stride..(base + p) * in_stride + in_stride];
+                    from_input(in_pixel, &mut fin);
+                    chan_in[p * in_ch..p * in_ch + in_ch].copy_from_slice(&fin[..in_ch]);
+                }
+                // Batched eval (identical to per-pixel eval_float).
+                batched.eval_float_buffer(&chan_in[..m * in_ch], &mut chan_out[..m * out_ch], m);
+                // Pack the tile back out (padding the packer's MAX_CHANNELS input).
+                let mut fout = [0f32; MAX_CHANNELS];
+                for p in 0..m {
+                    fout[..out_ch].copy_from_slice(&chan_out[p * out_ch..p * out_ch + out_ch]);
+                    let out_pixel =
+                        &mut output[(base + p) * out_stride..(base + p) * out_stride + out_stride];
+                    to_output(&fout, out_pixel);
+                    if let Some(plan) = &fmts.alpha_copy {
+                        let in_pixel =
+                            &input[(base + p) * in_stride..(base + p) * in_stride + in_stride];
+                        let out_pixel = &mut output
+                            [(base + p) * out_stride..(base + p) * out_stride + out_stride];
+                        plan.copy_pixel(in_pixel, out_pixel);
+                    }
+                }
+                base += m;
+            }
+        } else {
+            let from_input = fmts.from_input16.as_ref().unwrap();
+            let to_output = fmts.to_output16.as_ref().unwrap();
+            let mut chan_in = vec![0u16; TILE * in_ch];
+            let mut chan_out = vec![0u16; TILE * out_ch];
+            let mut win = [0u16; MAX_CHANNELS];
+
+            let mut base = 0usize;
+            while base < n_pixels {
+                let m = (n_pixels - base).min(TILE);
+                for p in 0..m {
+                    let in_pixel =
+                        &input[(base + p) * in_stride..(base + p) * in_stride + in_stride];
+                    from_input(in_pixel, &mut win);
+                    chan_in[p * in_ch..p * in_ch + in_ch].copy_from_slice(&win[..in_ch]);
+                }
+                batched.eval_16_buffer(&chan_in[..m * in_ch], &mut chan_out[..m * out_ch], m);
+                let mut wout = [0u16; MAX_CHANNELS];
+                for p in 0..m {
+                    wout[..out_ch].copy_from_slice(&chan_out[p * out_ch..p * out_ch + out_ch]);
+                    let out_pixel =
+                        &mut output[(base + p) * out_stride..(base + p) * out_stride + out_stride];
+                    to_output(&wout, out_pixel);
+                    if let Some(plan) = &fmts.alpha_copy {
+                        let in_pixel =
+                            &input[(base + p) * in_stride..(base + p) * in_stride + in_stride];
+                        let out_pixel = &mut output
+                            [(base + p) * out_stride..(base + p) * out_stride + out_stride];
+                        plan.copy_pixel(in_pixel, out_pixel);
+                    }
+                }
+                base += m;
+            }
+        }
+    }
+
     /// Format-aware transform over packed byte buffers (lcms2 `cmsDoTransform`):
     /// for each of `n_pixels`, unpack one packed pixel via the stored input
     /// formatter → evaluate the pipeline → pack one packed pixel via the output
@@ -703,6 +818,18 @@ impl Transform {
             output.len() >= n_pixels * out_stride,
             "output buffer too small"
         );
+
+        // LOSSLESS BATCHED general/CLUT fast path (AccurateFast). Byte-for-byte
+        // identical to the per-pixel Pipeline eval, but unpacks/evaluates/packs in
+        // CHUNKS so the CLUT interpolator + input curves are resolved once and the
+        // intermediate buffers stay cache-resident. Only taken when there is no
+        // gamut-check pipeline (batched never fires for proofing transforms).
+        if self.gamut_check.is_none() {
+            if let OptimizedEval::Batched(batched) = &self.opt_eval {
+                self.do_transform_batched(fmts, batched, input, output, n_pixels);
+                return;
+            }
+        }
 
         if fmts.is_float {
             let from_input = fmts.from_input_float.as_ref().unwrap();
@@ -783,8 +910,19 @@ impl Transform {
                         OptimizedEval::Baked(b) => {
                             b.eval(&win[..in_ch], &mut wout[..out_ch]);
                         }
-                        // The accurate in-place pipeline eval.
-                        OptimizedEval::Pipeline => {
+                        // The LOSSLESS matrix-shaper fast path (AccurateFast):
+                        // byte-for-byte identical to the Pipeline arm, but the
+                        // per-pixel input-curve eval is a table lookup.
+                        OptimizedEval::LosslessMatShaper(data) => {
+                            let res = data.eval(&[win[0], win[1], win[2]]);
+                            wout[..3].copy_from_slice(&res);
+                        }
+                        // The accurate in-place pipeline eval. The Batched general
+                        // fast path is handled by the early-return chunked loop in
+                        // `do_transform`, so reaching it here (only possible with a
+                        // gamut-check pipeline, which batched declines) falls back
+                        // to the bit-identical in-place eval.
+                        OptimizedEval::Pipeline | OptimizedEval::Batched(_) => {
                             let res = self.lut.eval_16(&win[..in_ch]);
                             wout[..out_ch].copy_from_slice(&res);
                         }

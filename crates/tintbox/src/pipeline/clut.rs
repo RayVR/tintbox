@@ -139,6 +139,16 @@ impl Clut {
         self
     }
 
+    /// Whether a build-time CUSTOM plugin interpolator was resolved for this CLUT
+    /// ([`Clut::resolve_interp_in`]). `false` in the common builtin case. The
+    /// batched evaluator ([`crate::opt::batched`]) consults this to decline
+    /// caching a CLUT whose interpolator only [`Clut::eval`] can dispatch.
+    #[inline]
+    #[must_use]
+    pub fn has_custom_interp(&self) -> bool {
+        matches!(self.resolved.0, Some(InterpFn::Custom(_)))
+    }
+
     /// The build-time custom interpolator, if one was resolved
     /// ([`Clut::resolve_interp_in`]). `None` in the common builtin case, so
     /// [`Clut::eval`] takes the unchanged builtin hot path.
