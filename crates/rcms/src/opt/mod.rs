@@ -2,15 +2,22 @@
 //! inlined into eval (mirrors the [`compat::floor`](crate::compat::floor) seam).
 //!
 //! lcms2 runs `_cmsOptimizePipeline` (`cmsopt.c:1919`) after building the
-//! device-link pipeline; with `cmsFLAGS_NOOPTIMIZE` it returns immediately and
-//! the pipeline is evaluated in place. rcms exposes the choice as
-//! [`OptimizationStrategy`]:
+//! device-link pipeline. Note that even with `cmsFLAGS_NOOPTIMIZE` it first runs
+//! `PreOptimize` (`cmsopt.c:1952`) — identity/inverse removal AND the
+//! `_MultiplyMatrix` adjacent-matrix merge — and only THEN returns at the
+//! NOOPTIMIZE gate (`cmsopt.c:1961`) to evaluate the pipeline in place. rcms
+//! replicates `PreOptimize` at link time (see
+//! [`Pipeline::pre_optimize`](crate::pipeline::Pipeline::pre_optimize), called
+//! from [`default_icc_intents`](crate::link::default_icc_intents)), so the device
+//! link the strategies receive is already pre-optimized. rcms exposes the
+//! remaining optimizer choice as [`OptimizationStrategy`]:
 //!
 //! - [`Accurate`](OptimizationStrategy::Accurate) (DEFAULT) — full in-place
 //!   pipeline eval, exactly what slice-5 `do_transform` does. Bit-identical to
-//!   lcms2 `-NOOPTIMIZE`, and MORE accurate than lcms2-DEFAULT. Never produces an
-//!   optimized eval (the optimizers it could safely apply — identity removal — do
-//!   not change output, so there is nothing to special-case).
+//!   lcms2 `-NOOPTIMIZE` (because the link already carries lcms2's unconditional
+//!   `PreOptimize` matrix merge), and MORE accurate than lcms2-DEFAULT. Never
+//!   produces an optimized eval; the structural simplifications lcms2 applies
+//!   unconditionally are baked into the linked pipeline, not the strategy.
 //! - [`Lcms2Compat`](OptimizationStrategy::Lcms2Compat) (opt-in) — replicate
 //!   lcms2's DEFAULT optimizer so the output matches stock lcms2-default. This
 //!   module implements its **matrix-shaper** optimizer

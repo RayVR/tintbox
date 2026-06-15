@@ -626,3 +626,130 @@ fn do_transform_packed_matches_oracle_over_testbed_pairs() {
         "both paths must be exercised"
     );
 }
+
+/// Dense 8→16 regression for the matrix-shaper `PreOptimize` matrix-merge fix.
+///
+/// lcms2's `_cmsOptimizePipeline` runs `PreOptimize` (which merges adjacent matrix
+/// stages via `_MultiplyMatrix`) BEFORE the `cmsFLAGS_NOOPTIMIZE` early-return
+/// (cmsopt.c:1952 vs 1961), so even the un-optimized device link has the input
+/// profile's RGB→XYZ matrix and the output profile's XYZ→RGB matrix collapsed into
+/// ONE pre-multiplied matrix. rcms previously left them as two separate `Matrix`
+/// stages, which applied an extra intermediate `f32` rounding and diverged from
+/// lcms2-NOOPTIMIZE by up to a few LSB after the following output tone curve — but
+/// only for some 8-bit input bytes (e.g. `ibm-t61.icc → test5.icc`, input byte
+/// 115 → 8→16 value 29555, output channel 1: rcms 27417 vs lcms2 27419). The
+/// coarse slice-5 16-bit grid quantized inputs round-to-nearest and missed the
+/// `(a<<8)|a` 8-bit expansion that exposes it.
+///
+/// This sweeps EVERY 8-bit value (0..=255) on each RGB channel through an 8-bit→
+/// 16-bit transform for every loadable RGB→RGB testbed pair under all four intents
+/// (BPC off), comparing `Transform::do_transform` (Accurate strategy) byte-for-byte
+/// against lcms2 `cmsCreateExtendedTransform(NOOPTIMIZE)` + `cmsDoTransform`.
+#[test]
+fn dense_8bit_to_16bit_matrix_shaper_bit_identical_to_lcms2_nooptimize() {
+    let files = testbed_icc();
+    let mut loaded: Vec<Loaded> = Vec::new();
+    for path in &files {
+        let bytes = fs::read(path).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if !rcms_oracle::open_succeeds(&bytes) {
+            continue;
+        }
+        let Ok(prof) = Profile::open(&bytes) else {
+            continue;
+        };
+        if prof.header().color_space != ColorSpace::Rgb {
+            continue;
+        }
+        loaded.push(Loaded { name, bytes });
+    }
+    assert!(loaded.len() >= 2, "need >= 2 loadable RGB testbed profiles");
+
+    let intents = [
+        RenderingIntent::RelativeColorimetric,
+        RenderingIntent::AbsoluteColorimetric,
+        RenderingIntent::Perceptual,
+        RenderingIntent::Saturation,
+    ];
+    // 8-bit RGB in, 16-bit RGB out (the 8→16 path: lcms2 unpacks each byte via
+    // FROM_8_TO_16 = (a<<8)|a, the expansion that exposed the bug).
+    let in_fmt = (decode::PT_RGB << 16) | (3u32 << 3) | 1;
+    let out_fmt = (decode::PT_RGB << 16) | (3u32 << 3) | 2;
+
+    // 256 pixels: pixel v carries a per-channel sweep so all 256 byte values appear
+    // on every channel (channel 0 = v, channels 1/2 = decorrelated permutations so
+    // the three matrix columns each see the full 0..255 range, not just the diagonal).
+    let n = 256usize;
+    let mut packed_in = vec![0u8; n * 3];
+    for v in 0..n {
+        packed_in[v * 3] = v as u8;
+        packed_in[v * 3 + 1] = ((v * 7 + 3) % 256) as u8;
+        packed_in[v * 3 + 2] = ((v * 13 + 17) % 256) as u8;
+    }
+
+    let mut cells = 0usize;
+    for a in &loaded {
+        for b in &loaded {
+            if a.name == b.name {
+                continue;
+            }
+            let pa = Profile::open(&a.bytes).unwrap();
+            let pb = Profile::open(&b.bytes).unwrap();
+
+            for &intent in &intents {
+                let intents_raw = [intent.to_raw(), intent.to_raw()];
+
+                let mut oracle_out = vec![0u8; n * 3 * 2];
+                let ok = rcms_oracle::do_transform_packed(
+                    &[&a.bytes, &b.bytes],
+                    &intents_raw,
+                    &[false, false],
+                    &[1.0, 1.0],
+                    in_fmt,
+                    out_fmt,
+                    &packed_in,
+                    &mut oracle_out,
+                    n,
+                );
+                if !ok {
+                    continue;
+                }
+                let xform = match Transform::new_simple_with_formats(
+                    &pa, &pb, intent, false, in_fmt, out_fmt,
+                ) {
+                    Ok(x) => x,
+                    Err(_) => continue, // deferred (e.g. forced-BPC detection cell)
+                };
+                let mut rcms_out = vec![0u8; n * 3 * 2];
+                xform.do_transform(&packed_in, &mut rcms_out, n);
+
+                // Byte-exact, with a precise per-sample message if it ever drifts.
+                if rcms_out != oracle_out {
+                    for px in 0..n {
+                        for ch in 0..3 {
+                            let off = (px * 3 + ch) * 2;
+                            let r = u16::from_le_bytes([rcms_out[off], rcms_out[off + 1]]);
+                            let o = u16::from_le_bytes([oracle_out[off], oracle_out[off + 1]]);
+                            assert_eq!(
+                                r,
+                                o,
+                                "8->16 {} -> {} ({intent:?}) pixel {px} (bytes {:?}) ch{ch}: \
+                                 rcms={r} lcms2={o}",
+                                a.name,
+                                b.name,
+                                &packed_in[px * 3..px * 3 + 3],
+                            );
+                        }
+                    }
+                }
+                cells += 1;
+            }
+        }
+    }
+
+    println!(
+        "Dense 8->16 matrix-shaper sweep: {cells} (RGB pair × intent) cells, all 256 \
+         byte values per channel, bit-exact vs lcms2 NOOPTIMIZE."
+    );
+    assert!(cells > 0, "expected at least one RGB pair × intent cell");
+}

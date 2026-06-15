@@ -577,6 +577,18 @@ pub fn default_icc_intents(
         current_color_space = color_space_out;
     }
 
+    // lcms2 `PreOptimize` (cmsopt.c:251-289) runs inside `_cmsOptimizePipeline`
+    // (cmsopt.c:1952) BEFORE the `cmsFLAGS_NOOPTIMIZE` early-return (cmsopt.c:1961),
+    // so it applies even to the "unoptimized" device link. We must replicate it for
+    // bit-identity: its `_MultiplyMatrix` step merges adjacent matrix stages (e.g.
+    // an input matrix-shaper's RGB→XYZ matrix and an output matrix-shaper's XYZ→RGB
+    // matrix) into a single pre-multiplied matrix, removing an intermediate f32
+    // rounding. Leaving them separate diverges from lcms2-NOOPTIMIZE by a few LSB
+    // after the following tone curve (the 8→16 matrix-shaper divergence). This is a
+    // value-preserving structural simplification only for identity/inverse removal;
+    // the matrix merge is a genuine numeric change that lcms2 performs unconditionally.
+    result.pre_optimize();
+
     // Final channel sanity guard: the chain's output width must match the device
     // channel count of the last profile's output space. lcms2 enforces this
     // implicitly through cmsPipelineCat/BlessLUT as stages are appended; we assert
