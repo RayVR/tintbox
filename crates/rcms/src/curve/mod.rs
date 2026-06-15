@@ -296,8 +296,35 @@ impl ToneCurve {
     }
 
     /// lcms2 `cmsIsToneCurveDescending` (cmsgamma.c:1393-1398).
-    fn is_descending(&self) -> bool {
+    pub fn is_descending(&self) -> bool {
         self.table16[0] > self.table16[self.table16.len() - 1]
+    }
+
+    /// lcms2 `IsDegenerated` (cmsopt.c:1022-1039): curves with wide empty areas
+    /// (too many `0x0000` or `0xffff` entries) are not optimizeable. A perfectly
+    /// linear table (exactly one zero and one pole) is NOT degenerated.
+    pub fn is_degenerated(&self) -> bool {
+        let n_entries = self.table16.len();
+        let mut zeros = 0usize;
+        let mut poles = 0usize;
+        for &v in &self.table16 {
+            if v == 0x0000 {
+                zeros += 1;
+            }
+            if v == 0xffff {
+                poles += 1;
+            }
+        }
+        if zeros == 1 && poles == 1 {
+            return false; // For linear tables
+        }
+        if zeros > (n_entries / 20) {
+            return true; // Degenerated, many zeros
+        }
+        if poles > (n_entries / 20) {
+            return true; // Degenerated, many poles
+        }
+        false
     }
 
     /// lcms2 `cmsIsToneCurveMonotonic` (cmsgamma.c:1347-1390): monotone in the

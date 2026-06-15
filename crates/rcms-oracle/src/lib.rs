@@ -519,6 +519,30 @@ pub fn do_transform_packed_default_8(
     )
 }
 
+/// Like [`do_transform_packed`] but builds the transform with lcms2's **DEFAULT**
+/// optimizer enabled (`cmsCreateExtendedTransform(.., /*flags*/ 0)` + the full
+/// optimizer chain: `OptimizeByJoiningCurves` / `OptimizeMatrixShaper` /
+/// `OptimizeByComputingLinearization` / `OptimizeByResampling`). This is the
+/// reference for rcms's `OptimizationStrategy::Lcms2Compat` over arbitrary
+/// formats (8/16-bit, any device colorspace) — the `_8`/`_16` siblings are
+/// historical aliases that call the SAME flags-0 C entry.
+#[allow(clippy::too_many_arguments)]
+pub fn do_transform_packed_default(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    do_transform_packed_default_impl(
+        profiles, intents, bpc, adaptation, in_fmt, out_fmt, input, output, n_pixels, false,
+    )
+}
+
 /// 16-bit-output sibling of [`do_transform_packed_default_8`]; see its docs.
 #[allow(clippy::too_many_arguments)]
 pub fn do_transform_packed_default_16(

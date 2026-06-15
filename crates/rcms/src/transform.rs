@@ -374,7 +374,11 @@ impl Transform {
         let mut xform = Transform::new(profiles, intents, bpc, adaptation, flags)?;
         xform.formatters = Some(select_formatters(in_fmt, out_fmt, flags)?);
         xform.strategy = strategy;
-        xform.opt_eval = strategy.build(&xform.lut, in_fmt, out_fmt);
+        // lcms2 passes the LAST intent to `_cmsOptimizePipeline`
+        // (cmsxform.c:1145,1210 `LastIntent`); rcms stores it as
+        // `rendering_intent`.
+        let intent = xform.rendering_intent.to_raw();
+        xform.opt_eval = strategy.build(&xform.lut, in_fmt, out_fmt, intent);
         Ok(xform)
     }
 
@@ -463,6 +467,19 @@ impl Transform {
     /// matrix-shaper pattern matched).
     pub fn matshaper_fired(&self) -> bool {
         matches!(self.opt_eval, OptimizedEval::MatShaper(_))
+    }
+
+    /// A label naming which lcms2 optimizer produced the installed 16-bit eval —
+    /// for diagnostics in the differential tests. One of `"pipeline"`,
+    /// `"matshaper"`, `"curves"` (`OptimizeByJoiningCurves`), or `"baked"`
+    /// (`OptimizeByComputingLinearization` / `OptimizeByResampling`).
+    pub fn opt_path_label(&self) -> &'static str {
+        match &self.opt_eval {
+            OptimizedEval::Pipeline => "pipeline",
+            OptimizedEval::MatShaper(_) => "matshaper",
+            OptimizedEval::Curves(_) => "curves",
+            OptimizedEval::Baked(_) => "baked",
+        }
     }
 
     /// Convenience 2-profile constructor (lcms2 `cmsCreateTransform`, which routes
@@ -633,6 +650,16 @@ impl Transform {
                     OptimizedEval::MatShaper(data) => {
                         let res = data.eval(&[win[0], win[1], win[2]]);
                         wout[..3].copy_from_slice(&res);
+                    }
+                    // lcms2 `FastEvaluateCurves8/16` / `FastIdentity16`
+                    // (OptimizeByJoiningCurves).
+                    OptimizedEval::Curves(c) => {
+                        c.eval(&win[..in_ch], &mut wout[..out_ch]);
+                    }
+                    // lcms2 `PrelinEval16` / `PrelinEval8` (the baked CLUT from
+                    // OptimizeByComputingLinearization / OptimizeByResampling).
+                    OptimizedEval::Baked(b) => {
+                        b.eval(&win[..in_ch], &mut wout[..out_ch]);
                     }
                     // The accurate in-place pipeline eval.
                     OptimizedEval::Pipeline => {
