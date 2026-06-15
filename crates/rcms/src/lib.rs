@@ -7,6 +7,7 @@
 //! always compiles. The full module set / prelude is assembled by the final task.
 
 pub mod adapt;
+pub mod cam02;
 pub mod color;
 pub mod compat;
 pub mod context;

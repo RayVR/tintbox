@@ -2422,3 +2422,45 @@ int rcms_oracle_detect_destination_black_point(const uint8_t* bytes, uint32_t le
     cmsCloseProfile(h);
     return ok ? 1 : 0;
 }
+
+// ==== slice9-cam02 ====
+/* CIECAM02 appearance model (cmscam02.c). The model handle is opaque; the Rust
+   side never dereferences it. Init takes the viewing conditions as 7 doubles
+   (whitepoint X,Y,Z, Yb, La, D_value) plus the surround as a u32; Forward maps
+   XYZ[3] -> JCh[3]; Reverse maps JCh[3] -> XYZ[3]; Done frees the handle. */
+
+void* rcms_oracle_cam02_init(double wp_x, double wp_y, double wp_z,
+                             double yb, double la, unsigned int surround,
+                             double d_value) {
+    cmsViewingConditions vc;
+    vc.whitePoint.X = wp_x;
+    vc.whitePoint.Y = wp_y;
+    vc.whitePoint.Z = wp_z;
+    vc.Yb = yb;
+    vc.La = la;
+    vc.surround = surround;
+    vc.D_value = d_value;
+    return (void*) cmsCIECAM02Init(NULL, &vc);
+}
+
+void rcms_oracle_cam02_forward(void* h, const double* xyz /* [3] */,
+                               double* jch /* [3] */) {
+    cmsCIEXYZ in;
+    cmsJCh out;
+    in.X = xyz[0]; in.Y = xyz[1]; in.Z = xyz[2];
+    cmsCIECAM02Forward((cmsHANDLE) h, &in, &out);
+    jch[0] = out.J; jch[1] = out.C; jch[2] = out.h;
+}
+
+void rcms_oracle_cam02_reverse(void* h, const double* jch /* [3] */,
+                               double* xyz /* [3] */) {
+    cmsJCh in;
+    cmsCIEXYZ out;
+    in.J = jch[0]; in.C = jch[1]; in.h = jch[2];
+    cmsCIECAM02Reverse((cmsHANDLE) h, &in, &out);
+    xyz[0] = out.X; xyz[1] = out.Y; xyz[2] = out.Z;
+}
+
+void rcms_oracle_cam02_done(void* h) {
+    cmsCIECAM02Done((cmsHANDLE) h);
+}

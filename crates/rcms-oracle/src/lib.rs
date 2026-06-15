@@ -525,6 +525,20 @@ unsafe extern "C" {
         flags: u32,
         out: *mut f64,
     ) -> i32;
+
+    // ==== slice9-cam02 ====
+    fn rcms_oracle_cam02_init(
+        wp_x: f64,
+        wp_y: f64,
+        wp_z: f64,
+        yb: f64,
+        la: f64,
+        surround: u32,
+        d_value: f64,
+    ) -> *mut core::ffi::c_void;
+    fn rcms_oracle_cam02_forward(h: *mut core::ffi::c_void, xyz: *const f64, jch: *mut f64);
+    fn rcms_oracle_cam02_reverse(h: *mut core::ffi::c_void, jch: *const f64, xyz: *mut f64);
+    fn rcms_oracle_cam02_done(h: *mut core::ffi::c_void);
 }
 
 /// lcms2 `cmsDetectBlackPoint` over a profile loaded from `bytes` at `intent` +
@@ -3258,5 +3272,67 @@ mod transcendental_probe {
             log10_stats.mismatches,
             log10_stats.total
         );
+    }
+}
+
+// ==== slice9-cam02 ====
+
+/// An lcms2 CIECAM02 model handle (`cmsHANDLE` from `cmsCIECAM02Init`). Owns the
+/// underlying allocation; freed via `cmsCIECAM02Done` on `Drop`.
+pub struct OracleCam02 {
+    handle: *mut core::ffi::c_void,
+}
+
+impl OracleCam02 {
+    /// Initialize an lcms2 CIECAM02 model. `surround` is one of `AVG_SURROUND` …
+    /// `CUTSHEET_SURROUND`; pass `d_value = -1.0` for `D_CALCULATE`.
+    pub fn new(
+        white_point: [f64; 3],
+        yb: f64,
+        la: f64,
+        surround: u32,
+        d_value: f64,
+    ) -> OracleCam02 {
+        // SAFETY: all arguments are plain scalars passed by value; lcms2 copies
+        // them into a heap-allocated model and returns its pointer (or null on
+        // OOM, which does not occur for these tiny allocations under test).
+        let handle = unsafe {
+            rcms_oracle_cam02_init(
+                white_point[0],
+                white_point[1],
+                white_point[2],
+                yb,
+                la,
+                surround,
+                d_value,
+            )
+        };
+        OracleCam02 { handle }
+    }
+
+    /// lcms2 `cmsCIECAM02Forward`: XYZ → (J, C, h).
+    pub fn forward(&self, xyz: [f64; 3]) -> [f64; 3] {
+        let mut out = [0.0f64; 3];
+        // SAFETY: `handle` is a live model from `new`; `xyz` is a readable [3]
+        // the C only reads, and `out` is a writable [3] the C fills.
+        unsafe { rcms_oracle_cam02_forward(self.handle, xyz.as_ptr(), out.as_mut_ptr()) };
+        out
+    }
+
+    /// lcms2 `cmsCIECAM02Reverse`: (J, C, h) → XYZ.
+    pub fn reverse(&self, jch: [f64; 3]) -> [f64; 3] {
+        let mut out = [0.0f64; 3];
+        // SAFETY: `handle` is a live model from `new`; `jch` is a readable [3]
+        // the C only reads, and `out` is a writable [3] the C fills.
+        unsafe { rcms_oracle_cam02_reverse(self.handle, jch.as_ptr(), out.as_mut_ptr()) };
+        out
+    }
+}
+
+impl Drop for OracleCam02 {
+    fn drop(&mut self) {
+        // SAFETY: `handle` came from `cmsCIECAM02Init` and is freed exactly once
+        // here. lcms2's `cmsCIECAM02Done` tolerates a null handle.
+        unsafe { rcms_oracle_cam02_done(self.handle) };
     }
 }
