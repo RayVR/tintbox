@@ -38,8 +38,10 @@ pub mod prelude {
     pub use crate::color::{CIELCh, CIELab, CIEXYZTriple, CIExyY, CIExyYTriple, JCh, CIEXYZ};
     pub use crate::context::{Context, Logger};
     pub use crate::curve::{
-        build_gamma, build_parametric, build_segmented, build_tabulated_16, build_tabulated_float,
-        eval_parametric, reverse_tone_curve, reverse_tone_curve_ex, CurveSegment, ToneCurve,
+        build_gamma, build_parametric, build_parametric_in, build_segmented, build_segmented_in,
+        build_tabulated_16, build_tabulated_float, eval_parametric, eval_parametric_in,
+        parametric_param_count_in, reverse_tone_curve, reverse_tone_curve_ex,
+        reverse_tone_curve_ex_in, reverse_tone_curve_in, CurveSegment, ToneCurve,
     };
     pub use crate::error::{Error, Result};
     pub use crate::fixed::{Half, S15Fixed16, U16Fixed16, U8Fixed8};

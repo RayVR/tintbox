@@ -17,6 +17,7 @@ pub use interp::{lin_lerp_16, lin_lerp_1d_float};
 pub use parametric::eval_parametric;
 
 use crate::compat::floor::{FloorStrategy, Lcms2Floor};
+use crate::context::Context;
 
 /// lcms2 `MINUS_INF` (cmsgamma.c:41): the *float* literal `-1E22F`.
 const MINUS_INF: f32 = -1E22_f32;
@@ -24,8 +25,10 @@ const MINUS_INF: f32 = -1E22_f32;
 const PLUS_INF: f32 = 1E22_f32;
 
 /// lcms2 `DefaultCurves.ParameterCount` (cmsgamma.c:64): coefficient count per
-/// ICC parametric type. Forward and inverse share the count. Returns `None` for
-/// any type lcms2's `GetParametricCurveByType` does not recognise.
+/// ICC *builtin* parametric type. Forward and inverse share the count. Returns
+/// `None` for any type lcms2's builtin `GetParametricCurveByType` does not
+/// recognise (a custom plugin may still service it — see
+/// [`parametric_param_count_in`]).
 fn parametric_param_count(ty: i32) -> Option<usize> {
     Some(match ty.abs() {
         1 => 1,
@@ -40,6 +43,62 @@ fn parametric_param_count(ty: i32) -> Option<usize> {
         109 => 1,
         _ => return None,
     })
+}
+
+/// Find a registered [`ParametricCurvePlugin`](crate::plugin::ParametricCurvePlugin)
+/// servicing `ty` (or its inverse `-ty`), consulting the registry in
+/// register-order (first match wins). Returns `None` when `ty` is a builtin id
+/// (builtins are matched FIRST — a plugin can never shadow a builtin type) or
+/// when no plugin services it.
+///
+/// Mirrors lcms2's `GetParametricCurveByType` plugin walk, but with the
+/// builtin-wins guard rcms enforces.
+fn find_parametric_plugin<'a>(
+    ctx: &'a Context,
+    ty: i32,
+) -> Option<&'a dyn crate::plugin::ParametricCurvePlugin> {
+    // Builtins win: a plugin can never occupy a builtin id (forward or inverse).
+    if parametric_param_count(ty).is_some() {
+        return None;
+    }
+    for plugin in &ctx.plugins().parametric_curves {
+        // lcms2 stores forward and inverse types as separate (signed) entries in
+        // `Curves[]`; a plugin services an id iff it lists that exact id. So the
+        // inverse `-ty` is only resolvable when the plugin explicitly registers
+        // `-ty` (callers reverse-dispatch with the negated id).
+        if plugin.function_types().contains(&ty) {
+            return Some(plugin.as_ref());
+        }
+    }
+    None
+}
+
+/// Context-aware coefficient count: a builtin type resolves via
+/// [`parametric_param_count`]; otherwise a registered plugin that lists exactly
+/// `ty` supplies the count. Returns `None` when neither knows `ty`.
+pub fn parametric_param_count_in(ctx: &Context, ty: i32) -> Option<usize> {
+    if let Some(n) = parametric_param_count(ty) {
+        return Some(n);
+    }
+    find_parametric_plugin(ctx, ty).map(|p| p.parameter_count(ty))
+}
+
+/// Context-aware parametric evaluation. Builtins are tried FIRST (so a plugin can
+/// never shadow ICC types `1..=8`/`108`/`109` or their inverses); only an
+/// otherwise-unsupported `ty` consults the registered
+/// [`ParametricCurvePlugin`](crate::plugin::ParametricCurvePlugin)s in
+/// register-order. An unknown `ty` with no plugin returns `0.0`, exactly as the
+/// builtin [`eval_parametric`] does.
+pub fn eval_parametric_in(ctx: &Context, curve_type: i32, params: &[f64; 10], r: f64) -> f64 {
+    // Builtins win.
+    if parametric_param_count(curve_type).is_some() {
+        return eval_parametric(curve_type, params, r);
+    }
+    if let Some(plugin) = find_parametric_plugin(ctx, curve_type) {
+        return plugin.eval(curve_type, params, r);
+    }
+    // Unknown type, no plugin: mirror the builtin `_ => 0.0` arm.
+    0.0
 }
 
 /// One segment of a segmented tone curve (lcms2 `cmsCurveSegment`).
@@ -143,7 +202,14 @@ pub fn build_tabulated_float(table: &[f32]) -> Option<ToneCurve> {
 /// Returns `None` when lcms2 would reject the type (unknown) or `params` is too
 /// short for the type's coefficient count.
 pub fn build_parametric(curve_type: i32, params: &[f64]) -> Option<ToneCurve> {
-    let n = parametric_param_count(curve_type)?;
+    build_parametric_in(&Context::new(), curve_type, params)
+}
+
+/// Context-aware [`build_parametric`]: the coefficient count and the materialised
+/// 16-bit table both resolve through the [`Context`]'s parametric-curve registry
+/// (builtins first), so a custom function type produces its plugin-defined table.
+pub fn build_parametric_in(ctx: &Context, curve_type: i32, params: &[f64]) -> Option<ToneCurve> {
+    let n = parametric_param_count_in(ctx, curve_type)?;
     if params.len() < n {
         return None;
     }
@@ -158,7 +224,7 @@ pub fn build_parametric(curve_type: i32, params: &[f64]) -> Option<ToneCurve> {
         params: p,
         sampled: Vec::new(),
     };
-    Some(build_segmented(vec![seg]))
+    Some(build_segmented_in(ctx, vec![seg]))
 }
 
 /// Build a gamma curve.
@@ -176,6 +242,13 @@ pub fn build_gamma(gamma: f64) -> ToneCurve {
 /// gamma-1.0 identity. Each entry `i` is `EvalSegmentedFn(i/(n-1))` quantised by
 /// `_cmsQuickSaturateWord(Val * 65535.0)`.
 pub fn build_segmented(segments: Vec<CurveSegment>) -> ToneCurve {
+    build_segmented_in(&Context::new(), segments)
+}
+
+/// Context-aware [`build_segmented`]: the 16-bit table is materialised through
+/// the [`Context`]-aware segmented evaluator, so any custom parametric segment
+/// uses its registered plugin (builtins still win).
+pub fn build_segmented_in(ctx: &Context, segments: Vec<CurveSegment>) -> ToneCurve {
     let mut n_grid_points: u32 = 4096;
 
     // Optimization for identity curves.
@@ -190,7 +263,7 @@ pub fn build_segmented(segments: Vec<CurveSegment>) -> ToneCurve {
 
     for i in 0..n_grid_points {
         let r = i as f64 / (n_grid_points - 1) as f64;
-        let val = curve.eval_segmented(r);
+        let val = curve.eval_segmented_in(ctx, r);
         // Round and saturate: _cmsQuickSaturateWord(Val * 65535.0).
         curve.table16[i as usize] = Lcms2Floor::quick_saturate_word(val * 65535.0);
     }
@@ -234,6 +307,14 @@ impl ToneCurve {
     /// otherwise the parametric evaluator). An infinite result clamps to `±1E22`.
     /// Returns `MINUS_INF` when no segment matches.
     pub fn eval_segmented(&self, r: f64) -> f64 {
+        self.eval_segmented_in(&Context::new(), r)
+    }
+
+    /// Context-aware [`eval_segmented`](Self::eval_segmented): parametric segments
+    /// route through [`eval_parametric_in`], so custom function types use their
+    /// registered plugin (builtins still win). With an empty [`Context`] this is
+    /// byte-for-byte the builtin path.
+    pub fn eval_segmented_in(&self, ctx: &Context, r: f64) -> f64 {
         for seg in self.segments.iter().rev() {
             // Check for domain: (R > x0) && (R <= x1).
             if r > seg.x0 as f64 && r <= seg.x1 as f64 {
@@ -244,7 +325,7 @@ impl ToneCurve {
                     let domain = (seg.sampled.len() - 1) as u32;
                     lin_lerp_1d_float(r1, &seg.sampled, domain) as f64
                 } else {
-                    eval_parametric(seg.seg_type, &seg.params, r)
+                    eval_parametric_in(ctx, seg.seg_type, &seg.params, r)
                 };
 
                 // cmsgamma.c:752-758: `if (isinf(Out)) return PLUS_INF;` — C's
@@ -266,12 +347,21 @@ impl ToneCurve {
     /// table; otherwise the segmented description is evaluated directly (the f32
     /// input widens to f64 for [`eval_segmented`], then the result narrows to f32).
     pub fn eval_float(&self, v: f32) -> f32 {
+        self.eval_float_in(&Context::new(), v)
+    }
+
+    /// Context-aware [`eval_float`](Self::eval_float): a segmented curve carrying
+    /// a custom parametric type is evaluated through [`eval_segmented_in`], so the
+    /// plugin's formula is used. A pure tabulated curve is context-independent
+    /// (it round-trips the already-materialised table). With an empty [`Context`]
+    /// this is byte-for-byte the builtin path.
+    pub fn eval_float_in(&self, ctx: &Context, v: f32) -> f32 {
         if self.segments.is_empty() {
             let in_ = Lcms2Floor::quick_saturate_word(v as f64 * 65535.0);
             let out = self.eval_16(in_);
             (out as f64 / 65535.0) as f32
         } else {
-            self.eval_segmented(v as f64) as f32
+            self.eval_segmented_in(ctx, v as f64) as f32
         }
     }
 
@@ -429,6 +519,11 @@ pub fn reverse_tone_curve(curve: &ToneCurve) -> ToneCurve {
     reverse_tone_curve_ex(4096, curve)
 }
 
+/// Context-aware [`reverse_tone_curve`].
+pub fn reverse_tone_curve_in(ctx: &Context, curve: &ToneCurve) -> ToneCurve {
+    reverse_tone_curve_ex_in(ctx, 4096, curve)
+}
+
 /// lcms2 `cmsReverseToneCurveEx` (cmsgamma.c:1070-1134).
 ///
 /// If the curve is a single parametric segment of a recognised type, the inverse
@@ -440,15 +535,37 @@ pub fn reverse_tone_curve(curve: &ToneCurve) -> ToneCurve {
 /// # Panics
 /// Panics if `n_result_samples < 2` (lcms2 divides by `n - 1`).
 pub fn reverse_tone_curve_ex(n_result_samples: u32, curve: &ToneCurve) -> ToneCurve {
-    // Analytic reversal whenever possible: one parametric segment of a known type.
-    if curve.segments.len() == 1
-        && curve.segments[0].seg_type > 0
-        && parametric_param_count(curve.segments[0].seg_type).is_some()
-    {
+    reverse_tone_curve_ex_in(&Context::new(), n_result_samples, curve)
+}
+
+/// Context-aware [`reverse_tone_curve_ex`].
+///
+/// Analytic reversal is attempted for a single parametric segment whose inverse
+/// is known — a builtin type, OR a custom forward type whose plugin ALSO
+/// registers the inverse `-type`. A custom forward type with NO registered
+/// inverse falls through to NUMERIC table reversal (never producing the `0.0`
+/// the bare `eval_parametric_in(-type)` would yield).
+pub fn reverse_tone_curve_ex_in(
+    ctx: &Context,
+    n_result_samples: u32,
+    curve: &ToneCurve,
+) -> ToneCurve {
+    // Analytic reversal whenever possible: one parametric segment whose inverse
+    // is resolvable. For builtins that is `parametric_param_count(type)`; for a
+    // custom forward type the inverse must be a SEPARATELY registered `-type`
+    // plugin — otherwise we must fall back to numeric reversal below.
+    if curve.segments.len() == 1 && curve.segments[0].seg_type > 0 {
         let seg = &curve.segments[0];
-        if let Some(c) = build_parametric(-seg.seg_type, &seg.params) {
-            return c;
+        let inv_ty = -seg.seg_type;
+        let inverse_known = parametric_param_count(seg.seg_type).is_some()
+            || find_parametric_plugin(ctx, inv_ty).is_some();
+        if inverse_known {
+            if let Some(c) = build_parametric_in(ctx, inv_ty, &seg.params) {
+                return c;
+            }
         }
+        // else: custom forward type without a registered inverse — fall through
+        // to numeric table reversal rather than emitting a 0.0 curve.
     }
 
     // Numeric reversal of the table.
@@ -502,4 +619,173 @@ pub fn reverse_tone_curve_ex(n_result_samples: u32, curve: &ToneCurve) -> ToneCu
 fn quantize_val(i: f64, max_samples: u32) -> u16 {
     let x = (i * 65535.0) / (max_samples - 1) as f64;
     Lcms2Floor::quick_saturate_word(x)
+}
+
+#[cfg(test)]
+mod plugin_dispatch_tests {
+    use super::*;
+    use crate::plugin::ParametricCurvePlugin;
+    use std::sync::Arc;
+
+    /// A plugin servicing a NEW forward type id (200): `Y = X^gamma`, i.e. a
+    /// re-implementation of the builtin type-1 formula under an unused id. No
+    /// inverse registered.
+    struct Pow200;
+    impl ParametricCurvePlugin for Pow200 {
+        fn function_types(&self) -> &[i32] {
+            &[200]
+        }
+        fn parameter_count(&self, _ty: i32) -> usize {
+            1
+        }
+        fn eval(&self, _ty: i32, params: &[f64; 10], r: f64) -> f64 {
+            // Mirror builtin type 1 exactly (cmsgamma.c type 1).
+            if r < 0.0 {
+                if (params[0] - 1.0).abs() < MATRIX_DET_TOLERANCE_TEST {
+                    r
+                } else {
+                    0.0
+                }
+            } else {
+                r.powf(params[0])
+            }
+        }
+    }
+    const MATRIX_DET_TOLERANCE_TEST: f64 = 0.0001;
+
+    fn ctx_with_pow200() -> Context<'static> {
+        let mut ctx = Context::new();
+        ctx.register_parametric_curve(Arc::new(Pow200));
+        ctx
+    }
+
+    #[test]
+    fn custom_type_param_count_resolves_via_plugin() {
+        let ctx = ctx_with_pow200();
+        // Builtin path does not know 200.
+        assert_eq!(parametric_param_count(200), None);
+        // Context-aware path resolves the count from the plugin.
+        assert_eq!(parametric_param_count_in(&ctx, 200), Some(1));
+        // An empty context still does not know 200.
+        assert_eq!(parametric_param_count_in(&Context::new(), 200), None);
+    }
+
+    #[test]
+    fn custom_type_eval_follows_plugin_formula() {
+        let ctx = ctx_with_pow200();
+        let mut p = [0.0f64; 10];
+        p[0] = 2.2;
+        // Custom formula: r^2.2.
+        for &r in &[0.0, 0.25, 0.5, 0.75, 1.0] {
+            let got = eval_parametric_in(&ctx, 200, &p, r);
+            assert_eq!(got, r.powf(2.2));
+        }
+        // Without the plugin: unknown type → 0.0 (mirrors builtin `_` arm).
+        assert_eq!(eval_parametric_in(&Context::new(), 200, &p, 0.5), 0.0);
+    }
+
+    #[test]
+    fn build_parametric_in_materializes_custom_curve() {
+        let ctx = ctx_with_pow200();
+        let curve = build_parametric_in(&ctx, 200, &[2.2]).expect("custom type builds");
+        // eval_float over the materialised table should follow r^2.2 (within the
+        // 16-bit table's resolution).
+        for &r in &[0.1f32, 0.5, 0.9] {
+            let expected = (r as f64).powf(2.2) as f32;
+            // eval_float_in routes the custom segment through the plugin.
+            let got = curve.eval_float_in(&ctx, r);
+            assert!(
+                (got - expected).abs() < 1.0 / 256.0,
+                "r={r}: got {got}, expected {expected}"
+            );
+            // The materialised table16 (built with ctx) also follows the formula.
+            let got16 = curve.eval_16(Lcms2Floor::quick_saturate_word(r as f64 * 65535.0));
+            assert!(
+                (got16 as f64 / 65535.0 - expected as f64).abs() < 1.0 / 256.0,
+                "table16 r={r}: got {got16}"
+            );
+        }
+        // Legacy no-ctx build cannot service type 200.
+        assert!(build_parametric(200, &[2.2]).is_none());
+    }
+
+    /// Differential bonus: a plugin re-implementing the builtin type-1 formula
+    /// under a NEW id (200) must produce a BYTE-IDENTICAL `table16` to the
+    /// builtin type-1 curve — proving the custom evaluator path matches the
+    /// known-good builtin path bit-for-bit.
+    #[test]
+    fn custom_reimpl_of_type1_is_byte_identical() {
+        let ctx = ctx_with_pow200();
+        let builtin = build_parametric(1, &[2.4]).expect("builtin type 1");
+        let custom = build_parametric_in(&ctx, 200, &[2.4]).expect("custom type 200");
+        // The builtin type-1 single-segment curve uses the gamma!=1.0 grid of
+        // 4096 points; the custom curve (seg_type 200) also uses 4096 (it is not
+        // the seg_type==1 identity special case). Tables must match byte-for-byte.
+        assert_eq!(custom.table16(), builtin.table16());
+    }
+
+    #[test]
+    fn builtins_cannot_be_shadowed() {
+        // A plugin claiming builtin type 1 must NEVER be consulted; the builtin
+        // wins. Register a plugin that would return a bogus value for type 1.
+        struct Bogus1;
+        impl ParametricCurvePlugin for Bogus1 {
+            fn function_types(&self) -> &[i32] {
+                &[1]
+            }
+            fn parameter_count(&self, _ty: i32) -> usize {
+                9
+            }
+            fn eval(&self, _ty: i32, _params: &[f64; 10], _r: f64) -> f64 {
+                -999.0
+            }
+        }
+        let mut ctx = Context::new();
+        ctx.register_parametric_curve(Arc::new(Bogus1));
+        // Param count: builtin (1), not the plugin's bogus 9.
+        assert_eq!(parametric_param_count_in(&ctx, 1), Some(1));
+        // Eval: builtin r^gamma, not -999.0.
+        let mut p = [0.0f64; 10];
+        p[0] = 2.0;
+        assert_eq!(eval_parametric_in(&ctx, 1, &p, 0.5), 0.5f64.powf(2.0));
+        // find_parametric_plugin refuses to surface a plugin for a builtin id.
+        assert!(find_parametric_plugin(&ctx, 1).is_none());
+    }
+
+    #[test]
+    fn custom_forward_without_inverse_falls_back_to_numeric() {
+        // Pow200 registers only the forward type 200 (no -200). Reversing such a
+        // curve must NOT analytically build `-200` (which would eval to 0.0);
+        // it must fall back to NUMERIC table reversal.
+        let ctx = ctx_with_pow200();
+        let curve = build_parametric_in(&ctx, 200, &[2.2]).expect("custom builds");
+        let rev = reverse_tone_curve_ex_in(&ctx, 4096, &curve);
+
+        // A numeric reversal of a monotone increasing r^2.2 is a sane increasing
+        // curve from ~0 to ~65535 — definitely NOT the all-zero table the bare
+        // `eval_parametric_in(-200)` (returns 0.0) would have produced.
+        assert!(rev.table16().iter().any(|&v| v > 0));
+        assert!(*rev.table16().last().unwrap() > 60000);
+        // Monotone non-decreasing.
+        assert!(rev.table16().windows(2).all(|w| w[0] <= w[1]));
+
+        // PROOF the fallback used the NUMERIC path: custom-200(g=2.2).table16 is
+        // byte-identical to builtin-1(g=2.2).table16 (the byte-identical test
+        // proves this for g=2.4; same construction for g=2.2), so reversing the
+        // custom curve numerically must equal reversing a TABULATED copy of the
+        // builtin curve (which forces the numeric path too, since it has no
+        // parametric segment).
+        let builtin = build_parametric(1, &[2.2]).unwrap();
+        assert_eq!(curve.table16(), builtin.table16());
+        let tabulated_builtin = build_tabulated_16(builtin.table16());
+        let rev_numeric = reverse_tone_curve_ex(4096, &tabulated_builtin);
+        assert_eq!(rev.table16(), rev_numeric.table16());
+
+        // Reversing the builtin type-1 curve directly stays ANALYTIC (single
+        // parametric segment of a known type) and is unaffected by the registry.
+        let rev_builtin = reverse_tone_curve_ex_in(&ctx, 4096, &builtin);
+        assert_eq!(rev_builtin, reverse_tone_curve_ex(4096, &builtin));
+        // The analytic and numeric reversals differ (proving 200 took numeric).
+        assert_ne!(rev_builtin.table16(), rev.table16());
+    }
 }
