@@ -20,4 +20,9 @@ file-io = ["std"]
 native-floor = []
 
 [dev-dependencies]
+criterion = "0.8.2"
 tintbox-oracle = { path = "../tintbox-oracle" }
+
+[[bench]]
+name = "transform"
+harness = false
