@@ -1234,6 +1234,78 @@ int rcms_oracle_pipeline_clut_curves_matrix_eval_float(
     return 1;
 }
 
+/* ---- cmsPipelineCat / cmsPipelineInsertStage(AT_BEGIN) (slice 5 task 0) -----
+   Exercise the pipeline-construction API that transform building relies on. */
+
+/* Build pipeline A = [ ToneCurves(3, tblLen) -> Matrix(3x3, matA[,offA]) ] and
+   pipeline B = [ CLut16(3->3, grid/clutTable) ], then cmsPipelineCat(A, B) and
+   evaluate `in` (3 f32) via cmsPipelineEvalFloat, writing 3 f32 to `out`. This
+   mirrors the rcms `a.concat(&b)` test: A is 3->3, B is 3->3, so the cat chains
+   3==3 and the result is 3->3. Returns 1 on success, 0 on any allocation /
+   insert / cat failure. */
+int rcms_oracle_pipeline_cat_eval_float(
+        uint32_t tblLen, const uint16_t* curveTables,
+        const double* matA, const double* offA,
+        const uint32_t* grid, const uint16_t* clutTable,
+        const float* in, float* out) {
+    cmsPipeline* A = cmsPipelineAlloc(NULL, 3, 3);
+    cmsPipeline* B = cmsPipelineAlloc(NULL, 3, 3);
+    if (!A || !B) { if (A) cmsPipelineFree(A); if (B) cmsPipelineFree(B); return 0; }
+
+    cmsStage* curves = build_curves_stage(3, tblLen, curveTables);
+    cmsStage* mat = curves ? cmsStageAllocMatrix(NULL, 3, 3, matA, offA) : NULL;
+    cmsStage* clut = mat ? cmsStageAllocCLut16bitGranular(NULL, grid, 3, 3, clutTable) : NULL;
+    if (!curves || !mat || !clut) {
+        if (curves) cmsStageFree(curves);
+        if (mat) cmsStageFree(mat);
+        if (clut) cmsStageFree(clut);
+        cmsPipelineFree(A); cmsPipelineFree(B);
+        return 0;
+    }
+
+    int ok = 0;
+    if (cmsPipelineInsertStage(A, cmsAT_END, curves) &&
+        cmsPipelineInsertStage(A, cmsAT_END, mat) &&
+        cmsPipelineInsertStage(B, cmsAT_END, clut) &&
+        cmsPipelineCat(A, B)) {
+        cmsPipelineEvalFloat(in, out, A);
+        ok = 1;
+    }
+    cmsPipelineFree(A);
+    cmsPipelineFree(B);
+    return ok;
+}
+
+/* Build pipeline P = [ ToneCurves(3, tblLen) ] then prepend a 3x3 Matrix stage
+   via cmsPipelineInsertStage(P, cmsAT_BEGIN, mat). The result is
+   [ Matrix -> ToneCurves ]. Evaluate `in` (3 f32) via cmsPipelineEvalFloat into
+   `out` (3 f32). Mirrors rcms `p.prepend_stage(matrix)`. Returns 1/0. */
+int rcms_oracle_pipeline_prepend_eval_float(
+        uint32_t tblLen, const uint16_t* curveTables,
+        const double* matA, const double* offA,
+        const float* in, float* out) {
+    cmsPipeline* P = cmsPipelineAlloc(NULL, 3, 3);
+    if (!P) return 0;
+
+    cmsStage* curves = build_curves_stage(3, tblLen, curveTables);
+    cmsStage* mat = curves ? cmsStageAllocMatrix(NULL, 3, 3, matA, offA) : NULL;
+    if (!curves || !mat) {
+        if (curves) cmsStageFree(curves);
+        if (mat) cmsStageFree(mat);
+        cmsPipelineFree(P);
+        return 0;
+    }
+
+    int ok = 0;
+    if (cmsPipelineInsertStage(P, cmsAT_END, curves) &&
+        cmsPipelineInsertStage(P, cmsAT_BEGIN, mat)) {
+        cmsPipelineEvalFloat(in, out, P);
+        ok = 1;
+    }
+    cmsPipelineFree(P);
+    return ok;
+}
+
 /* ---- LUT8 / LUT16 tag readers (Type_LUT8_Read / Type_LUT16_Read) -----------
    cmsReadTag of an mft1/mft2 tag returns a cmsPipeline*. These extractors let
    the differential test build the SAME pipeline lcms2 builds and evaluate input

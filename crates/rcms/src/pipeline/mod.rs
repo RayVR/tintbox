@@ -62,6 +62,97 @@ impl Pipeline {
         Ok(())
     }
 
+    /// Prepend a stage at the beginning (lcms2 `cmsPipelineInsertStage` with
+    /// `cmsAT_BEGIN`, cmslut.c:1529-1532, followed by `BlessLUT`). After
+    /// prepending, `BlessLUT` (cmslut.c:1306-1307) sets `input_channels` to the
+    /// new first stage's input width and validates the chain: the new stage's
+    /// **output** width must equal the old first stage's input width. With no
+    /// existing stages the new stage simply becomes both first and last, so
+    /// `BlessLUT` sets `input_channels`/`output_channels` from it (no junction to
+    /// check). lcms2 returns FALSE on a chain mismatch; we return
+    /// [`Error::Corrupt`].
+    pub fn prepend_stage(&mut self, s: Stage) -> Result<()> {
+        if s.input_channels() > MAX_STAGE_CHANNELS || s.output_channels() > MAX_STAGE_CHANNELS {
+            return Err(Error::Unsupported("stage exceeds MAX_STAGE_CHANNELS"));
+        }
+        // BlessLUT's chain check at the junction with the (old) first stage:
+        // next->InputChannels (old first) must equal prev->OutputChannels (new).
+        if let Some(first) = self.stages.first() {
+            if first.input_channels() != s.output_channels() {
+                return Err(Error::Corrupt(
+                    "prepended stage output width does not chain with the first stage",
+                ));
+            }
+        }
+        // BlessLUT sets InputChannels = First->InputChannels (the new stage);
+        // OutputChannels = Last->OutputChannels (unchanged: still the old last
+        // stage, or the new stage itself when the pipeline was empty).
+        self.input_channels = s.input_channels();
+        if self.stages.is_empty() {
+            self.output_channels = s.output_channels();
+        }
+        self.stages.insert(0, s);
+        Ok(())
+    }
+
+    /// Concatenate `other` onto `self` (lcms2 `cmsPipelineCat`, cmslut.c:1613).
+    ///
+    /// Duplicates each of `other`'s stages and appends them at the end (each
+    /// append goes through `cmsPipelineInsertStage(.., cmsAT_END, ..)` +
+    /// `BlessLUT`, so the chain is validated stage by stage). Channel-count
+    /// rules transcribed from the C:
+    /// - If **both** pipelines are empty, `self` inherits `other`'s
+    ///   `input_channels` and `output_channels` (cmslut.c:1619-1622).
+    /// - Otherwise each appended stage runs `BlessLUT`, which sets
+    ///   `self.input_channels` to the first stage's input (only changes anything
+    ///   when `self` was empty: it then adopts `other`'s input width) and
+    ///   `self.output_channels` to the last stage's output (i.e. `other`'s
+    ///   output width once all of `other`'s stages are appended).
+    /// - The junction stage (`other`'s first stage) must chain: its input width
+    ///   must equal `self`'s current output width. On mismatch lcms2 returns
+    ///   FALSE; we return [`Error::Corrupt`].
+    pub fn concat(&mut self, other: &Pipeline) -> Result<()> {
+        // Both empty: inherit channel counts (cmslut.c:1619-1622).
+        if self.stages.is_empty() && other.stages.is_empty() {
+            self.input_channels = other.input_channels;
+            self.output_channels = other.output_channels;
+            return Ok(());
+        }
+
+        // When self has no stages, C's first AT_END insert does not check the
+        // stage against l1.InputChannels (BlessLUT only *sets* it from the new
+        // first stage). Adopt other's input width up front so the existing
+        // append's "first stage must match input_channels" check passes for the
+        // junction stage, mirroring BlessLUT's InputChannels = First->Input.
+        if self.stages.is_empty() {
+            self.input_channels = other.input_channels;
+        }
+
+        for stage in &other.stages {
+            // cmsStageDup + cmsPipelineInsertStage(AT_END): the existing
+            // append validates the junction (stage.input == current last
+            // output). We translate insert's Unsupported chain error into
+            // Corrupt to mirror lcms2's BlessLUT returning FALSE for an
+            // inconsistent cat.
+            self.insert_stage_at_end(stage.clone())
+                .map_err(|e| match e {
+                    Error::Unsupported(
+                        "stage input width does not chain with the previous stage",
+                    ) => Error::Corrupt(
+                        "pipeline output width does not chain with concatenated pipeline",
+                    ),
+                    other => other,
+                })?;
+        }
+
+        // After appending all of other's stages, BlessLUT has set
+        // output_channels = last stage's output = other.output_channels. When
+        // self was empty, insert_stage_at_end leaves output_channels at its
+        // original value, so set it explicitly to match BlessLUT.
+        self.output_channels = other.output_channels;
+        Ok(())
+    }
+
     /// Evaluate in the float domain (lcms2 `_LUTevalFloat`, cmslut.c:1355-1374).
     ///
     /// Copies `input_channels` floats into the first ping-pong buffer, walks the

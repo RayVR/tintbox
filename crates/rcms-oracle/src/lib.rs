@@ -322,6 +322,25 @@ unsafe extern "C" {
         input: *const f32,
         out: *mut f32,
     ) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_pipeline_cat_eval_float(
+        tbl_len: u32,
+        curve_tables: *const u16,
+        mat_a: *const f64,
+        off_a: *const f64,
+        grid: *const u32,
+        clut_table: *const u16,
+        input: *const f32,
+        out: *mut f32,
+    ) -> i32;
+    fn rcms_oracle_pipeline_prepend_eval_float(
+        tbl_len: u32,
+        curve_tables: *const u16,
+        mat_a: *const f64,
+        off_a: *const f64,
+        input: *const f32,
+        out: *mut f32,
+    ) -> i32;
     fn rcms_oracle_lut_channels(
         buf: *const u8,
         len: u32,
@@ -957,6 +976,81 @@ pub fn pipeline_clut_curves_matrix_eval_float(
             curve_tables.as_ptr(),
             rows as u32,
             matrix.as_ptr(),
+            off_ptr,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsPipelineCat`: builds A = `[ToneCurves(3, tbl_len) -> Matrix(3x3)]`
+/// and B = `[CLut16(3->3)]`, runs `cmsPipelineCat(A, B)`, then evaluates `input`
+/// (3 f32) through the catenated A via `cmsPipelineEvalFloat`. `curve_tables` is
+/// `3 * tbl_len` u16 (3 contiguous 16-bit tabulated curves); `mat` is 9 row-major
+/// f64; `offset` is 3 f64 or `None`; `grid` is 3 per-axis sample counts; the CLUT
+/// `table` is `grid-product * 3` u16. Returns the 3 f32 outputs, or `None` on any
+/// lcms2 failure.
+#[allow(clippy::too_many_arguments)]
+pub fn pipeline_cat_eval_float(
+    tbl_len: usize,
+    curve_tables: &[u16],
+    mat: &[f64],
+    offset: Option<&[f64]>,
+    grid: &[u32],
+    clut_table: &[u16],
+    input: &[f32],
+) -> Option<[f32; 3]> {
+    let mut out = [0f32; 3];
+    let off_ptr = offset.map_or(core::ptr::null(), |o| o.as_ptr());
+    // SAFETY: `curve_tables` is `3 * tbl_len` readable u16; `mat` is 9 readable
+    // f64; `off_ptr` is null or 3 readable f64; `grid` is 3 readable u32;
+    // `clut_table` is grid-product*3 readable u16; `input` is 3 readable f32;
+    // `out` has 3 f32. C only reads inputs and writes exactly 3 outputs; the two
+    // pipelines and all stages are allocated and freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_pipeline_cat_eval_float(
+            tbl_len as u32,
+            curve_tables.as_ptr(),
+            mat.as_ptr(),
+            off_ptr,
+            grid.as_ptr(),
+            clut_table.as_ptr(),
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsPipelineInsertStage(.., cmsAT_BEGIN, ..)`: builds
+/// `P = [ToneCurves(3, tbl_len)]`, prepends a 3x3 Matrix stage (so the pipeline
+/// becomes `[Matrix -> ToneCurves]`), then evaluates `input` (3 f32) via
+/// `cmsPipelineEvalFloat`. Arguments as `pipeline_cat_eval_float`. Returns the 3
+/// f32 outputs, or `None` on lcms2 failure.
+pub fn pipeline_prepend_eval_float(
+    tbl_len: usize,
+    curve_tables: &[u16],
+    mat: &[f64],
+    offset: Option<&[f64]>,
+    input: &[f32],
+) -> Option<[f32; 3]> {
+    let mut out = [0f32; 3];
+    let off_ptr = offset.map_or(core::ptr::null(), |o| o.as_ptr());
+    // SAFETY: as `pipeline_cat_eval_float`, minus the CLUT inputs.
+    let ok = unsafe {
+        rcms_oracle_pipeline_prepend_eval_float(
+            tbl_len as u32,
+            curve_tables.as_ptr(),
+            mat.as_ptr(),
             off_ptr,
             input.as_ptr(),
             out.as_mut_ptr(),
