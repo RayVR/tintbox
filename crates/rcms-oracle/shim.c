@@ -1782,3 +1782,116 @@ int rcms_oracle_do_transform_packed_copyalpha(const uint8_t* const* bufs, const 
     free(profiles); free(bpcArr); free(intArr); free(adArr);
     return ok;
 }
+
+/* ---- Profile serializer oracle (slice 7 T0) ------------------------------
+   Build a DETERMINISTIC in-memory profile via the public + internal API and
+   serialize it with cmsSaveProfileToMem, returning the exact bytes. Every
+   header field is set explicitly (including CMM/creator/platform and the
+   creation date, which cmsCreateProfilePlaceholder would otherwise seed from
+   the wall clock) so the byte stream is reproducible and rcms can construct an
+   identical structure on its side. This isolates the serializer: both stacks
+   serialize the SAME constructed profile.
+
+   Layout written:
+     - Display class, RGB device space, XYZ PCS, version 4.4 (0x04400000),
+       relative-colorimetric intent, fixed attributes/flags/manufacturer/model,
+       a fixed 16-byte profile ID, fixed creation date 2026-06-15 12:34:56.
+     - Tags (in this insertion order):
+         'wtpt' = D50 XYZ  (cmsCIEXYZ)
+         'rXYZ' = (0.5, 0.25, 0.125)
+         'gXYZ' = (0.25, 0.5, 0.0625)   [or LINKED to rXYZ when link!=0]
+         'bXYZ' = (0.125, 0.0625, 0.75) [or LINKED to rXYZ when link!=0]
+         'cprt' = a TextType ASCII string (v2-style 'text' is forced by
+                  setting the version low enough for the copyright descriptor;
+                  we use a SignatureType-free path: write a 'text' via an MLU is
+                  the desc path, so instead we write the ASCII through the
+                  DecideTextType v2 branch -- see note below).
+
+   NOTE on the text tag: cmsWriteTag(cprt, cmsMLU*) routes 'cprt' through the
+   copyright descriptor whose DecideTextType picks 'text' for v2 and 'mluc' for
+   v4. To exercise the bare TextType 'text' writer at version 4.4 we instead use
+   a tag whose descriptor's SupportedTypes[0] is plain TextType regardless of
+   version. 'cprt' under v2 yields 'text'; but the rest of the header is v4.4.
+   To keep ONE deterministic header AND a 'text' body, we set the version to
+   4.4 but write the text via the 'targ' (CharTarget) tag, whose descriptor is
+   { TextType } with no decider -> always 'text'. That gives a real 'text' body
+   under a v4.4 header.                                                       */
+
+static void rcms_oracle_set_xyz_tag(cmsHPROFILE h, cmsTagSignature sig,
+                                    double X, double Y, double Z) {
+    cmsCIEXYZ v; v.X = X; v.Y = Y; v.Z = Z;
+    cmsWriteTag(h, sig, &v);
+}
+
+/* Returns bytes written (>0) on success, or 0 on failure. If out==NULL just
+   returns the required length (size query). link!=0 links gXYZ/bXYZ to rXYZ. */
+uint32_t rcms_oracle_save_basic_profile(int link, uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = cmsCreateProfilePlaceholder(NULL);
+    if (!h) return 0;
+
+    _cmsICCPROFILE* Icc = (_cmsICCPROFILE*) h;
+
+    /* --- deterministic header --- */
+    cmsSetProfileVersion(h, 4.4);
+    cmsSetDeviceClass(h, cmsSigDisplayClass);
+    cmsSetColorSpace(h, cmsSigRgbData);
+    cmsSetPCS(h, cmsSigXYZData);
+    cmsSetHeaderRenderingIntent(h, INTENT_RELATIVE_COLORIMETRIC);
+    cmsSetHeaderFlags(h, 0);
+    cmsSetHeaderManufacturer(h, 0x6E6F6E65 /* 'none' */);
+    cmsSetHeaderModel(h, 0x6D6F6431 /* 'mod1' */);
+    cmsSetHeaderAttributes(h, (cmsUInt64Number) 0);
+    Icc->CMM      = 0;        /* zero CMM (avoid lcms2 'lcms' signature) */
+    Icc->creator  = 0;        /* zero creator */
+    Icc->platform = (cmsPlatformSignature) 0; /* zero platform */
+    /* Fixed profile ID. */
+    {
+        cmsUInt8Number id[16];
+        for (int i = 0; i < 16; i++) id[i] = (cmsUInt8Number) i;
+        cmsSetHeaderProfileID(h, id);
+    }
+    /* Fixed creation date: 2026-06-15 12:34:56 (UTC, as stored). struct tm uses
+       tm_year = year-1900, tm_mon = month-1. _cmsEncodeDateTimeNumber undoes
+       those when writing the wire bytes. */
+    Icc->Created.tm_year = 2026 - 1900;
+    Icc->Created.tm_mon  = 6 - 1;
+    Icc->Created.tm_mday = 15;
+    Icc->Created.tm_hour = 12;
+    Icc->Created.tm_min  = 34;
+    Icc->Created.tm_sec  = 56;
+
+    /* --- tags --- */
+    cmsCIEXYZ d50 = *cmsD50_XYZ();
+    cmsWriteTag(h, cmsSigMediaWhitePointTag, &d50);
+
+    rcms_oracle_set_xyz_tag(h, cmsSigRedColorantTag,   0.5,   0.25,   0.125);
+    if (link) {
+        /* cmsLinkTag creates the green/blue slots (in insertion order) as links
+           to red: TagLinked[i]=red, TagPtrs[i]=NULL. SetLinks then copies red's
+           offset/size into both, and the body is written once (cmsio0.c:1520). */
+        cmsLinkTag(h, cmsSigGreenColorantTag, cmsSigRedColorantTag);
+        cmsLinkTag(h, cmsSigBlueColorantTag,  cmsSigRedColorantTag);
+    } else {
+        rcms_oracle_set_xyz_tag(h, cmsSigGreenColorantTag, 0.25, 0.5,   0.0625);
+        rcms_oracle_set_xyz_tag(h, cmsSigBlueColorantTag,  0.125, 0.0625, 0.75);
+    }
+
+    /* A plain TextType 'text' body under the v4.4 header via the 'targ' tag
+       (CharTargetTag), whose descriptor is { TextType } with no decider. */
+    {
+        cmsMLU* mlu = cmsMLUalloc(NULL, 1);
+        cmsMLUsetASCII(mlu, cmsNoLanguage, cmsNoCountry, "rcms serializer test");
+        cmsWriteTag(h, cmsSigCharTargetTag, mlu);
+        cmsMLUfree(mlu);
+    }
+
+    cmsUInt32Number needed = 0;
+    if (!cmsSaveProfileToMem(h, NULL, &needed)) { cmsCloseProfile(h); return 0; }
+
+    if (out == NULL) { cmsCloseProfile(h); return needed; }
+    if (needed > cap) { cmsCloseProfile(h); return 0; }
+
+    if (!cmsSaveProfileToMem(h, out, &needed)) { cmsCloseProfile(h); return 0; }
+    cmsCloseProfile(h);
+    return needed;
+}

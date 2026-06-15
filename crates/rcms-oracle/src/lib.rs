@@ -69,6 +69,7 @@ unsafe extern "C" {
     fn rcms_oracle_tag_signature(buf: *const u8, len: u32, n: u32) -> u32;
     fn rcms_oracle_tag_true_type(buf: *const u8, len: u32, sig: u32) -> u32;
     fn rcms_oracle_tag_read_succeeds(buf: *const u8, len: u32, sig: u32) -> i32;
+    fn rcms_oracle_save_basic_profile(link: i32, out: *mut u8, cap: u32) -> u32;
     fn rcms_oracle_tetra16(
         grid: *const u32,
         n_out: u32,
@@ -2866,6 +2867,33 @@ pub fn assert_f64_bits_eq(rust: f64, c: f64, ctx: impl core::fmt::Debug) {
         c.to_bits(),
         "f64 bit mismatch at {ctx:?}: rust={rust} c={c}"
     );
+}
+
+/// Build a deterministic RGB/XYZ Display profile (v4.4) in lcms2 and serialize
+/// it with `cmsSaveProfileToMem`, returning the exact bytes. The profile carries
+/// `wtpt` (D50), `rXYZ`/`gXYZ`/`bXYZ` colorants, and a `targ` TextType tag, with
+/// every header field set explicitly (including the creation date) so the byte
+/// stream is reproducible. When `link` is true, `gXYZ`/`bXYZ` are `cmsLinkTag`'d
+/// to `rXYZ` (shared offset/size, body written once). Returns `None` on failure.
+///
+/// This is the genuine serializer-vs-serializer reference: rcms builds the SAME
+/// in-memory structure and serializes it, and the two byte streams must match.
+pub fn save_basic_profile(link: bool) -> Option<Vec<u8>> {
+    // SAFETY: out=NULL size query; C only reads the link flag and writes the
+    // required length as its return value (no pointer deref).
+    let needed = unsafe { rcms_oracle_save_basic_profile(link as i32, core::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return None;
+    }
+    let mut out = vec![0u8; needed as usize];
+    // SAFETY: `out` has exactly `needed` bytes of room; C writes at most `cap`
+    // bytes (it bails if needed > cap) and returns the count actually written.
+    let written = unsafe { rcms_oracle_save_basic_profile(link as i32, out.as_mut_ptr(), needed) };
+    if written == 0 {
+        return None;
+    }
+    out.truncate(written as usize);
+    Some(out)
 }
 
 #[cfg(test)]

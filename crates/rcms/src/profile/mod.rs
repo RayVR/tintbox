@@ -5,11 +5,13 @@
 pub mod descriptor;
 pub mod directory;
 pub mod header;
+pub mod serialize;
 pub mod tag;
 pub mod types;
 
 pub use directory::TagEntry;
 pub use header::{ColorSpace, DateTime, Header, ProfileClass, RenderingIntent};
+pub use serialize::{save_to_mem, SlotContent, TagSlot, WritableProfile};
 pub use tag::Tag;
 
 use crate::error::{Error, Result};
