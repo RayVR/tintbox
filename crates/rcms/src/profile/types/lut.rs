@@ -208,6 +208,7 @@ fn read_clut<R: ProfileReader>(
         table: ClutTable::U16(table),
         params,
         is_trilinear: false,
+        implements_identity: false,
     }))
 }
 
@@ -431,6 +432,7 @@ fn read_clut_at<R: ProfileReader>(
         table: ClutTable::U16(table),
         params,
         is_trilinear: false,
+        implements_identity: false,
     }))
 }
 

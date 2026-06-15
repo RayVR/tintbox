@@ -268,6 +268,7 @@ fn read_mpe_clut<R: ProfileReader>(r: &mut R, lut: &mut Pipeline) -> Result<()> 
         table: ClutTable::F32(table),
         params,
         is_trilinear: false,
+        implements_identity: false,
     }))
 }
 

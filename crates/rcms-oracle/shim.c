@@ -1782,3 +1782,643 @@ int rcms_oracle_do_transform_packed_copyalpha(const uint8_t* const* bufs, const 
     free(profiles); free(bpcArr); free(intArr); free(adArr);
     return ok;
 }
+
+/* ---- Profile serializer oracle (slice 7 T0) ------------------------------
+   Build a DETERMINISTIC in-memory profile via the public + internal API and
+   serialize it with cmsSaveProfileToMem, returning the exact bytes. Every
+   header field is set explicitly (including CMM/creator/platform and the
+   creation date, which cmsCreateProfilePlaceholder would otherwise seed from
+   the wall clock) so the byte stream is reproducible and rcms can construct an
+   identical structure on its side. This isolates the serializer: both stacks
+   serialize the SAME constructed profile.
+
+   Layout written:
+     - Display class, RGB device space, XYZ PCS, version 4.4 (0x04400000),
+       relative-colorimetric intent, fixed attributes/flags/manufacturer/model,
+       a fixed 16-byte profile ID, fixed creation date 2026-06-15 12:34:56.
+     - Tags (in this insertion order):
+         'wtpt' = D50 XYZ  (cmsCIEXYZ)
+         'rXYZ' = (0.5, 0.25, 0.125)
+         'gXYZ' = (0.25, 0.5, 0.0625)   [or LINKED to rXYZ when link!=0]
+         'bXYZ' = (0.125, 0.0625, 0.75) [or LINKED to rXYZ when link!=0]
+         'cprt' = a TextType ASCII string (v2-style 'text' is forced by
+                  setting the version low enough for the copyright descriptor;
+                  we use a SignatureType-free path: write a 'text' via an MLU is
+                  the desc path, so instead we write the ASCII through the
+                  DecideTextType v2 branch -- see note below).
+
+   NOTE on the text tag: cmsWriteTag(cprt, cmsMLU*) routes 'cprt' through the
+   copyright descriptor whose DecideTextType picks 'text' for v2 and 'mluc' for
+   v4. To exercise the bare TextType 'text' writer at version 4.4 we instead use
+   a tag whose descriptor's SupportedTypes[0] is plain TextType regardless of
+   version. 'cprt' under v2 yields 'text'; but the rest of the header is v4.4.
+   To keep ONE deterministic header AND a 'text' body, we set the version to
+   4.4 but write the text via the 'targ' (CharTarget) tag, whose descriptor is
+   { TextType } with no decider -> always 'text'. That gives a real 'text' body
+   under a v4.4 header.                                                       */
+
+static void rcms_oracle_set_xyz_tag(cmsHPROFILE h, cmsTagSignature sig,
+                                    double X, double Y, double Z) {
+    cmsCIEXYZ v; v.X = X; v.Y = Y; v.Z = Z;
+    cmsWriteTag(h, sig, &v);
+}
+
+/* Apply the deterministic v4.4 Display RGB/XYZ header used by every serializer
+   oracle (same fields as rcms_oracle_save_basic_profile). */
+static void rcms_oracle_set_fixed_header(cmsHPROFILE h) {
+    _cmsICCPROFILE* Icc = (_cmsICCPROFILE*) h;
+    cmsSetProfileVersion(h, 4.4);
+    cmsSetDeviceClass(h, cmsSigDisplayClass);
+    cmsSetColorSpace(h, cmsSigRgbData);
+    cmsSetPCS(h, cmsSigXYZData);
+    cmsSetHeaderRenderingIntent(h, INTENT_RELATIVE_COLORIMETRIC);
+    cmsSetHeaderFlags(h, 0);
+    cmsSetHeaderManufacturer(h, 0x6E6F6E65 /* 'none' */);
+    cmsSetHeaderModel(h, 0x6D6F6431 /* 'mod1' */);
+    cmsSetHeaderAttributes(h, (cmsUInt64Number) 0);
+    Icc->CMM      = 0;
+    Icc->creator  = 0;
+    Icc->platform = (cmsPlatformSignature) 0;
+    {
+        cmsUInt8Number id[16];
+        for (int i = 0; i < 16; i++) id[i] = (cmsUInt8Number) i;
+        cmsSetHeaderProfileID(h, id);
+    }
+    Icc->Created.tm_year = 2026 - 1900;
+    Icc->Created.tm_mon  = 6 - 1;
+    Icc->Created.tm_mday = 15;
+    Icc->Created.tm_hour = 12;
+    Icc->Created.tm_min  = 34;
+    Icc->Created.tm_sec  = 56;
+}
+
+/* Save the placeholder built so far to a freshly-allocated buffer (size query +
+   write); returns bytes written (>0) or, when out==NULL, the required length.
+   Closes the profile in all paths. */
+static uint32_t rcms_oracle_finish_save(cmsHPROFILE h, uint8_t* out, uint32_t cap) {
+    cmsUInt32Number needed = 0;
+    if (!cmsSaveProfileToMem(h, NULL, &needed)) { cmsCloseProfile(h); return 0; }
+    if (out == NULL) { cmsCloseProfile(h); return needed; }
+    if (needed > cap) { cmsCloseProfile(h); return 0; }
+    if (!cmsSaveProfileToMem(h, out, &needed)) { cmsCloseProfile(h); return 0; }
+    cmsCloseProfile(h);
+    return needed;
+}
+
+/* ---- Single-tag serializer oracle (slice 7 T1) --------------------------
+   Build a profile with the deterministic header plus ONE tag of the type
+   selected by `which`, using fixed representative values, and serialize it.
+   rcms constructs the identical structure and the whole-profile bytes must
+   match. The `which` indices mirror the rcms test's `SingleTag` cases. */
+enum {
+    RCMS_T1_SIG = 0,       /* SignatureType   via cmsSigTechnologyTag */
+    RCMS_T1_DATA,          /* DataType        via cmsSigPs2CRD0Tag    */
+    RCMS_T1_DATETIME,      /* DateTimeType    via cmsSigDateTimeTag   */
+    RCMS_T1_CHROMATICITY,  /* ChromaticityType via cmsSigChromaticityTag */
+    RCMS_T1_COLORANT_ORDER,/* ColorantOrderType via cmsSigColorantOrderTag */
+    RCMS_T1_SF32,          /* S15Fixed16Array via cmsSigChromaticAdaptationTag */
+    RCMS_T1_MEASUREMENT,   /* MeasurementType via cmsSigMeasurementTag */
+    RCMS_T1_VIEWING,       /* ViewingConditionsType via cmsSigViewingConditionsTag */
+    RCMS_T1_COLORANT_TABLE,/* ColorantTableType via cmsSigColorantTableTag */
+    RCMS_T1_CICP,          /* cicpType        via cmsSigcicpTag       */
+    RCMS_T1_XYZ_LUMI       /* XYZType via cmsSigLuminanceTag (DecideXYZtype) */
+};
+
+uint32_t rcms_oracle_save_single_tag(int which, uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = cmsCreateProfilePlaceholder(NULL);
+    if (!h) return 0;
+    rcms_oracle_set_fixed_header(h);
+
+    switch (which) {
+
+    case RCMS_T1_SIG: {
+        cmsTagSignature s = (cmsTagSignature) 0x6D6E7472; /* 'mntr' */
+        cmsWriteTag(h, cmsSigTechnologyTag, &s);
+        break;
+    }
+    case RCMS_T1_DATA: {
+        /* cmsICCData: len, flag, data[]. Flag 1, 5 opaque bytes. */
+        cmsUInt8Number raw[sizeof(cmsICCData) + 5];
+        cmsICCData* d = (cmsICCData*) raw;
+        d->len  = 5;
+        d->flag = 1;
+        d->data[0] = 0xDE; d->data[1] = 0xAD; d->data[2] = 0xBE;
+        d->data[3] = 0xEF; d->data[4] = 0x42;
+        cmsWriteTag(h, cmsSigPs2CRD0Tag, d);
+        break;
+    }
+    case RCMS_T1_DATETIME: {
+        struct tm t;
+        memset(&t, 0, sizeof(t));
+        t.tm_year = 2030 - 1900; t.tm_mon = 11 - 1; t.tm_mday = 23;
+        t.tm_hour = 7; t.tm_min = 8; t.tm_sec = 9;
+        cmsWriteTag(h, cmsSigDateTimeTag, &t);
+        break;
+    }
+    case RCMS_T1_CHROMATICITY: {
+        cmsCIExyYTRIPLE c;
+        c.Red.x   = 0.640; c.Red.y   = 0.330; c.Red.Y   = 1.0;
+        c.Green.x = 0.300; c.Green.y = 0.600; c.Green.Y = 1.0;
+        c.Blue.x  = 0.150; c.Blue.y  = 0.060; c.Blue.Y  = 1.0;
+        cmsWriteTag(h, cmsSigChromaticityTag, &c);
+        break;
+    }
+    case RCMS_T1_COLORANT_ORDER: {
+        /* Type_ColorantOrderType expects a 16-byte array padded with 0xFF; the
+           first `Count` non-0xFF entries are written. Use 4 colorants KCMY. */
+        cmsUInt8Number order[16];
+        memset(order, 0xFF, sizeof(order));
+        order[0] = 3; order[1] = 0; order[2] = 1; order[3] = 2;
+        cmsWriteTag(h, cmsSigColorantOrderTag, order);
+        break;
+    }
+    case RCMS_T1_SF32: {
+        /* S15Fixed16Array: chromaticAdaptation default is sf32. 9 values. */
+        cmsFloat64Number v[9] = {
+            1.0478, 0.0229, -0.0501,
+            0.0296, 0.9905, -0.0171,
+            -0.0092, 0.0151, 0.7517
+        };
+        cmsWriteTag(h, cmsSigChromaticAdaptationTag, v);
+        break;
+    }
+    case RCMS_T1_MEASUREMENT: {
+        cmsICCMeasurementConditions mc;
+        mc.Observer = 1;
+        mc.Backing.X = 0.0; mc.Backing.Y = 0.0; mc.Backing.Z = 0.0;
+        mc.Geometry = 1;
+        mc.Flare = 0.01;
+        mc.IlluminantType = 3; /* D50 */
+        cmsWriteTag(h, cmsSigMeasurementTag, &mc);
+        break;
+    }
+    case RCMS_T1_VIEWING: {
+        cmsICCViewingConditions vc;
+        vc.IlluminantXYZ.X = 0.9642; vc.IlluminantXYZ.Y = 1.0; vc.IlluminantXYZ.Z = 0.8249;
+        vc.SurroundXYZ.X = 0.5; vc.SurroundXYZ.Y = 0.6; vc.SurroundXYZ.Z = 0.7;
+        vc.IlluminantType = 1;
+        cmsWriteTag(h, cmsSigViewingConditionsTag, &vc);
+        break;
+    }
+    case RCMS_T1_COLORANT_TABLE: {
+        cmsNAMEDCOLORLIST* nc = cmsAllocNamedColorList(NULL, 3, 3, "", "");
+        cmsUInt16Number pcs0[3] = { 0x1111, 0x2222, 0x3333 };
+        cmsUInt16Number pcs1[3] = { 0x4444, 0x5555, 0x6666 };
+        cmsUInt16Number pcs2[3] = { 0x7777, 0x8888, 0x9999 };
+        cmsUInt16Number dev[3]  = { 0, 0, 0 };
+        cmsAppendNamedColor(nc, "Cyan", pcs0, dev);
+        cmsAppendNamedColor(nc, "Magenta", pcs1, dev);
+        cmsAppendNamedColor(nc, "Yellow", pcs2, dev);
+        cmsWriteTag(h, cmsSigColorantTableTag, nc);
+        cmsFreeNamedColorList(nc);
+        break;
+    }
+    case RCMS_T1_CICP: {
+        cmsVideoSignalType cicp;
+        cicp.ColourPrimaries = 9;
+        cicp.TransferCharacteristics = 16;
+        cicp.MatrixCoefficients = 9;
+        cicp.VideoFullRangeFlag = 1;
+        cmsWriteTag(h, cmsSigcicpTag, &cicp);
+        break;
+    }
+    case RCMS_T1_XYZ_LUMI: {
+        cmsCIEXYZ v; v.X = 80.0; v.Y = 100.0; v.Z = 90.0;
+        cmsWriteTag(h, cmsSigLuminanceTag, &v);
+        break;
+    }
+    default:
+        cmsCloseProfile(h);
+        return 0;
+    }
+
+    return rcms_oracle_finish_save(h, out, cap);
+}
+
+/* ---- Curve/parametric + MLU/textDescription serializer oracle (slice 7 T2) ---
+   Build a profile carrying ONE tag whose body exercises a curv/para/mluc/desc
+   (or pseq) writer, using a per-case profile version so DecideCurveType /
+   DecideTextType / DecideTextDescType select the intended on-disk type. rcms
+   constructs the identical structure and the whole-profile bytes must match. */
+enum {
+    RCMS_T2_CURV_GAMMA_V2 = 0, /* gamma curve, v2  -> curv (8Fixed8 path)  */
+    RCMS_T2_CURV_TABLE_V2,     /* tabulated curve, v2 -> curv (table path) */
+    RCMS_T2_CURV_TABLE_V4,     /* tabulated curve, v4 -> curv (nSeg != 1)  */
+    RCMS_T2_PARA_GAMMA_V4,     /* gamma curve, v4  -> para type 0          */
+    RCMS_T2_PARA_TYPE1_V4,     /* para ICC type 1 (lcms2 type 2)           */
+    RCMS_T2_PARA_TYPE2_V4,     /* para ICC type 2 (lcms2 type 3)           */
+    RCMS_T2_PARA_TYPE3_V4,     /* para ICC type 3 (lcms2 type 4, sRGB-ish) */
+    RCMS_T2_PARA_TYPE4_V4,     /* para ICC type 4 (lcms2 type 5)           */
+    RCMS_T2_MLUC_V4,           /* cprt MLU, multiple langs + non-ASCII     */
+    RCMS_T2_DESC_V2,           /* profileDesc textDescription, v2 -> desc  */
+    RCMS_T2_PSEQ_V4,           /* profile sequence desc, v4 (mluc embeds)  */
+    RCMS_T2_PSEQ_V2            /* profile sequence desc, v2 (desc embeds)  */
+};
+
+uint32_t rcms_oracle_save_curve_mlu_tag(int which, uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = cmsCreateProfilePlaceholder(NULL);
+    if (!h) return 0;
+    rcms_oracle_set_fixed_header(h);
+
+    switch (which) {
+
+    case RCMS_T2_CURV_GAMMA_V2: {
+        cmsSetProfileVersion(h, 2.1);
+        cmsToneCurve* c = cmsBuildGamma(NULL, 2.4);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_CURV_TABLE_V2:
+    case RCMS_T2_CURV_TABLE_V4: {
+        cmsSetProfileVersion(h, which == RCMS_T2_CURV_TABLE_V2 ? 2.1 : 4.4);
+        cmsUInt16Number tbl[5] = { 0, 0x3000, 0x7000, 0xB000, 0xFFFF };
+        cmsToneCurve* c = cmsBuildTabulatedToneCurve16(NULL, 5, tbl);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_PARA_GAMMA_V4: {
+        cmsSetProfileVersion(h, 4.4);
+        cmsToneCurve* c = cmsBuildGamma(NULL, 2.4);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_PARA_TYPE1_V4: {
+        cmsSetProfileVersion(h, 4.4);
+        cmsFloat64Number p[3] = { 2.4, 0.9, 0.1 };
+        cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, 2, p);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_PARA_TYPE2_V4: {
+        cmsSetProfileVersion(h, 4.4);
+        cmsFloat64Number p[4] = { 2.4, 0.9, 0.1, 0.05 };
+        cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, 3, p);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_PARA_TYPE3_V4: {
+        cmsSetProfileVersion(h, 4.4);
+        /* sRGB-like type-4 lcms2 (ICC type 3): g, a, b, c, d. */
+        cmsFloat64Number p[5] = { 2.4, 1.0/1.055, 0.055/1.055, 1.0/12.92, 0.04045 };
+        cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, 4, p);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_PARA_TYPE4_V4: {
+        cmsSetProfileVersion(h, 4.4);
+        cmsFloat64Number p[7] = { 2.4, 1.0/1.055, 0.055/1.055, 1.0/12.92, 0.04045, 0.1, 0.2 };
+        cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, 5, p);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_MLUC_V4: {
+        cmsSetProfileVersion(h, 4.4);
+        cmsMLU* mlu = cmsMLUalloc(NULL, 3);
+        /* en/US ASCII, de/DE with a non-ASCII umlaut, ja/JP with CJK. */
+        cmsMLUsetWide(mlu, "en", "US", L"Hello");
+        /* Split adjacent \x escapes so trailing hex-like letters aren't absorbed
+           into the previous escape (C \x is greedy). "Grüße". */
+        cmsMLUsetWide(mlu, "de", "DE", L"Gr" L"\x00fc" L"\x00df" L"e");
+        cmsMLUsetWide(mlu, "ja", "JP", L"\x65e5" L"\x672c" L"\x8a9e"); /* 日本語 */
+        cmsWriteTag(h, cmsSigCopyrightTag, mlu);
+        cmsMLUfree(mlu);
+        break;
+    }
+    case RCMS_T2_DESC_V2: {
+        cmsSetProfileVersion(h, 2.1);
+        cmsMLU* mlu = cmsMLUalloc(NULL, 1);
+        cmsMLUsetASCII(mlu, cmsNoLanguage, cmsNoCountry, "rcms desc test");
+        cmsWriteTag(h, cmsSigProfileDescriptionTag, mlu);
+        cmsMLUfree(mlu);
+        break;
+    }
+    case RCMS_T2_PSEQ_V4:
+    case RCMS_T2_PSEQ_V2: {
+        cmsSetProfileVersion(h, which == RCMS_T2_PSEQ_V4 ? 4.4 : 2.1);
+        cmsSEQ* seq = cmsAllocProfileSequenceDescription(NULL, 2);
+        for (int i = 0; i < 2; i++) {
+            seq->seq[i].deviceMfg   = (cmsSignature) (0x4D464731 + i); /* MFG1.. */
+            seq->seq[i].deviceModel = (cmsSignature) (0x4D4F4431 + i); /* MOD1.. */
+            seq->seq[i].attributes  = (cmsUInt64Number) (i + 1);
+            seq->seq[i].technology  = (cmsTechnologySignature) 0x6D6E7472; /* mntr */
+            /* The seq MLUs start NULL; allocate before setting (cmsMLUsetASCII on
+               a NULL handle is a no-op). */
+            seq->seq[i].Manufacturer = cmsMLUalloc(NULL, 1);
+            seq->seq[i].Model        = cmsMLUalloc(NULL, 1);
+            cmsMLUsetASCII(seq->seq[i].Manufacturer, cmsNoLanguage, cmsNoCountry,
+                           i == 0 ? "MakerOne" : "MakerTwo");
+            cmsMLUsetASCII(seq->seq[i].Model, cmsNoLanguage, cmsNoCountry,
+                           i == 0 ? "ModelOne" : "ModelTwo");
+        }
+        cmsWriteTag(h, cmsSigProfileSequenceDescTag, seq);
+        cmsFreeProfileSequenceDescription(seq);
+        break;
+    }
+    default:
+        cmsCloseProfile(h);
+        return 0;
+    }
+
+    return rcms_oracle_finish_save(h, out, cap);
+}
+
+/* ---- LUT/MPE tag-body re-serializer oracle (slice 7 T3) ------------------
+   Read the pipeline tag `src_sig` from the in-memory source profile `src`/`len`
+   (a real testbed profile carrying mft1/mft2/mAB/mBA), then build a fresh
+   placeholder with the deterministic header at version `version`, write that
+   SAME parsed pipeline under `dst_sig` via cmsWriteTag (so lcms2 re-serializes
+   the parsed structure, not a raw copy), and save. When `save_as_8bit != 0` the
+   pipeline's SaveAs8Bits flag is forced on (to exercise the mft1/LUT8 path,
+   which a fresh read never selects). rcms builds the identical WritableProfile
+   from its own parse of the same bytes; the whole-profile bytes must match. */
+uint32_t rcms_oracle_resave_lut_tag(const uint8_t* src, uint32_t len,
+                                    uint32_t src_sig, uint32_t dst_sig,
+                                    double version, int save_as_8bit,
+                                    uint8_t* out, uint32_t cap) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*) src, len);
+    if (!p) return 0;
+
+    cmsPipeline* lut = (cmsPipeline*) cmsReadTag(p, (cmsTagSignature) src_sig);
+    if (lut == NULL) { cmsCloseProfile(p); return 0; }
+
+    /* Duplicate so the pipeline survives closing the source profile. */
+    cmsPipeline* dup = cmsPipelineDup(lut);
+    cmsCloseProfile(p);
+    if (dup == NULL) return 0;
+
+    if (save_as_8bit) cmsPipelineSetSaveAs8bitsFlag(dup, TRUE);
+
+    cmsHPROFILE h = cmsCreateProfilePlaceholder(NULL);
+    if (!h) { cmsPipelineFree(dup); return 0; }
+    rcms_oracle_set_fixed_header(h);
+    cmsSetProfileVersion(h, version);
+
+    if (!cmsWriteTag(h, (cmsTagSignature) dst_sig, dup)) {
+        cmsPipelineFree(dup);
+        cmsCloseProfile(h);
+        return 0;
+    }
+    cmsPipelineFree(dup);
+
+    return rcms_oracle_finish_save(h, out, cap);
+}
+
+/* Build a small synthetic MPE pipeline (curve-set -> matrix -> float CLUT),
+   write it under cmsSigDToB0Tag at v4.4, and serialize. rcms constructs the
+   identical pipeline; the bytes must match. This exercises the mpet body when
+   no testbed profile carries a valid multiProcessElements tag. */
+uint32_t rcms_oracle_save_mpe_tag(uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = cmsCreateProfilePlaceholder(NULL);
+    if (!h) return 0;
+    rcms_oracle_set_fixed_header(h);
+    cmsSetProfileVersion(h, 4.4);
+
+    cmsPipeline* lut = cmsPipelineAlloc(NULL, 3, 3);
+    if (!lut) { cmsCloseProfile(h); return 0; }
+
+    /* Curve-set: three segmented curves, each one formula segment of type 0
+       (lcms2 internal Type 6: Y = (a*X + b)^g + c) spanning the whole domain.
+       MPE WriteSegmentedCurve only allows formula types 0/1/2 (stored Type-6),
+       so this is the simplest curve that round-trips through the MPE writer. */
+    cmsCurveSegment seg;
+    memset(&seg, 0, sizeof(seg));
+    seg.x0 = -1e22f;
+    seg.x1 = 1e22f;
+    seg.Type = 6;           /* formula type 0 on disk */
+    seg.Params[0] = 1.0;    /* g */
+    seg.Params[1] = 1.0;    /* a */
+    seg.Params[2] = 0.0;    /* b */
+    seg.Params[3] = 0.0;    /* c */
+    cmsToneCurve* g[3];
+    g[0] = cmsBuildSegmentedToneCurve(NULL, 1, &seg);
+    g[1] = cmsBuildSegmentedToneCurve(NULL, 1, &seg);
+    g[2] = cmsBuildSegmentedToneCurve(NULL, 1, &seg);
+    cmsPipelineInsertStage(lut, cmsAT_END, cmsStageAllocToneCurves(NULL, 3, g));
+    cmsFreeToneCurveTriple(g);
+
+    /* Matrix 3x3 with offset. */
+    static const cmsFloat64Number mat[9] = {
+        1.1, 0.0, 0.0, 0.0, 0.9, 0.0, 0.0, 0.0, 1.05
+    };
+    static const cmsFloat64Number off[3] = { 0.01, -0.02, 0.03 };
+    cmsPipelineInsertStage(lut, cmsAT_END, cmsStageAllocMatrix(NULL, 3, 3, mat, off));
+
+    /* Float CLUT, 2 points per dimension, 3->3. */
+    cmsUInt32Number grid[3] = { 2, 2, 2 };
+    cmsPipelineInsertStage(lut, cmsAT_END,
+        cmsStageAllocCLutFloatGranular(NULL, grid, 3, 3, NULL));
+
+    if (!cmsWriteTag(h, cmsSigDToB0Tag, lut)) {
+        cmsPipelineFree(lut);
+        cmsCloseProfile(h);
+        return 0;
+    }
+    cmsPipelineFree(lut);
+
+    return rcms_oracle_finish_save(h, out, cap);
+}
+
+/* Returns bytes written (>0) on success, or 0 on failure. If out==NULL just
+   returns the required length (size query). link!=0 links gXYZ/bXYZ to rXYZ. */
+uint32_t rcms_oracle_save_basic_profile(int link, uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = cmsCreateProfilePlaceholder(NULL);
+    if (!h) return 0;
+
+    _cmsICCPROFILE* Icc = (_cmsICCPROFILE*) h;
+
+    /* --- deterministic header --- */
+    cmsSetProfileVersion(h, 4.4);
+    cmsSetDeviceClass(h, cmsSigDisplayClass);
+    cmsSetColorSpace(h, cmsSigRgbData);
+    cmsSetPCS(h, cmsSigXYZData);
+    cmsSetHeaderRenderingIntent(h, INTENT_RELATIVE_COLORIMETRIC);
+    cmsSetHeaderFlags(h, 0);
+    cmsSetHeaderManufacturer(h, 0x6E6F6E65 /* 'none' */);
+    cmsSetHeaderModel(h, 0x6D6F6431 /* 'mod1' */);
+    cmsSetHeaderAttributes(h, (cmsUInt64Number) 0);
+    Icc->CMM      = 0;        /* zero CMM (avoid lcms2 'lcms' signature) */
+    Icc->creator  = 0;        /* zero creator */
+    Icc->platform = (cmsPlatformSignature) 0; /* zero platform */
+    /* Fixed profile ID. */
+    {
+        cmsUInt8Number id[16];
+        for (int i = 0; i < 16; i++) id[i] = (cmsUInt8Number) i;
+        cmsSetHeaderProfileID(h, id);
+    }
+    /* Fixed creation date: 2026-06-15 12:34:56 (UTC, as stored). struct tm uses
+       tm_year = year-1900, tm_mon = month-1. _cmsEncodeDateTimeNumber undoes
+       those when writing the wire bytes. */
+    Icc->Created.tm_year = 2026 - 1900;
+    Icc->Created.tm_mon  = 6 - 1;
+    Icc->Created.tm_mday = 15;
+    Icc->Created.tm_hour = 12;
+    Icc->Created.tm_min  = 34;
+    Icc->Created.tm_sec  = 56;
+
+    /* --- tags --- */
+    cmsCIEXYZ d50 = *cmsD50_XYZ();
+    cmsWriteTag(h, cmsSigMediaWhitePointTag, &d50);
+
+    rcms_oracle_set_xyz_tag(h, cmsSigRedColorantTag,   0.5,   0.25,   0.125);
+    if (link) {
+        /* cmsLinkTag creates the green/blue slots (in insertion order) as links
+           to red: TagLinked[i]=red, TagPtrs[i]=NULL. SetLinks then copies red's
+           offset/size into both, and the body is written once (cmsio0.c:1520). */
+        cmsLinkTag(h, cmsSigGreenColorantTag, cmsSigRedColorantTag);
+        cmsLinkTag(h, cmsSigBlueColorantTag,  cmsSigRedColorantTag);
+    } else {
+        rcms_oracle_set_xyz_tag(h, cmsSigGreenColorantTag, 0.25, 0.5,   0.0625);
+        rcms_oracle_set_xyz_tag(h, cmsSigBlueColorantTag,  0.125, 0.0625, 0.75);
+    }
+
+    /* A plain TextType 'text' body under the v4.4 header via the 'targ' tag
+       (CharTargetTag), whose descriptor is { TextType } with no decider. */
+    {
+        cmsMLU* mlu = cmsMLUalloc(NULL, 1);
+        cmsMLUsetASCII(mlu, cmsNoLanguage, cmsNoCountry, "rcms serializer test");
+        cmsWriteTag(h, cmsSigCharTargetTag, mlu);
+        cmsMLUfree(mlu);
+    }
+
+    cmsUInt32Number needed = 0;
+    if (!cmsSaveProfileToMem(h, NULL, &needed)) { cmsCloseProfile(h); return 0; }
+
+    if (out == NULL) { cmsCloseProfile(h); return needed; }
+    if (needed > cap) { cmsCloseProfile(h); return 0; }
+
+    if (!cmsSaveProfileToMem(h, out, &needed)) { cmsCloseProfile(h); return 0; }
+    cmsCloseProfile(h);
+    return needed;
+}
+
+/* ---- Virtual / built-in profile serializer oracle (slice 7 T4) -----------
+   Build a virtual profile with the REAL cmsCreate*Profile constructor, then
+   override ONLY the nondeterministic header fields (CMM/creator/platform set by
+   cmsCreateProfilePlaceholder, plus the wall-clock creation date) to fixed
+   values so the byte stream is reproducible. The constructor-set fields
+   (version/class/space/PCS/intent) and the tag set are left exactly as
+   cmsCreate* produced them. rcms builds the identical WritableProfile; the
+   whole-profile bytes must match byte-for-byte. */
+enum {
+    RCMS_T4_SRGB = 0,   /* cmsCreate_sRGBProfile               */
+    RCMS_T4_GRAY,       /* cmsCreateGrayProfileTHR (D50, gamma 2.2) */
+    RCMS_T4_LAB2,       /* cmsCreateLab2Profile(NULL)          */
+    RCMS_T4_LAB4,       /* cmsCreateLab4Profile(NULL)          */
+    RCMS_T4_XYZ,        /* cmsCreateXYZProfile                 */
+    RCMS_T4_NULL,       /* cmsCreateNULLProfile                */
+    RCMS_T4_RGB,        /* cmsCreateRGBProfile (Rec709/D65, gamma 2.2) */
+    RCMS_T4_LIN         /* cmsCreateLinearizationDeviceLink (RGB, gamma 2.2) */
+};
+
+/* Overwrite the placeholder-seeded nondeterministic header fields with the same
+   fixed values rcms uses. Does NOT touch version/class/space/PCS/intent (those
+   are the constructor's contract). */
+static void rcms_oracle_fix_virtual_header(cmsHPROFILE h) {
+    _cmsICCPROFILE* Icc = (_cmsICCPROFILE*) h;
+    Icc->CMM      = 0;
+    Icc->creator  = 0;
+    Icc->platform = (cmsPlatformSignature) 0;
+    Icc->Created.tm_year = 2026 - 1900;
+    Icc->Created.tm_mon  = 6 - 1;
+    Icc->Created.tm_mday = 15;
+    Icc->Created.tm_hour = 12;
+    Icc->Created.tm_min  = 34;
+    Icc->Created.tm_sec  = 56;
+}
+
+uint32_t rcms_oracle_save_virtual_profile(int which, uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = NULL;
+
+    switch (which) {
+    case RCMS_T4_SRGB:
+        h = cmsCreate_sRGBProfile();
+        break;
+    case RCMS_T4_GRAY: {
+        cmsCIExyY d50 = *cmsD50_xyY();
+        cmsToneCurve* g = cmsBuildGamma(NULL, 2.2);
+        if (!g) return 0;
+        h = cmsCreateGrayProfileTHR(NULL, &d50, g);
+        cmsFreeToneCurve(g);
+        break;
+    }
+    case RCMS_T4_LAB2:
+        h = cmsCreateLab2Profile(NULL);
+        break;
+    case RCMS_T4_LAB4:
+        h = cmsCreateLab4Profile(NULL);
+        break;
+    case RCMS_T4_XYZ:
+        h = cmsCreateXYZProfile();
+        break;
+    case RCMS_T4_NULL:
+        h = cmsCreateNULLProfile();
+        break;
+    case RCMS_T4_RGB: {
+        cmsCIExyY       d65 = { 0.3127, 0.3290, 1.0 };
+        cmsCIExyYTRIPLE prim = {
+            {0.6400, 0.3300, 1.0},
+            {0.3000, 0.6000, 1.0},
+            {0.1500, 0.0600, 1.0}
+        };
+        cmsToneCurve* g = cmsBuildGamma(NULL, 2.2);
+        cmsToneCurve* gamma3[3];
+        if (!g) return 0;
+        gamma3[0] = gamma3[1] = gamma3[2] = g;
+        h = cmsCreateRGBProfile(&d65, &prim, gamma3);
+        cmsFreeToneCurve(g);
+        break;
+    }
+    case RCMS_T4_LIN: {
+        cmsToneCurve* g = cmsBuildGamma(NULL, 2.2);
+        cmsToneCurve* gamma3[3];
+        if (!g) return 0;
+        gamma3[0] = gamma3[1] = gamma3[2] = g;
+        h = cmsCreateLinearizationDeviceLink(cmsSigRgbData, gamma3);
+        cmsFreeToneCurve(g);
+        break;
+    }
+    default:
+        return 0;
+    }
+
+    if (!h) return 0;
+    rcms_oracle_fix_virtual_header(h);
+    return rcms_oracle_finish_save(h, out, cap);
+}
+
+/* ---- Black-point detection (cmssamp.c) ------------------------------------
+   Open a profile from raw bytes, run cmsDetectBlackPoint /
+   cmsDetectDestinationBlackPoint at the given intent + flags, and write the
+   resulting CIEXYZ (3 doubles: X,Y,Z) into `out`. Returns 1 on the C function
+   returning TRUE, 0 on FALSE. In BOTH cases the out-XYZ is written (lcms2 zeroes
+   it on the FALSE paths), so the caller can compare the XYZ unconditionally. */
+int rcms_oracle_detect_black_point(const uint8_t* bytes, uint32_t len,
+                                   uint32_t intent, uint32_t flags,
+                                   double* out /* [3] */) {
+    cmsHPROFILE h = cmsOpenProfileFromMem((const void*) bytes, len);
+    if (!h) return 0;
+    cmsCIEXYZ bp = { 0, 0, 0 };
+    cmsBool ok = cmsDetectBlackPoint(&bp, h, intent, flags);
+    out[0] = bp.X; out[1] = bp.Y; out[2] = bp.Z;
+    cmsCloseProfile(h);
+    return ok ? 1 : 0;
+}
+
+int rcms_oracle_detect_destination_black_point(const uint8_t* bytes, uint32_t len,
+                                               uint32_t intent, uint32_t flags,
+                                               double* out /* [3] */) {
+    cmsHPROFILE h = cmsOpenProfileFromMem((const void*) bytes, len);
+    if (!h) return 0;
+    cmsCIEXYZ bp = { 0, 0, 0 };
+    cmsBool ok = cmsDetectDestinationBlackPoint(&bp, h, intent, flags);
+    out[0] = bp.X; out[1] = bp.Y; out[2] = bp.Z;
+    cmsCloseProfile(h);
+    return ok ? 1 : 0;
+}

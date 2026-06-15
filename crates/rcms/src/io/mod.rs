@@ -6,4 +6,4 @@ pub mod writer;
 
 pub use cursor::MemReader;
 pub use reader::ProfileReader;
-pub use writer::{MemWriter, ProfileWriter};
+pub use writer::{CountWriter, MemWriter, ProfileWriter};

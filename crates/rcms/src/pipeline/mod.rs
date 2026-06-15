@@ -204,7 +204,16 @@ impl Pipeline {
     /// output widths are equal.
     fn remove_1op_identity(&mut self) -> bool {
         let before = self.stages.len();
-        self.stages.retain(|s| !matches!(s, Stage::Identity(_)));
+        self.stages.retain(|s| {
+            // `cmsSigIdentityElemType`: identity curve stages (`Stage::Identity`)
+            // and identity CLUTs built by `_cmsStageAllocIdentityCLut` (the
+            // `implements_identity` marker — see [`crate::pipeline::clut::Clut`]).
+            !matches!(s, Stage::Identity(_))
+                && !matches!(
+                    s,
+                    Stage::Clut(c) if c.implements_identity
+                )
+        });
         self.stages.len() != before
     }
 

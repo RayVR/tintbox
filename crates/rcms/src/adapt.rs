@@ -5,7 +5,7 @@
 //! host FLT_EVAL_METHOD==0. Polynomial and matrix-multiply operand order are
 //! transcribed verbatim from the C.
 
-use crate::color::{CIExyY, CIEXYZ};
+use crate::color::{CIExyY, CIExyYTriple, CIEXYZ};
 use crate::math::matrix::{Mat3, Vec3};
 
 /// Bradford cone-response matrix (`LamRigg`, `cmswtpnt.c:238-242`), row-major.
@@ -117,6 +117,73 @@ pub fn adapt_to_illuminant(source_wp: CIEXYZ, illuminant: CIEXYZ, value: CIEXYZ)
         y: out.0[1],
         z: out.0[2],
     })
+}
+
+/// `cmsxyY2XYZ` (`cmspcs.c:102`): convert an xyY chromaticity to XYZ.
+fn xyy_to_xyz(s: CIExyY) -> CIEXYZ {
+    CIEXYZ {
+        x: (s.x / s.y) * s.yy,
+        y: s.yy,
+        z: ((1.0 - s.x - s.y) / s.y) * s.yy,
+    }
+}
+
+/// `_cmsAdaptMatrixToD50` (`cmswtpnt.c:252-266`): post-multiply `r` by the
+/// Bradford adaptation from `source_white_pt` (xyY) to D50 — `r = Bradford · r`.
+fn adapt_matrix_to_d50(r: &Mat3, source_white_pt: CIExyY) -> Option<Mat3> {
+    let dn = xyy_to_xyz(source_white_pt);
+    let bradford = adaptation_matrix(None, dn, crate::math::whitepoint::D50)?;
+    Some(bradford.per(r))
+}
+
+/// Build the white-point + primaries RGB→CIE-XYZ transfer matrix, then adapt it
+/// to D50. Transcribes `_cmsBuildRGB2XYZtransferMatrix` (`cmswtpnt.c:285-323`):
+/// invert the chromaticity primaries matrix, evaluate the white point through it
+/// to get per-channel coefficients, scale the primaries by those coefficients,
+/// and finally Bradford-adapt the result from `white_pt` to D50. The columns of
+/// the returned matrix are the (D50-adapted) R, G, B colorant XYZ vectors.
+///
+/// Returns `None` when the primaries matrix is singular (matching lcms2's FALSE).
+pub fn build_rgb2xyz_transfer_matrix(white_pt: CIExyY, primaries: CIExyYTriple) -> Option<Mat3> {
+    let xn = white_pt.x;
+    let yn = white_pt.y;
+    let xr = primaries.red.x;
+    let yr = primaries.red.y;
+    let xg = primaries.green.x;
+    let yg = primaries.green.y;
+    let xb = primaries.blue.x;
+    let yb = primaries.blue.y;
+
+    // Build the primaries matrix (row-major), then invert it.
+    let primaries_mat = Mat3([
+        xr,
+        xg,
+        xb,
+        yr,
+        yg,
+        yb,
+        1.0 - xr - yr,
+        1.0 - xg - yg,
+        1.0 - xb - yb,
+    ]);
+    let result = primaries_mat.inverse()?;
+
+    let white_point = Vec3([xn / yn, 1.0, (1.0 - xn - yn) / yn]);
+    let coef = result.eval(white_point);
+
+    let r = Mat3([
+        coef.0[0] * xr,
+        coef.0[1] * xg,
+        coef.0[2] * xb,
+        coef.0[0] * yr,
+        coef.0[1] * yg,
+        coef.0[2] * yb,
+        coef.0[0] * (1.0 - xr - yr),
+        coef.0[1] * (1.0 - xg - yg),
+        coef.0[2] * (1.0 - xb - yb),
+    ]);
+
+    adapt_matrix_to_d50(&r, white_pt)
 }
 
 #[cfg(test)]
