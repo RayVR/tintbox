@@ -532,7 +532,15 @@ impl Transform {
             OptimizedEval::MatShaper(_) => "matshaper",
             OptimizedEval::Curves(_) => "curves",
             OptimizedEval::Baked(_) => "baked",
+            OptimizedEval::LosslessMatShaper(_) => "lossless-matshaper",
         }
+    }
+
+    /// Whether the LOSSLESS matrix-shaper fast path fired for this transform
+    /// (true only under [`OptimizationStrategy::AccurateFast`] when the RGB 8-bit
+    /// matrix-shaper shape matched).
+    pub fn lossless_matshaper_fired(&self) -> bool {
+        matches!(self.opt_eval, OptimizedEval::LosslessMatShaper(_))
     }
 
     /// Convenience 2-profile constructor (lcms2 `cmsCreateTransform`, which routes
@@ -782,6 +790,13 @@ impl Transform {
                         // OptimizeByComputingLinearization / OptimizeByResampling).
                         OptimizedEval::Baked(b) => {
                             b.eval(&win[..in_ch], &mut wout[..out_ch]);
+                        }
+                        // The LOSSLESS matrix-shaper fast path (AccurateFast):
+                        // byte-for-byte identical to the Pipeline arm, but the
+                        // per-pixel input-curve eval is a table lookup.
+                        OptimizedEval::LosslessMatShaper(data) => {
+                            let res = data.eval(&[win[0], win[1], win[2]]);
+                            wout[..3].copy_from_slice(&res);
                         }
                         // The accurate in-place pipeline eval.
                         OptimizedEval::Pipeline => {

@@ -35,11 +35,13 @@
 //! loop calls — swapping strategies never touches the formatter or the loop.
 
 pub mod joincurves;
+pub mod lossless_matshaper;
 pub mod matshaper;
 pub mod resampling;
 
 use crate::pipeline::Pipeline;
 use joincurves::CurvesEval;
+use lossless_matshaper::LosslessMatShaper;
 use matshaper::MatShaper8Data;
 use resampling::BakedEval;
 
@@ -56,6 +58,16 @@ pub enum OptimizationStrategy {
     /// Opt-in; for drop-in byte-identity with stock lcms2-default or as a speed
     /// knob.
     Lcms2Compat,
+    /// LOSSLESS speedups that keep byte-for-byte parity with
+    /// [`Accurate`](Self::Accurate) (and thus lcms2 `-NOOPTIMIZE`), opt-in for
+    /// now. Detects the RGB 8-bit-input matrix-shaper shape and installs the
+    /// [`LosslessMatShaper`](lossless_matshaper::LosslessMatShaper) fast path —
+    /// exact input-curve LUTs + the unchanged f64-accumulated matrix + exact
+    /// output-curve eval — which removes the per-pixel `powf`/parametric input
+    /// eval without changing a single output bit. Any pipeline that does not match
+    /// the shape falls back to the in-place pipeline eval
+    /// ([`Pipeline`](OptimizedEval::Pipeline)).
+    AccurateFast,
 }
 
 /// The eval a [`Transform`](crate::transform::Transform) calls per pixel, built
@@ -76,6 +88,12 @@ pub enum OptimizedEval {
     /// CLUT (with optional prelinearization), evaluated by lcms2
     /// `PrelinEval16`/`PrelinEval8`.
     Baked(Box<BakedEval>),
+    /// The LOSSLESS matrix-shaper fast path fired
+    /// ([`AccurateFast`](OptimizationStrategy::AccurateFast)): exact input-curve
+    /// LUTs + the unchanged f64 matrix + exact output-curve eval. Byte-for-byte
+    /// identical to [`Pipeline`](Self::Pipeline); boxed (the LUTs + curves are a
+    /// few KB).
+    LosslessMatShaper(Box<LosslessMatShaper>),
 }
 
 /// A custom pipeline optimizer (lcms2 `cmsPluginOptimization`). Registered via
@@ -116,7 +134,20 @@ impl OptimizationStrategy {
         match self {
             OptimizationStrategy::Accurate => OptimizedEval::Pipeline,
             OptimizationStrategy::Lcms2Compat => Self::lcms2_compat(lut, in_fmt, out_fmt, intent),
+            OptimizationStrategy::AccurateFast => Self::accurate_fast(lut, in_fmt, out_fmt),
         }
+    }
+
+    /// The LOSSLESS [`AccurateFast`](Self::AccurateFast) build: detect the RGB
+    /// 8-bit-input matrix-shaper shape and install the byte-identical
+    /// [`LosslessMatShaper`](lossless_matshaper::LosslessMatShaper); otherwise
+    /// fall back to the in-place pipeline eval (the accurate path). Never changes
+    /// an output bit versus [`Accurate`](Self::Accurate).
+    fn accurate_fast(lut: &Pipeline, in_fmt: u32, out_fmt: u32) -> OptimizedEval {
+        if let Some(eval) = lossless_matshaper::try_optimize(lut, in_fmt, out_fmt) {
+            return OptimizedEval::LosslessMatShaper(Box::new(eval));
+        }
+        OptimizedEval::Pipeline
     }
 
     /// Build the [`OptimizedEval`], consulting an optional custom [`Optimizer`]
