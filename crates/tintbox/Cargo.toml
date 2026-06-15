@@ -8,6 +8,10 @@ repository = "https://github.com/RayVR/tintbox"
 readme = "../../README.md"
 keywords = ["color", "icc", "cms", "color-management", "lcms"]
 categories = ["graphics", "multimedia::images"]
+# The integration tests depend on the test-only `tintbox-oracle` (a path
+# dev-dependency that cargo strips on publish), so they can't compile from a
+# published package. Exclude them — consumers never build a dep's tests anyway.
+exclude = ["tests/**"]
 
 [features]
 default = ["std"]
