@@ -1823,6 +1823,178 @@ static void rcms_oracle_set_xyz_tag(cmsHPROFILE h, cmsTagSignature sig,
     cmsWriteTag(h, sig, &v);
 }
 
+/* Apply the deterministic v4.4 Display RGB/XYZ header used by every serializer
+   oracle (same fields as rcms_oracle_save_basic_profile). */
+static void rcms_oracle_set_fixed_header(cmsHPROFILE h) {
+    _cmsICCPROFILE* Icc = (_cmsICCPROFILE*) h;
+    cmsSetProfileVersion(h, 4.4);
+    cmsSetDeviceClass(h, cmsSigDisplayClass);
+    cmsSetColorSpace(h, cmsSigRgbData);
+    cmsSetPCS(h, cmsSigXYZData);
+    cmsSetHeaderRenderingIntent(h, INTENT_RELATIVE_COLORIMETRIC);
+    cmsSetHeaderFlags(h, 0);
+    cmsSetHeaderManufacturer(h, 0x6E6F6E65 /* 'none' */);
+    cmsSetHeaderModel(h, 0x6D6F6431 /* 'mod1' */);
+    cmsSetHeaderAttributes(h, (cmsUInt64Number) 0);
+    Icc->CMM      = 0;
+    Icc->creator  = 0;
+    Icc->platform = (cmsPlatformSignature) 0;
+    {
+        cmsUInt8Number id[16];
+        for (int i = 0; i < 16; i++) id[i] = (cmsUInt8Number) i;
+        cmsSetHeaderProfileID(h, id);
+    }
+    Icc->Created.tm_year = 2026 - 1900;
+    Icc->Created.tm_mon  = 6 - 1;
+    Icc->Created.tm_mday = 15;
+    Icc->Created.tm_hour = 12;
+    Icc->Created.tm_min  = 34;
+    Icc->Created.tm_sec  = 56;
+}
+
+/* Save the placeholder built so far to a freshly-allocated buffer (size query +
+   write); returns bytes written (>0) or, when out==NULL, the required length.
+   Closes the profile in all paths. */
+static uint32_t rcms_oracle_finish_save(cmsHPROFILE h, uint8_t* out, uint32_t cap) {
+    cmsUInt32Number needed = 0;
+    if (!cmsSaveProfileToMem(h, NULL, &needed)) { cmsCloseProfile(h); return 0; }
+    if (out == NULL) { cmsCloseProfile(h); return needed; }
+    if (needed > cap) { cmsCloseProfile(h); return 0; }
+    if (!cmsSaveProfileToMem(h, out, &needed)) { cmsCloseProfile(h); return 0; }
+    cmsCloseProfile(h);
+    return needed;
+}
+
+/* ---- Single-tag serializer oracle (slice 7 T1) --------------------------
+   Build a profile with the deterministic header plus ONE tag of the type
+   selected by `which`, using fixed representative values, and serialize it.
+   rcms constructs the identical structure and the whole-profile bytes must
+   match. The `which` indices mirror the rcms test's `SingleTag` cases. */
+enum {
+    RCMS_T1_SIG = 0,       /* SignatureType   via cmsSigTechnologyTag */
+    RCMS_T1_DATA,          /* DataType        via cmsSigPs2CRD0Tag    */
+    RCMS_T1_DATETIME,      /* DateTimeType    via cmsSigDateTimeTag   */
+    RCMS_T1_CHROMATICITY,  /* ChromaticityType via cmsSigChromaticityTag */
+    RCMS_T1_COLORANT_ORDER,/* ColorantOrderType via cmsSigColorantOrderTag */
+    RCMS_T1_SF32,          /* S15Fixed16Array via cmsSigChromaticAdaptationTag */
+    RCMS_T1_MEASUREMENT,   /* MeasurementType via cmsSigMeasurementTag */
+    RCMS_T1_VIEWING,       /* ViewingConditionsType via cmsSigViewingConditionsTag */
+    RCMS_T1_COLORANT_TABLE,/* ColorantTableType via cmsSigColorantTableTag */
+    RCMS_T1_CICP,          /* cicpType        via cmsSigcicpTag       */
+    RCMS_T1_XYZ_LUMI       /* XYZType via cmsSigLuminanceTag (DecideXYZtype) */
+};
+
+uint32_t rcms_oracle_save_single_tag(int which, uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = cmsCreateProfilePlaceholder(NULL);
+    if (!h) return 0;
+    rcms_oracle_set_fixed_header(h);
+
+    switch (which) {
+
+    case RCMS_T1_SIG: {
+        cmsTagSignature s = (cmsTagSignature) 0x6D6E7472; /* 'mntr' */
+        cmsWriteTag(h, cmsSigTechnologyTag, &s);
+        break;
+    }
+    case RCMS_T1_DATA: {
+        /* cmsICCData: len, flag, data[]. Flag 1, 5 opaque bytes. */
+        cmsUInt8Number raw[sizeof(cmsICCData) + 5];
+        cmsICCData* d = (cmsICCData*) raw;
+        d->len  = 5;
+        d->flag = 1;
+        d->data[0] = 0xDE; d->data[1] = 0xAD; d->data[2] = 0xBE;
+        d->data[3] = 0xEF; d->data[4] = 0x42;
+        cmsWriteTag(h, cmsSigPs2CRD0Tag, d);
+        break;
+    }
+    case RCMS_T1_DATETIME: {
+        struct tm t;
+        memset(&t, 0, sizeof(t));
+        t.tm_year = 2030 - 1900; t.tm_mon = 11 - 1; t.tm_mday = 23;
+        t.tm_hour = 7; t.tm_min = 8; t.tm_sec = 9;
+        cmsWriteTag(h, cmsSigDateTimeTag, &t);
+        break;
+    }
+    case RCMS_T1_CHROMATICITY: {
+        cmsCIExyYTRIPLE c;
+        c.Red.x   = 0.640; c.Red.y   = 0.330; c.Red.Y   = 1.0;
+        c.Green.x = 0.300; c.Green.y = 0.600; c.Green.Y = 1.0;
+        c.Blue.x  = 0.150; c.Blue.y  = 0.060; c.Blue.Y  = 1.0;
+        cmsWriteTag(h, cmsSigChromaticityTag, &c);
+        break;
+    }
+    case RCMS_T1_COLORANT_ORDER: {
+        /* Type_ColorantOrderType expects a 16-byte array padded with 0xFF; the
+           first `Count` non-0xFF entries are written. Use 4 colorants KCMY. */
+        cmsUInt8Number order[16];
+        memset(order, 0xFF, sizeof(order));
+        order[0] = 3; order[1] = 0; order[2] = 1; order[3] = 2;
+        cmsWriteTag(h, cmsSigColorantOrderTag, order);
+        break;
+    }
+    case RCMS_T1_SF32: {
+        /* S15Fixed16Array: chromaticAdaptation default is sf32. 9 values. */
+        cmsFloat64Number v[9] = {
+            1.0478, 0.0229, -0.0501,
+            0.0296, 0.9905, -0.0171,
+            -0.0092, 0.0151, 0.7517
+        };
+        cmsWriteTag(h, cmsSigChromaticAdaptationTag, v);
+        break;
+    }
+    case RCMS_T1_MEASUREMENT: {
+        cmsICCMeasurementConditions mc;
+        mc.Observer = 1;
+        mc.Backing.X = 0.0; mc.Backing.Y = 0.0; mc.Backing.Z = 0.0;
+        mc.Geometry = 1;
+        mc.Flare = 0.01;
+        mc.IlluminantType = 3; /* D50 */
+        cmsWriteTag(h, cmsSigMeasurementTag, &mc);
+        break;
+    }
+    case RCMS_T1_VIEWING: {
+        cmsICCViewingConditions vc;
+        vc.IlluminantXYZ.X = 0.9642; vc.IlluminantXYZ.Y = 1.0; vc.IlluminantXYZ.Z = 0.8249;
+        vc.SurroundXYZ.X = 0.5; vc.SurroundXYZ.Y = 0.6; vc.SurroundXYZ.Z = 0.7;
+        vc.IlluminantType = 1;
+        cmsWriteTag(h, cmsSigViewingConditionsTag, &vc);
+        break;
+    }
+    case RCMS_T1_COLORANT_TABLE: {
+        cmsNAMEDCOLORLIST* nc = cmsAllocNamedColorList(NULL, 3, 3, "", "");
+        cmsUInt16Number pcs0[3] = { 0x1111, 0x2222, 0x3333 };
+        cmsUInt16Number pcs1[3] = { 0x4444, 0x5555, 0x6666 };
+        cmsUInt16Number pcs2[3] = { 0x7777, 0x8888, 0x9999 };
+        cmsUInt16Number dev[3]  = { 0, 0, 0 };
+        cmsAppendNamedColor(nc, "Cyan", pcs0, dev);
+        cmsAppendNamedColor(nc, "Magenta", pcs1, dev);
+        cmsAppendNamedColor(nc, "Yellow", pcs2, dev);
+        cmsWriteTag(h, cmsSigColorantTableTag, nc);
+        cmsFreeNamedColorList(nc);
+        break;
+    }
+    case RCMS_T1_CICP: {
+        cmsVideoSignalType cicp;
+        cicp.ColourPrimaries = 9;
+        cicp.TransferCharacteristics = 16;
+        cicp.MatrixCoefficients = 9;
+        cicp.VideoFullRangeFlag = 1;
+        cmsWriteTag(h, cmsSigcicpTag, &cicp);
+        break;
+    }
+    case RCMS_T1_XYZ_LUMI: {
+        cmsCIEXYZ v; v.X = 80.0; v.Y = 100.0; v.Z = 90.0;
+        cmsWriteTag(h, cmsSigLuminanceTag, &v);
+        break;
+    }
+    default:
+        cmsCloseProfile(h);
+        return 0;
+    }
+
+    return rcms_oracle_finish_save(h, out, cap);
+}
+
 /* Returns bytes written (>0) on success, or 0 on failure. If out==NULL just
    returns the required length (size query). link!=0 links gXYZ/bXYZ to rXYZ. */
 uint32_t rcms_oracle_save_basic_profile(int link, uint8_t* out, uint32_t cap) {

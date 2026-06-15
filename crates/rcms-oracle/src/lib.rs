@@ -70,6 +70,7 @@ unsafe extern "C" {
     fn rcms_oracle_tag_true_type(buf: *const u8, len: u32, sig: u32) -> u32;
     fn rcms_oracle_tag_read_succeeds(buf: *const u8, len: u32, sig: u32) -> i32;
     fn rcms_oracle_save_basic_profile(link: i32, out: *mut u8, cap: u32) -> u32;
+    fn rcms_oracle_save_single_tag(which: i32, out: *mut u8, cap: u32) -> u32;
     fn rcms_oracle_tetra16(
         grid: *const u32,
         n_out: u32,
@@ -2889,6 +2890,27 @@ pub fn save_basic_profile(link: bool) -> Option<Vec<u8>> {
     // SAFETY: `out` has exactly `needed` bytes of room; C writes at most `cap`
     // bytes (it bails if needed > cap) and returns the count actually written.
     let written = unsafe { rcms_oracle_save_basic_profile(link as i32, out.as_mut_ptr(), needed) };
+    if written == 0 {
+        return None;
+    }
+    out.truncate(written as usize);
+    Some(out)
+}
+
+/// lcms2 serializes a profile carrying the deterministic v4.4 header plus ONE tag
+/// of the type selected by `which` (see the `RCMS_T1_*` enum in `shim.c`), built
+/// with fixed representative values. Returns the whole-profile bytes, or `None` on
+/// failure. rcms constructs the identical structure; the bytes must match.
+pub fn save_single_tag(which: i32) -> Option<Vec<u8>> {
+    // SAFETY: out=NULL size query; C only reads `which` and returns the length.
+    let needed = unsafe { rcms_oracle_save_single_tag(which, core::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return None;
+    }
+    let mut out = vec![0u8; needed as usize];
+    // SAFETY: `out` has exactly `needed` bytes; C writes at most `cap` and bails
+    // if needed > cap, returning the count written.
+    let written = unsafe { rcms_oracle_save_single_tag(which, out.as_mut_ptr(), needed) };
     if written == 0 {
         return None;
     }
