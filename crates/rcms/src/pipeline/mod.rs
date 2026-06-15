@@ -8,7 +8,7 @@
 pub mod clut;
 mod stage;
 
-pub use clut::{Clut, ClutTable};
+pub use clut::{Clut, ClutTable, ResolvedInterp};
 pub use stage::Stage;
 
 use crate::compat::floor::{FloorStrategy, Lcms2Floor};

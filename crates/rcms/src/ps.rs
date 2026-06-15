@@ -228,6 +228,7 @@ fn clut_interp(params: &InterpParams) -> Interp16 {
     match interp_factory(params.n_inputs, params.n_outputs, false, false) {
         InterpFn::Lerp16(l) => l,
         InterpFn::LerpFloat(_) => unreachable!("16-bit CLUT selects Lerp16"),
+        InterpFn::Custom(_) => unreachable!("builtin interp_factory never returns Custom"),
     }
 }
 
