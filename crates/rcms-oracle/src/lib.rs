@@ -416,6 +416,62 @@ unsafe extern "C" {
         out_chans: u32,
         n_pixels: u32,
     ) -> i32;
+
+    // Pixel-format unpack/pack via lcms2's real stock formatters (cmspack.c).
+    fn rcms_oracle_unpack16(fmt: u32, buf: *const u8, out: *mut u16);
+    fn rcms_oracle_pack16(fmt: u32, values: *const u16, out: *mut u8, nbytes: *mut u32);
+
+    fn rcms_oracle_from_8_to_16(v: u8) -> u16;
+    fn rcms_oracle_from_16_to_8(v: u16) -> u8;
+}
+
+/// lcms2 `FROM_8_TO_16` (lcms2_internal.h:125).
+pub fn from_8_to_16(v: u8) -> u16 {
+    // SAFETY: pure arithmetic macro, no pointers.
+    unsafe { rcms_oracle_from_8_to_16(v) }
+}
+
+/// lcms2 `FROM_16_TO_8` (lcms2_internal.h:126).
+pub fn from_16_to_8(v: u16) -> u8 {
+    // SAFETY: pure arithmetic macro, no pointers.
+    unsafe { rcms_oracle_from_16_to_8(v) }
+}
+
+/// lcms2 `cmsMAXCHANNELS` — the width of the formatter value array.
+pub const MAX_CHANNELS: usize = 16;
+
+/// Drive lcms2's real stock unpack formatter for `fmt` on `buf` and return the
+/// 16-bit values it produces (cmsMAXCHANNELS wide; channels beyond the format's
+/// T_CHANNELS are left zero, as lcms2 never writes them).
+///
+/// `buf` must hold at least one packed pixel for `fmt`; the caller sizes it.
+pub fn unpack16(fmt: u32, buf: &[u8]) -> [u16; MAX_CHANNELS] {
+    let mut out = [0u16; MAX_CHANNELS];
+    // SAFETY: `buf` is a valid readable slice; lcms2's stock 16-bit formatters
+    // read only the bytes for one pixel of `fmt` (which the caller guarantees
+    // are present) and write only T_CHANNELS(fmt) <= MAX_CHANNELS u16 entries
+    // into `out`. The shim sets a zeroed _cmsTRANSFORM with only InputFormat,
+    // which is the sole field these formatters read.
+    unsafe {
+        rcms_oracle_unpack16(fmt, buf.as_ptr(), out.as_mut_ptr());
+    }
+    out
+}
+
+/// Drive lcms2's real stock pack formatter for `fmt` on `values` and return the
+/// packed bytes it writes. `out` must be large enough for one packed pixel of
+/// `fmt`; the returned slice length is the byte count lcms2 advanced.
+pub fn pack16(fmt: u32, values: &[u16; MAX_CHANNELS], out: &mut [u8]) -> usize {
+    let mut nbytes: u32 = 0;
+    // SAFETY: `values` is MAX_CHANNELS wide (lcms2 reads at most T_CHANNELS +
+    // T_EXTRA entries); `out` is a valid writable slice the caller sized to one
+    // packed pixel for `fmt`. The shim sets a zeroed _cmsTRANSFORM with only
+    // OutputFormat, the sole field these packers read, and returns the advanced
+    // byte count via `nbytes`.
+    unsafe {
+        rcms_oracle_pack16(fmt, values.as_ptr(), out.as_mut_ptr(), &mut nbytes);
+    }
+    nbytes as usize
 }
 
 /// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).

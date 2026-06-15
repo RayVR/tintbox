@@ -72,6 +72,20 @@ impl Half {
     }
 }
 
+/// lcms2 `FROM_8_TO_16` (lcms2_internal.h:125): `(rgb << 8) | rgb`.
+/// Replicates an 8-bit sample across both bytes of a 16-bit one.
+pub const fn from_8_to_16(rgb: u8) -> u16 {
+    ((rgb as u16) << 8) | (rgb as u16)
+}
+
+/// lcms2 `FROM_16_TO_8` (lcms2_internal.h:126):
+/// `((rgb * 65281 + 8388608) >> 24) & 0xFF`.
+/// NOTE: this is the exact integer form lcms2 uses — NOT the older
+/// `(v + 0x80) >> 8` rounding. 65281 = 0xFF01, 8388608 = 0x800000.
+pub const fn from_16_to_8(rgb: u16) -> u8 {
+    (((rgb as u32 * 65281 + 8_388_608) >> 24) & 0xFF) as u8
+}
+
 /// lcms2 `_cmsToFixedDomain` (lcms2_internal.h:151): a + (a + 0x7fff)/0xffff.
 /// NOTE: the `/0xffff` is integer division, NOT a shift — do not "simplify".
 pub const fn to_fixed_domain(a: i32) -> i32 {
@@ -118,6 +132,26 @@ mod tests {
             assert_eq!(
                 U8Fixed8::from_f64(v).to_raw(),
                 rcms_oracle::double_to_8fixed8(v),
+                "v={v}"
+            );
+        }
+    }
+    #[test]
+    fn from_8_to_16_matches_oracle() {
+        for v in 0u16..=255 {
+            assert_eq!(
+                from_8_to_16(v as u8),
+                rcms_oracle::from_8_to_16(v as u8),
+                "v={v}"
+            );
+        }
+    }
+    #[test]
+    fn from_16_to_8_matches_oracle() {
+        for v in 0u32..=0xffff {
+            assert_eq!(
+                from_16_to_8(v as u16),
+                rcms_oracle::from_16_to_8(v as u16),
                 "v={v}"
             );
         }

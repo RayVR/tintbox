@@ -1555,3 +1555,38 @@ int rcms_oracle_transform_eval_16(const uint8_t* const* bufs, const uint32_t* le
     free(profiles); free(bpcArr); free(intArr); free(adArr);
     return ok;
 }
+
+/* ---- Pixel-format unpack/pack formatters (cmspack.c) ----------------------
+   Drive lcms2's REAL stock unpack/pack formatters in isolation. The stock
+   16-bit formatters read only info->InputFormat / info->OutputFormat (verified
+   against cmspack.c: every formatter pulls T_* fields off that one word and
+   touches no other transform field), so a zeroed _cmsTRANSFORM with just the
+   format word set reproduces exactly what cmsDoTransform's FromInput/ToOutput
+   would do for these simple chunky/planar-free types. We fetch the formatter
+   via the exported _cmsGetFormatter(NULL, fmt, dir, CMS_PACK_FLAGS_16BITS) and
+   call its .Fmt16 pointer. Stride is 0 (chunky single pixel). */
+
+void rcms_oracle_unpack16(uint32_t fmt, const uint8_t* buf, uint16_t* out) {
+    _cmsTRANSFORM info;
+    memset(&info, 0, sizeof(info));
+    info.InputFormat = fmt;
+    cmsFormatter fn = _cmsGetFormatter(NULL, fmt, cmsFormatterInput, CMS_PACK_FLAGS_16BITS);
+    if (fn.Fmt16 == NULL) return;
+    /* Formatter writes only T_CHANNELS(fmt) entries; caller zeroes the rest. */
+    fn.Fmt16(&info, out, (cmsUInt8Number*) buf, 0);
+}
+
+void rcms_oracle_pack16(uint32_t fmt, const uint16_t* values, uint8_t* out, uint32_t* nbytes) {
+    _cmsTRANSFORM info;
+    memset(&info, 0, sizeof(info));
+    info.OutputFormat = fmt;
+    cmsFormatter fn = _cmsGetFormatter(NULL, fmt, cmsFormatterOutput, CMS_PACK_FLAGS_16BITS);
+    if (fn.Fmt16 == NULL) { *nbytes = 0; return; }
+    /* cmsUInt16Number wOut[] is const-by-contract for packers; cast away const. */
+    cmsUInt8Number* end = fn.Fmt16(&info, (cmsUInt16Number*) values, out, 0);
+    *nbytes = (uint32_t) (end - out);
+}
+
+/* lcms2 FROM_8_TO_16 / FROM_16_TO_8 (lcms2_internal.h:125-126). */
+uint16_t rcms_oracle_from_8_to_16(uint8_t v) { return FROM_8_TO_16(v); }
+uint8_t  rcms_oracle_from_16_to_8(uint16_t v) { return FROM_16_TO_8(v); }
