@@ -25,6 +25,7 @@ pub mod named;
 pub mod opt;
 pub mod pcs;
 pub mod pipeline;
+pub mod plugin;
 pub mod profile;
 pub mod ps;
 pub mod sig;

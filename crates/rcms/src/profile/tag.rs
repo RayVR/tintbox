@@ -12,6 +12,9 @@ use crate::fixed::{S15Fixed16, U16Fixed16};
 use crate::pipeline::Pipeline;
 use crate::profile::header::DateTime;
 use crate::sig::Signature;
+use core::any::Any;
+use core::fmt;
+use std::sync::Arc;
 
 /// A decoded ICC tag value. One variant per supported on-disk tag *type*.
 #[derive(Clone, Debug, PartialEq)]
@@ -112,6 +115,44 @@ pub enum Tag {
     /// decode in lcms2 to a `cmsPipeline`, so they share one Rust value. Carried
     /// by the A2Bx / B2Ax / gamut / preview LUT tags.
     Lut(Pipeline),
+    /// A custom tag value produced by a [`TagTypePlugin`](crate::plugin::TagTypePlugin)
+    /// (slice-8). `type_sig` is the on-disk type signature the plugin reads/writes;
+    /// `data` is the plugin's opaque cooked value, kept behind an [`Arc`] so the
+    /// whole enum stays `Clone`. Built-in dispatch never produces this variant —
+    /// only a registered plugin does — and every built-in match treats it as
+    /// opaque pass-through.
+    Custom(CustomTagData),
+}
+
+/// The opaque payload of [`Tag::Custom`]: an on-disk type signature plus a
+/// type-erased, thread-safe, reference-counted plugin value. A newtype so [`Tag`]
+/// can keep its `#[derive(Clone, Debug, PartialEq)]` — `Arc<dyn Any + Send + Sync>`
+/// implements none of `Debug`/`PartialEq`, so this wrapper supplies hand-written
+/// impls (pointer identity for equality, the type signature for `Debug`).
+#[derive(Clone)]
+pub struct CustomTagData {
+    /// The on-disk tag type signature this value reads/writes as.
+    pub type_sig: Signature,
+    /// The plugin's cooked value, type-erased behind a shared, thread-safe handle.
+    pub data: Arc<dyn Any + Send + Sync>,
+}
+
+impl fmt::Debug for CustomTagData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CustomTagData")
+            .field("type_sig", &self.type_sig)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for CustomTagData {
+    /// Two custom payloads are equal iff they share the same type signature and
+    /// the SAME underlying allocation (pointer identity). An opaque `dyn Any` has
+    /// no structural equality, so identity is the only sound comparison; cloning a
+    /// `Tag::Custom` (which clones the `Arc`) preserves it.
+    fn eq(&self, other: &Self) -> bool {
+        self.type_sig == other.type_sig && Arc::ptr_eq(&self.data, &other.data)
+    }
 }
 
 /// One named colour of a `cmsNAMEDCOLORLIST` (`cmstypes.c:3369`). `name` is the

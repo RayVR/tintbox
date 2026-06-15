@@ -78,6 +78,28 @@ pub enum OptimizedEval {
     Baked(Box<BakedEval>),
 }
 
+/// A custom pipeline optimizer (lcms2 `cmsPluginOptimization`). Registered via
+/// [`Context::set_optimizer`](crate::context::Context::set_optimizer) and
+/// re-exported from [`crate::plugin`]. The optimizer is consulted at
+/// [`Transform`](crate::transform::Transform) construction (T2), BEFORE the
+/// builtin strategy chain; returning `None` declines and falls through to the
+/// builtin path, preserving the builtin-wins invariant. The lookup resolves to a
+/// concrete [`OptimizedEval`] before any hot loop, so the per-pixel path never
+/// touches `Context`/`Arc`.
+pub trait Optimizer: Send + Sync {
+    /// Resolve a specialized evaluator for `lut` under the given in/out format
+    /// words and rendering `intent`, or `None` to decline (fall through to the
+    /// builtin [`OptimizationStrategy`]). Mirrors lcms2's
+    /// `_cmsOptimizationPluginChunk` `OptimizePtr` callback.
+    fn optimize(
+        &self,
+        lut: &Pipeline,
+        in_fmt: u32,
+        out_fmt: u32,
+        intent: u32,
+    ) -> Option<OptimizedEval>;
+}
+
 impl OptimizationStrategy {
     /// Build the [`OptimizedEval`] for `lut` under the given in/out format words
     /// and rendering `intent` (lcms2 `_cmsOptimizePipeline`). `Accurate` always

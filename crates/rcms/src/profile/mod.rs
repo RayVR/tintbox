@@ -13,7 +13,7 @@ pub mod virtuals;
 pub use directory::TagEntry;
 pub use header::{ColorSpace, DateTime, Header, ProfileClass, RenderingIntent};
 pub use serialize::{save_to_mem, SlotContent, TagSlot, WritableProfile};
-pub use tag::Tag;
+pub use tag::{CustomTagData, Tag};
 
 use crate::error::{Error, Result};
 use crate::io::{MemReader, ProfileReader};
@@ -278,7 +278,10 @@ fn elem_count(tag: &Tag) -> u32 {
         | Tag::Vcgt(_)
         | Tag::UcrBg { .. }
         // Type_LUT8_Read and Type_LUT16_Read both set *nItems = 1.
-        | Tag::Lut(_) => 1,
+        | Tag::Lut(_)
+        // A plugin tag's element count is opaque; treat it as a single value
+        // (the §7.5 count validation never runs against a custom type).
+        | Tag::Custom(_) => 1,
     }
 }
 
