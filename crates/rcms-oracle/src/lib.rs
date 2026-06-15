@@ -3260,3 +3260,199 @@ mod transcendental_probe {
         );
     }
 }
+
+// ==== slice9-cgats ====
+// CGATS / IT8.7 measurement-file parser + writer oracle (cmscgats.c).
+
+use std::ffi::{CStr, CString};
+
+unsafe extern "C" {
+    fn rcms_oracle_it8_load(bytes: *const u8, len: u32) -> usize;
+    fn rcms_oracle_it8_free(h: usize);
+    fn rcms_oracle_it8_table_count(h: usize) -> u32;
+    fn rcms_oracle_it8_set_table(h: usize, n: u32) -> i32;
+    fn rcms_oracle_it8_sheet_type(h: usize) -> *const std::os::raw::c_char;
+    fn rcms_oracle_it8_get_property(
+        h: usize,
+        key: *const std::os::raw::c_char,
+    ) -> *const std::os::raw::c_char;
+    fn rcms_oracle_it8_get_property_dbl(h: usize, key: *const std::os::raw::c_char) -> f64;
+    fn rcms_oracle_it8_num_samples(h: usize) -> i32;
+    fn rcms_oracle_it8_enum_properties(
+        h: usize,
+        out: *mut *const std::os::raw::c_char,
+        cap: u32,
+    ) -> u32;
+    fn rcms_oracle_it8_data_format(h: usize, col: i32) -> *const std::os::raw::c_char;
+    fn rcms_oracle_it8_get_data_rowcol(h: usize, row: i32, col: i32)
+        -> *const std::os::raw::c_char;
+    fn rcms_oracle_it8_get_data_rowcol_dbl(h: usize, row: i32, col: i32) -> f64;
+    fn rcms_oracle_it8_get_data(
+        h: usize,
+        patch: *const std::os::raw::c_char,
+        sample: *const std::os::raw::c_char,
+    ) -> *const std::os::raw::c_char;
+    fn rcms_oracle_it8_get_data_dbl(
+        h: usize,
+        patch: *const std::os::raw::c_char,
+        sample: *const std::os::raw::c_char,
+    ) -> f64;
+    fn rcms_oracle_it8_patch_name(h: usize, patch: i32) -> *const std::os::raw::c_char;
+    fn rcms_oracle_it8_save(h: usize, out: *mut u8, cap: u32) -> u32;
+}
+
+/// Owning RAII handle around a loaded lcms2 `cmsHANDLE` IT8 object. `Drop` calls
+/// `cmsIT8Free` exactly once. All accessor strings are copied out (lcms2 owns the
+/// underlying storage for the lifetime of the handle, so we copy immediately).
+pub struct It8 {
+    h: usize,
+}
+
+/// Helper: copy a (possibly null) borrowed C string into an owned `String`.
+///
+/// # Safety
+/// `p` must be null or a valid NUL-terminated C string owned by lcms2 for the
+/// duration of this call.
+unsafe fn opt_cstr(p: *const std::os::raw::c_char) -> Option<String> {
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+    }
+}
+
+impl It8 {
+    /// lcms2 `cmsIT8LoadFromMem`. `None` if lcms2 rejects the buffer (the
+    /// accept/reject decision rcms must agree with).
+    pub fn load(bytes: &[u8]) -> Option<It8> {
+        // SAFETY: `bytes` is a readable slice C only reads (it copies it into an
+        // owned in-memory buffer). The returned handle (or 0) is owned by us.
+        let h = unsafe { rcms_oracle_it8_load(bytes.as_ptr(), bytes.len() as u32) };
+        if h == 0 {
+            None
+        } else {
+            Some(It8 { h })
+        }
+    }
+
+    /// `cmsIT8TableCount`.
+    pub fn table_count(&self) -> u32 {
+        // SAFETY: `self.h` is a live handle owned by `self`.
+        unsafe { rcms_oracle_it8_table_count(self.h) }
+    }
+
+    /// `cmsIT8SetTable`; returns the new index or `-1`.
+    pub fn set_table(&self, n: u32) -> i32 {
+        // SAFETY: live handle.
+        unsafe { rcms_oracle_it8_set_table(self.h, n) }
+    }
+
+    /// `cmsIT8GetSheetType` for the active table.
+    pub fn sheet_type(&self) -> Option<String> {
+        // SAFETY: live handle; the returned pointer is borrowed and copied here.
+        unsafe { opt_cstr(rcms_oracle_it8_sheet_type(self.h)) }
+    }
+
+    /// `cmsIT8GetProperty` (string), `None` if absent.
+    pub fn get_property(&self, key: &str) -> Option<String> {
+        let k = CString::new(key).ok()?;
+        // SAFETY: live handle; `k` is a valid NUL-terminated string C only reads;
+        // the result pointer is borrowed and copied here.
+        unsafe { opt_cstr(rcms_oracle_it8_get_property(self.h, k.as_ptr())) }
+    }
+
+    /// `cmsIT8GetPropertyDbl`.
+    pub fn get_property_dbl(&self, key: &str) -> f64 {
+        let k = CString::new(key).unwrap();
+        // SAFETY: live handle; `k` is a valid NUL-terminated string C only reads.
+        unsafe { rcms_oracle_it8_get_property_dbl(self.h, k.as_ptr()) }
+    }
+
+    /// `cmsIT8EnumDataFormat` field count for the active table.
+    pub fn num_samples(&self) -> i32 {
+        // SAFETY: live handle.
+        unsafe { rcms_oracle_it8_num_samples(self.h) }
+    }
+
+    /// `cmsIT8EnumProperties` — property keyword names of the active table.
+    pub fn enum_properties(&self) -> Vec<String> {
+        // First count.
+        // SAFETY: live handle; null out-pointer makes C only return the count.
+        let n = unsafe { rcms_oracle_it8_enum_properties(self.h, std::ptr::null_mut(), 0) };
+        let mut ptrs: Vec<*const std::os::raw::c_char> = vec![std::ptr::null(); n as usize];
+        // SAFETY: live handle; `ptrs` has capacity `n`, C writes up to `n`
+        // borrowed name pointers.
+        unsafe { rcms_oracle_it8_enum_properties(self.h, ptrs.as_mut_ptr(), n) };
+        ptrs.into_iter()
+            // SAFETY: each pointer is a borrowed lcms2 string copied here.
+            .map(|p| unsafe { opt_cstr(p) }.unwrap_or_default())
+            .collect()
+    }
+
+    /// DATA_FORMAT label for column `col`, `None` if out of range.
+    pub fn data_format(&self, col: i32) -> Option<String> {
+        // SAFETY: live handle; borrowed result copied here.
+        unsafe { opt_cstr(rcms_oracle_it8_data_format(self.h, col)) }
+    }
+
+    /// `cmsIT8GetDataRowCol` (string), `None` if out of range.
+    pub fn get_data_rowcol(&self, row: i32, col: i32) -> Option<String> {
+        // SAFETY: live handle; borrowed result copied here.
+        unsafe { opt_cstr(rcms_oracle_it8_get_data_rowcol(self.h, row, col)) }
+    }
+
+    /// `cmsIT8GetDataRowColDbl`.
+    pub fn get_data_rowcol_dbl(&self, row: i32, col: i32) -> f64 {
+        // SAFETY: live handle.
+        unsafe { rcms_oracle_it8_get_data_rowcol_dbl(self.h, row, col) }
+    }
+
+    /// `cmsIT8GetData` by patch + sample name (string), `None` if not found.
+    pub fn get_data(&self, patch: &str, sample: &str) -> Option<String> {
+        let p = CString::new(patch).ok()?;
+        let s = CString::new(sample).ok()?;
+        // SAFETY: live handle; `p`/`s` are valid NUL-terminated strings C only
+        // reads; the result pointer is borrowed and copied here.
+        unsafe { opt_cstr(rcms_oracle_it8_get_data(self.h, p.as_ptr(), s.as_ptr())) }
+    }
+
+    /// `cmsIT8GetDataDbl` by patch + sample name.
+    pub fn get_data_dbl(&self, patch: &str, sample: &str) -> f64 {
+        let p = CString::new(patch).unwrap();
+        let s = CString::new(sample).unwrap();
+        // SAFETY: live handle; `p`/`s` are valid NUL-terminated strings C reads.
+        unsafe { rcms_oracle_it8_get_data_dbl(self.h, p.as_ptr(), s.as_ptr()) }
+    }
+
+    /// `cmsIT8GetPatchName` for the active table, `None` if no SAMPLE_ID data.
+    pub fn patch_name(&self, patch: i32) -> Option<String> {
+        // SAFETY: live handle; borrowed result copied here.
+        unsafe { opt_cstr(rcms_oracle_it8_patch_name(self.h, patch)) }
+    }
+
+    /// `cmsIT8SaveToMem` round-trip — the byte-exact serialized text INCLUDING
+    /// the trailing NUL byte that lcms2 writes. `None` on failure.
+    pub fn save(&self) -> Option<Vec<u8>> {
+        // SAFETY: live handle; null out-pointer returns the needed size.
+        let needed = unsafe { rcms_oracle_it8_save(self.h, std::ptr::null_mut(), 0) };
+        if needed == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        // SAFETY: live handle; `buf` has `needed` bytes of capacity, C writes
+        // exactly `needed` bytes (incl. trailing NUL).
+        let written = unsafe { rcms_oracle_it8_save(self.h, buf.as_mut_ptr(), needed) };
+        if written == 0 {
+            return None;
+        }
+        buf.truncate(written as usize);
+        Some(buf)
+    }
+}
+
+impl Drop for It8 {
+    fn drop(&mut self) {
+        // SAFETY: `self.h` is a live handle owned by `self`, freed exactly once.
+        unsafe { rcms_oracle_it8_free(self.h) }
+    }
+}

@@ -2422,3 +2422,102 @@ int rcms_oracle_detect_destination_black_point(const uint8_t* bytes, uint32_t le
     cmsCloseProfile(h);
     return ok ? 1 : 0;
 }
+
+// ==== slice9-cgats ====
+/* CGATS / IT8.7 measurement-file parser + writer (cmscgats.c).
+   These expose lcms2's cmsIT8LoadFromMem + read accessors + cmsIT8SaveToMem so
+   the Rust side can diff parse results and the byte-exact serialized output.
+
+   Handle model: rcms_oracle_it8_load returns the cmsHANDLE as a uintptr_t (0 on
+   reject). The caller passes it back to the accessor functions and must call
+   rcms_oracle_it8_free exactly once. lcms2 owns all returned string pointers for
+   the lifetime of the handle; the Rust side copies them out immediately. */
+
+uintptr_t rcms_oracle_it8_load(const uint8_t* bytes, uint32_t len) {
+    cmsHANDLE h = cmsIT8LoadFromMem(NULL, (const void*) bytes, len);
+    return (uintptr_t) h;
+}
+
+void rcms_oracle_it8_free(uintptr_t h) {
+    if (h) cmsIT8Free((cmsHANDLE) h);
+}
+
+uint32_t rcms_oracle_it8_table_count(uintptr_t h) {
+    return cmsIT8TableCount((cmsHANDLE) h);
+}
+
+/* Select active table; returns the resulting table index or -1 on error. */
+int32_t rcms_oracle_it8_set_table(uintptr_t h, uint32_t n) {
+    return cmsIT8SetTable((cmsHANDLE) h, n);
+}
+
+const char* rcms_oracle_it8_sheet_type(uintptr_t h) {
+    return cmsIT8GetSheetType((cmsHANDLE) h);
+}
+
+/* Property string value, or NULL if absent. */
+const char* rcms_oracle_it8_get_property(uintptr_t h, const char* key) {
+    return cmsIT8GetProperty((cmsHANDLE) h, key);
+}
+
+double rcms_oracle_it8_get_property_dbl(uintptr_t h, const char* key) {
+    return cmsIT8GetPropertyDbl((cmsHANDLE) h, key);
+}
+
+/* Number of fields / sets for the active table (mirrors NUMBER_OF_FIELDS/SETS). */
+int32_t rcms_oracle_it8_num_samples(uintptr_t h) {
+    return cmsIT8EnumDataFormat((cmsHANDLE) h, NULL);
+}
+
+/* Enumerate property names of the active table. Returns count; writes up to
+   `cap` borrowed name pointers into out[]. */
+uint32_t rcms_oracle_it8_enum_properties(uintptr_t h, const char** out, uint32_t cap) {
+    char** props = NULL;
+    uint32_t n = cmsIT8EnumProperties((cmsHANDLE) h, &props);
+    uint32_t i;
+    for (i = 0; i < n && i < cap; i++) out[i] = props[i];
+    return n;
+}
+
+/* DATA_FORMAT label for column `col`, or NULL. */
+const char* rcms_oracle_it8_data_format(uintptr_t h, int32_t col) {
+    char** names = NULL;
+    int n = cmsIT8EnumDataFormat((cmsHANDLE) h, &names);
+    if (!names || col < 0 || col >= n) return NULL;
+    return names[col];
+}
+
+const char* rcms_oracle_it8_get_data_rowcol(uintptr_t h, int32_t row, int32_t col) {
+    return cmsIT8GetDataRowCol((cmsHANDLE) h, row, col);
+}
+
+double rcms_oracle_it8_get_data_rowcol_dbl(uintptr_t h, int32_t row, int32_t col) {
+    return cmsIT8GetDataRowColDbl((cmsHANDLE) h, row, col);
+}
+
+const char* rcms_oracle_it8_get_data(uintptr_t h, const char* patch, const char* sample) {
+    return cmsIT8GetData((cmsHANDLE) h, patch, sample);
+}
+
+double rcms_oracle_it8_get_data_dbl(uintptr_t h, const char* patch, const char* sample) {
+    return cmsIT8GetDataDbl((cmsHANDLE) h, patch, sample);
+}
+
+/* cmsIT8GetPatchName for the active table; returns borrowed pointer or NULL. */
+const char* rcms_oracle_it8_patch_name(uintptr_t h, int32_t patch) {
+    return cmsIT8GetPatchName((cmsHANDLE) h, patch, NULL);
+}
+
+/* cmsIT8SaveToMem round-trip. Writes the serialized text (incl. trailing NUL)
+   into `out` (capacity `cap`) and returns the byte count lcms2 reports
+   (BytesNeeded, including the NUL). If `out` is NULL or too small, returns the
+   needed size without writing (so the caller can size its buffer). Returns 0 on
+   failure. */
+uint32_t rcms_oracle_it8_save(uintptr_t h, uint8_t* out, uint32_t cap) {
+    cmsUInt32Number needed = 0;
+    if (!cmsIT8SaveToMem((cmsHANDLE) h, NULL, &needed)) return 0;
+    if (out == NULL || cap < needed) return needed;
+    needed = cap;
+    if (!cmsIT8SaveToMem((cmsHANDLE) h, out, &needed)) return 0;
+    return needed;
+}
