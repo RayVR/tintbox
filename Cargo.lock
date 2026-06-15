@@ -19,21 +19,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "rcms"
-version = "0.0.0"
-dependencies = [
- "rcms-oracle",
-]
-
-[[package]]
-name = "rcms-oracle"
-version = "0.0.0"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "tintbox"
+version = "0.1.0"
+dependencies = [
+ "tintbox-oracle",
+]
+
+[[package]]
+name = "tintbox-oracle"
+version = "0.0.0"
+dependencies = [
+ "cc",
+]

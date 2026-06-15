@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The rcms-oracle crate cc-builds the vendored C lcms2 submodule.
+          # The tintbox-oracle crate cc-builds the vendored C lcms2 submodule.
           submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
@@ -52,5 +52,5 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build rcms for wasm32
-        run: cargo build -p rcms --target wasm32-unknown-unknown
+      - name: Build tintbox for wasm32
+        run: cargo build -p tintbox --target wasm32-unknown-unknown

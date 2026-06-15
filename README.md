@@ -1,9 +1,9 @@
-# rcms
+# tintbox
 
 A pure-Rust, full-parity reimplementation of [Little CMS](https://littlecms.com)
 (lcms2 2.19.1) — the ICC color-management engine.
 
-`rcms` is written from scratch in safe Rust (`#![forbid(unsafe_code)]`), targets
+`tintbox` is written from scratch in safe Rust (`#![forbid(unsafe_code)]`), targets
 `std` with abstract I/O (so it builds cleanly for `wasm32`), and is **verified
 bit-identical to the C library by differential testing** — not "close enough",
 byte-for-byte.
@@ -24,7 +24,7 @@ wins over linking the C library:
 ## Bit-identity is the contract
 
 Correctness is defined as *producing the same bytes as lcms2*. A test-only
-`rcms-oracle` crate `cc`-builds the vendored C lcms2 (pinned at tag `lcms2.19.1`)
+`tintbox-oracle` crate `cc`-builds the vendored C lcms2 (pinned at tag `lcms2.19.1`)
 plus thin shims, and every numeric path is swept against it: pixel transforms,
 tag parsing, profile serialization, virtual profiles, black-point detection,
 CIECAM02, gamut/TAC, PostScript generation, and more. Where a value depends on a
@@ -32,7 +32,7 @@ documented lcms2 quirk (e.g. the 1998 `quick_floor` rounding hack, 1.14
 fixed-point matrix-shapers), the quirk is reproduced exactly and isolated behind
 a compile-time strategy seam so an alternative can be swapped in and measured.
 
-The shipped `rcms` crate contains **no C and no `unsafe`**; the C only exists in
+The shipped `tintbox` crate contains **no C and no `unsafe`**; the C only exists in
 the test oracle.
 
 ## Status
@@ -55,8 +55,8 @@ tested against lcms2:
 ## Usage
 
 ```rust
-use rcms::prelude::*;
-use rcms::format::decode::{TYPE_RGB_8, TYPE_CMYK_8};
+use tintbox::prelude::*;
+use tintbox::format::decode::{TYPE_RGB_8, TYPE_CMYK_8};
 
 // Build a transform between two profiles and convert packed pixels.
 let input = Profile::open(&srgb_icc)?;
@@ -78,9 +78,9 @@ The default optimization strategy is `Accurate` (full-precision, lossless, and
 bit-identical to lcms2 run with `cmsFLAGS_NOOPTIMIZE`). Opt into
 `OptimizationStrategy::Lcms2Compat` for drop-in parity with stock lcms2-default.
 
-## Extending rcms (plugins)
+## Extending tintbox (plugins)
 
-lcms2 is extensible through a C plugin ABI. `rcms` exposes the same extension
+lcms2 is extensible through a C plugin ABI. `tintbox` exposes the same extension
 points as **idiomatic Rust traits**, registered on a `Context`:
 
 | Trait | Register | Real-world use |
@@ -96,7 +96,7 @@ concrete value *before* the per-pixel loop runs, so a plugin never slows the hot
 path. Crucially, **built-ins are always matched first** — a plugin can only
 service an id the engine doesn't already handle, so registering one *cannot
 perturb* the bit-identical built-in paths. An empty `Context` behaves exactly
-like stock rcms.
+like stock tintbox.
 
 ### Motivating example: keep black text black
 
@@ -109,8 +109,8 @@ as a Rust trait:
 
 ```rust
 use std::sync::Arc;
-use rcms::prelude::*;
-use rcms::link::default_icc_intents;
+use tintbox::prelude::*;
+use tintbox::link::default_icc_intents;
 
 struct PreserveBlack;
 
@@ -156,7 +156,7 @@ keeps using the verified default.
 
 ## Building & testing
 
-The workspace has two crates: `rcms` (the library) and `rcms-oracle` (test-only,
+The workspace has two crates: `tintbox` (the library) and `tintbox-oracle` (test-only,
 builds the C library for differential comparison).
 
 ```bash
@@ -166,11 +166,11 @@ git submodule update --init --recursive
 cargo test --workspace          # full differential suite (builds C lcms2 via cc)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
-cargo build -p rcms --target wasm32-unknown-unknown   # wasm builds without the oracle
+cargo build -p tintbox --target wasm32-unknown-unknown   # wasm builds without the oracle
 ```
 
 Building the oracle requires a C compiler (the vendored lcms2 is compiled with
-`cc`). The `rcms` crate itself has no C dependency.
+`cc`). The `tintbox` crate itself has no C dependency.
 
 ## License
 

@@ -1,0 +1,19 @@
+[package]
+name = "tintbox"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A pure-Rust, full-parity reimplementation of Little CMS (lcms2) — the ICC color-management engine. Memory-safe, no C, verified bit-identical to lcms2 by differential testing."
+repository = "https://github.com/RayVR/tintbox"
+readme = "../../README.md"
+keywords = ["color", "icc", "cms", "color-management", "lcms"]
+categories = ["graphics", "multimedia::images"]
+
+[features]
+default = ["std"]
+std = []
+file-io = ["std"]
+native-floor = []
+
+[dev-dependencies]
+tintbox-oracle = { path = "../tintbox-oracle" }
