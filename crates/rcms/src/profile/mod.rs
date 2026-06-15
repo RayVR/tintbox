@@ -31,6 +31,16 @@ pub struct Profile<'a> {
     /// Lazy per-tag decoded-value cache, keyed by the *resolved* (link-chased)
     /// tag signature. `read_tag` populates it on first read (lcms2 `TagPtrs`).
     cache: RefCell<BTreeMap<u32, Tag>>,
+    /// In-memory tag values keyed by signature, for profiles built directly from a
+    /// [`WritableProfile`] (the black-point detection virtuals). When present,
+    /// `read_tag` serves these in-memory values instead of parsing `bytes` — this
+    /// is what makes a built virtual link bit-identically to lcms2's freshly-built
+    /// `cmsCreate*Profile` (whose tags are in-memory `cmsPipeline`s, NOT
+    /// serialize→reparse-quantized). The companion `mem_true_types` map carries the
+    /// `DecideType` true-type each tag would serialize as (so the LUT V2/V4 gates
+    /// that key on `OriginalType == Lut16Type` match lcms2).
+    mem_tags: Option<BTreeMap<u32, Tag>>,
+    mem_true_types: BTreeMap<u32, Signature>,
 }
 
 impl<'a> Profile<'a> {
@@ -48,6 +58,55 @@ impl<'a> Profile<'a> {
             header,
             dir,
             cache: RefCell::new(BTreeMap::new()),
+            mem_tags: None,
+            mem_true_types: BTreeMap::new(),
+        })
+    }
+
+    /// Build a `Profile` directly from an in-memory [`WritableProfile`], serving its
+    /// tags from memory rather than from serialized bytes. Used by the black-point
+    /// detection virtuals (Lab2/Lab4): lcms2's `cmsDetectBlackPoint` links the
+    /// *freshly-built* virtual, whose tags are in-memory `cmsPipeline`s — a
+    /// serialize→reparse round-trip would 16-bit-quantize the identity CLUT and
+    /// diverge by up to half an LSB. Each tag's directory entry carries no byte
+    /// range (offset/size 0); `read_tag` short-circuits to the in-memory value, and
+    /// `tag_true_type` reports the `DecideType` true-type so the LUT V2/V4 gates
+    /// behave as for the native virtual.
+    pub fn from_writable(p: &WritableProfile) -> Result<Profile<'static>> {
+        let version = serialize::profile_version_float(p.header.version);
+        let mut dir = Vec::with_capacity(p.tags.len());
+        let mut mem = BTreeMap::new();
+        let mut true_types = BTreeMap::new();
+        for slot in &p.tags {
+            match &slot.content {
+                SlotContent::Body(value) => {
+                    dir.push(TagEntry {
+                        sig: slot.sig,
+                        offset: 0,
+                        size: 0,
+                        linked: None,
+                    });
+                    let ty = serialize::write_type_for(slot.sig, value, version)?;
+                    true_types.insert(slot.sig.to_raw(), ty);
+                    mem.insert(slot.sig.to_raw(), value.clone());
+                }
+                SlotContent::Linked(target) => {
+                    dir.push(TagEntry {
+                        sig: slot.sig,
+                        offset: 0,
+                        size: 0,
+                        linked: Some(*target),
+                    });
+                }
+            }
+        }
+        Ok(Profile {
+            bytes: &[],
+            header: p.header,
+            dir,
+            cache: RefCell::new(BTreeMap::new()),
+            mem_tags: Some(mem),
+            mem_true_types: true_types,
         })
     }
 
@@ -112,6 +171,9 @@ impl<'a> Profile<'a> {
     /// Needed by the V2↔V4 LUT gates, which key on `OriginalType == Lut16Type`.
     pub fn tag_true_type(&self, sig: Signature) -> Option<Signature> {
         let entry = self.search_tag(sig)?;
+        if self.mem_tags.is_some() {
+            return self.mem_true_types.get(&entry.sig.to_raw()).copied();
+        }
         let mut r = MemReader::new(self.bytes);
         r.seek(entry.offset as u64).ok()?;
         r.read_type_base().ok()
@@ -135,6 +197,11 @@ impl<'a> Profile<'a> {
         //    two links to the same data share one entry (lcms2 caches per slot n).
         let entry = *self.search_tag(sig).ok_or(Error::Range)?;
         let resolved = entry.sig;
+
+        // In-memory profile (from_writable): serve the built tag value directly.
+        if let Some(mem) = &self.mem_tags {
+            return mem.get(&resolved.to_raw()).cloned().ok_or(Error::Range);
+        }
 
         if let Some(cached) = self.cache.borrow().get(&resolved.to_raw()) {
             return Ok(cached.clone());

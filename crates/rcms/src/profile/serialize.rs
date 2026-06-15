@@ -364,7 +364,7 @@ fn base_to_base(mut input: u32, base_in: u32, base_out: u32) -> u32 {
 
 /// lcms2 `cmsGetProfileVersion` (cmsio0.c:1237): the BCD header version decoded to
 /// a float (e.g. `0x04400000` → 4.4). The DecideType deciders compare this to 4.0.
-fn profile_version_float(version: u32) -> f64 {
+pub(crate) fn profile_version_float(version: u32) -> f64 {
     base_to_base(version >> 16, 16, 10) as f64 / 100.0
 }
 
@@ -374,7 +374,7 @@ fn profile_version_float(version: u32) -> f64 {
 /// value shape (the rcms reader produces exactly one `Tag` variant per type), but
 /// the version-dependent deciders (curv/para, text/mluc/desc, LUT selection) need
 /// the tag SIGNATURE plus the profile version. We mirror the descriptor table.
-fn write_type_for(sig: Signature, value: &Tag, version: f64) -> Result<Signature> {
+pub(crate) fn write_type_for(sig: Signature, value: &Tag, version: f64) -> Result<Signature> {
     match value {
         // XYZType: rXYZ/gXYZ/bXYZ go through DecideXYZtype (always 'XYZ '); all
         // other XYZ-valued tags (wtpt/bkpt/lumi) default to 'XYZ '.
@@ -2707,6 +2707,7 @@ mod tests {
             table: ClutTable::F32(vec![0.0f32; n_entries]),
             params,
             is_trilinear: false,
+            implements_identity: false,
         }))
         .unwrap();
 

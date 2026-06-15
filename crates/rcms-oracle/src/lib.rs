@@ -508,6 +508,56 @@ unsafe extern "C" {
 
     fn rcms_oracle_from_8_to_16(v: u8) -> u16;
     fn rcms_oracle_from_16_to_8(v: u16) -> u8;
+
+    // Black-point detection (cmssamp.c): open a profile from bytes, run
+    // cmsDetectBlackPoint / cmsDetectDestinationBlackPoint, write the CIEXYZ.
+    fn rcms_oracle_detect_black_point(
+        bytes: *const u8,
+        len: u32,
+        intent: u32,
+        flags: u32,
+        out: *mut f64,
+    ) -> i32;
+    fn rcms_oracle_detect_destination_black_point(
+        bytes: *const u8,
+        len: u32,
+        intent: u32,
+        flags: u32,
+        out: *mut f64,
+    ) -> i32;
+}
+
+/// lcms2 `cmsDetectBlackPoint` over a profile loaded from `bytes` at `intent` +
+/// `flags`. Returns `(ok, [X, Y, Z])` — `ok` is the C boolean return, and the
+/// XYZ is always populated (lcms2 zeroes it on the FALSE paths).
+pub fn detect_black_point(bytes: &[u8], intent: u32, flags: u32) -> (bool, [f64; 3]) {
+    let mut out = [0.0f64; 3];
+    let ok = unsafe {
+        rcms_oracle_detect_black_point(
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            intent,
+            flags,
+            out.as_mut_ptr(),
+        )
+    };
+    (ok != 0, out)
+}
+
+/// lcms2 `cmsDetectDestinationBlackPoint` over a profile loaded from `bytes` at
+/// `intent` + `flags`. Returns `(ok, [X, Y, Z])`.
+pub fn detect_destination_black_point(bytes: &[u8], intent: u32, flags: u32) -> (bool, [f64; 3]) {
+    let mut out = [0.0f64; 3];
+    let ok = unsafe {
+        rcms_oracle_detect_destination_black_point(
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            intent,
+            flags,
+            out.as_mut_ptr(),
+        )
+    };
+    (ok != 0, out)
 }
 
 /// Like [`do_transform_packed`] but with lcms2's **DEFAULT** optimizer enabled

@@ -48,6 +48,14 @@ pub struct Clut {
     /// stage of an output/devicelink LUT whose PCS is Lab — flipping a 3-input
     /// CLUT from tetrahedral to trilinear, a *different* numeric result.
     pub is_trilinear: bool,
+    /// `cmsStage::Implements == cmsSigIdentityElemType` (`_cmsStageAllocIdentityCLut`,
+    /// cmslut.c:730 sets it). lcms2's `PreOptimize` runs `_Remove1Op(IdentityElem)`
+    /// BEFORE the `cmsFLAGS_NOOPTIMIZE` gate (cmsopt.c:261 vs :1961), so an
+    /// identity-marked CLUT is dropped even under NOOPTIMIZE. Only the in-memory
+    /// virtual (built via `_cmsStageAllocIdentityCLut`) carries this marker; a CLUT
+    /// READ from disk (`mft2`/`mAB`) never does, so a serialize→reparse round-trip
+    /// loses it — exactly the divergence the black-point Lab2/Lab4 virtuals exploit.
+    pub implements_identity: bool,
 }
 
 impl Clut {

@@ -12,12 +12,13 @@
 //! `compute_conversion` covers the relative (identity) path, the
 //! absolute-colorimetric branch (`ComputeAbsoluteIntent`), and the
 //! black-point-compensation branch (`ComputeBlackPointCompensation` +
-//! `cmsDetectBlackPoint`/`...Destination...`) for the no-sampling subset (the
-//! V4-perceptual-black constant or a `{0,0,0}` black point). It still divides the
-//! offset by `MAX_ENCODEABLE_XYZ` to match the C code path. The
-//! detection-by-sampling BPC cases (V2, V4 matrix-shaper perc/sat, rel-col, ink
-//! output, destination round-trip) are deferred to post-slice-7 (Lab virtual
-//! profiles) and surface as `Error::Unsupported`.
+//! `cmsDetectBlackPoint`/`...Destination...`). It still divides the offset by
+//! `MAX_ENCODEABLE_XYZ` to match the C code path. Black-point detection — the
+//! V4-perceptual-black constant, a `{0,0,0}` black point, AND the
+//! detection-by-sampling cases (V2, V4 matrix-shaper perc/sat, rel-col, ink
+//! output, destination round-trip) — is fully implemented in
+//! [`crate::link::black_point`] (Lab2/Lab4 virtual profiles + round-trip
+//! transforms).
 
 use crate::color::CIEXYZ;
 use crate::error::{Error, Result};
@@ -255,23 +256,18 @@ pub fn is_empty_layer(m: &Mat3, off: &Vec3) -> bool {
 /// Map a [`BlackPoint`] detection outcome to the concrete XYZ that
 /// `ComputeConversion` (cmscnvrt.c:389-392) would use, mirroring how the C reads
 /// the `{0,0,0}`-initialized out-parameter regardless of the boolean return:
-/// - [`BlackPoint::Resolved`] → that XYZ (the V4 perceptual constant);
+/// - [`BlackPoint::Resolved`] → that XYZ (the V4 perceptual constant or a sampled
+///   value);
 /// - [`BlackPoint::Zero`] → `{0,0,0}` (the C `return FALSE` with the zeroed
-///   out-param — e.g. inadequate class/intent);
-/// - [`BlackPoint::NeedsSampling`] → [`Error::Unsupported`] (detection-by-sampling
-///   deferred to post-slice-7: V2 BPC, V4 matrix-shaper perc/sat, rel-col, ink
-///   output, destination round-trip).
-fn resolve_black_point(bp: BlackPoint) -> Result<CIEXYZ> {
+///   out-param — e.g. inadequate class/intent).
+fn resolve_black_point(bp: BlackPoint) -> CIEXYZ {
     match bp {
-        BlackPoint::Resolved(xyz) => Ok(xyz),
-        BlackPoint::Zero => Ok(CIEXYZ {
+        BlackPoint::Resolved(xyz) => xyz,
+        BlackPoint::Zero => CIEXYZ {
             x: 0.0,
             y: 0.0,
             z: 0.0,
-        }),
-        BlackPoint::NeedsSampling => Err(Error::Unsupported(
-            "black-point detection-by-sampling not implemented (deferred to post-slice-7)",
-        )),
+        },
     }
 }
 
@@ -281,12 +277,13 @@ fn resolve_black_point(bp: BlackPoint) -> Result<CIEXYZ> {
 ///
 /// Implemented branches: the relative (identity) path, the absolute-colorimetric
 /// branch (`ComputeAbsoluteIntent`), and the black-point-compensation branch
-/// (`ComputeBlackPointCompensation`) for the cases where both black points resolve
-/// without sampling (V4-perceptual-black constant or `{0,0,0}`). BPC cells that
-/// need detection-by-sampling surface as [`Error::Unsupported`] via
-/// [`resolve_black_point`] (deferred to post-slice-7). Regardless of the branch,
-/// the C unconditionally divides every offset component by `MAX_ENCODEABLE_XYZ` at
-/// the end; we replicate that.
+/// (`ComputeBlackPointCompensation`). Both black points are resolved via
+/// [`detect_black_point`]/[`detect_destination_black_point`] — the
+/// V4-perceptual-black constant, the `{0,0,0}` class/intent cases, AND
+/// detection-by-sampling (`BlackPointAsDarkerColorant` / the destination
+/// round-trip over the Lab2/Lab4 virtuals). Regardless of the branch, the C
+/// unconditionally divides every offset component by `MAX_ENCODEABLE_XYZ` at the
+/// end; we replicate that.
 pub fn compute_conversion(
     i: usize,
     profiles: &[&Profile],
@@ -322,10 +319,9 @@ pub fn compute_conversion(
         // cmsDetectBlackPoint / ...Destination... init their out-param to {0,0,0}
         // and `return FALSE` (leaving it zero) for inadequate class/intent. We map
         // that FALSE-with-zero to BlackPoint::Zero ⇒ CIEXYZ{0,0,0}. The
-        // detection-by-sampling paths are deferred (post-slice-7); they surface as
-        // BlackPoint::NeedsSampling ⇒ Error::Unsupported.
-        let bp_in = resolve_black_point(detect_black_point(profiles[i - 1], intent))?;
-        let bp_out = resolve_black_point(detect_destination_black_point(profiles[i], intent))?;
+        // detection-by-sampling paths resolve to a sampled XYZ (BlackPoint::Resolved).
+        let bp_in = resolve_black_point(detect_black_point(profiles[i - 1], intent)?);
+        let bp_out = resolve_black_point(detect_destination_black_point(profiles[i], intent)?);
 
         // If black points are equal, then do nothing (cmscnvrt.c:394-398).
         if bp_in.x != bp_out.x || bp_in.y != bp_out.y || bp_in.z != bp_out.z {

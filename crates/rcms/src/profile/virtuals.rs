@@ -172,6 +172,9 @@ fn identity_clut_pipeline(n_chan: usize) -> Pipeline {
         table: ClutTable::U16(table),
         params,
         is_trilinear: false,
+        // `_cmsStageAllocIdentityCLut` sets Implements = cmsSigIdentityElemType
+        // (cmslut.c:730), so PreOptimize drops this stage even under NOOPTIMIZE.
+        implements_identity: true,
     }))
     .expect("identity CLUT stage shape is valid");
     lut

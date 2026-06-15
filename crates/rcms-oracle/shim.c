@@ -2392,3 +2392,33 @@ uint32_t rcms_oracle_save_virtual_profile(int which, uint8_t* out, uint32_t cap)
     rcms_oracle_fix_virtual_header(h);
     return rcms_oracle_finish_save(h, out, cap);
 }
+
+/* ---- Black-point detection (cmssamp.c) ------------------------------------
+   Open a profile from raw bytes, run cmsDetectBlackPoint /
+   cmsDetectDestinationBlackPoint at the given intent + flags, and write the
+   resulting CIEXYZ (3 doubles: X,Y,Z) into `out`. Returns 1 on the C function
+   returning TRUE, 0 on FALSE. In BOTH cases the out-XYZ is written (lcms2 zeroes
+   it on the FALSE paths), so the caller can compare the XYZ unconditionally. */
+int rcms_oracle_detect_black_point(const uint8_t* bytes, uint32_t len,
+                                   uint32_t intent, uint32_t flags,
+                                   double* out /* [3] */) {
+    cmsHPROFILE h = cmsOpenProfileFromMem((const void*) bytes, len);
+    if (!h) return 0;
+    cmsCIEXYZ bp = { 0, 0, 0 };
+    cmsBool ok = cmsDetectBlackPoint(&bp, h, intent, flags);
+    out[0] = bp.X; out[1] = bp.Y; out[2] = bp.Z;
+    cmsCloseProfile(h);
+    return ok ? 1 : 0;
+}
+
+int rcms_oracle_detect_destination_black_point(const uint8_t* bytes, uint32_t len,
+                                               uint32_t intent, uint32_t flags,
+                                               double* out /* [3] */) {
+    cmsHPROFILE h = cmsOpenProfileFromMem((const void*) bytes, len);
+    if (!h) return 0;
+    cmsCIEXYZ bp = { 0, 0, 0 };
+    cmsBool ok = cmsDetectDestinationBlackPoint(&bp, h, intent, flags);
+    out[0] = bp.X; out[1] = bp.Y; out[2] = bp.Z;
+    cmsCloseProfile(h);
+    return ok ? 1 : 0;
+}
