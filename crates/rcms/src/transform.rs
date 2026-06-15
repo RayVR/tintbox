@@ -431,11 +431,11 @@ impl Transform {
     /// [`OptimizationStrategy`] (lcms2 `cmsCreateTransform` with explicit format
     /// words and a chosen optimizer). Default adaptation 1.0, BPC `bpc`.
     ///
-    /// With [`OptimizationStrategy::Lcms2Compat`] the build flags drop
-    /// `NOOPTIMIZE` (so the recorded pipeline still matches lcms2's
-    /// pre-optimization device link, and the matrix-shaper optimizer is applied
-    /// on top); with [`Accurate`](OptimizationStrategy::Accurate) `NOOPTIMIZE` is
-    /// forced as usual.
+    /// Optimization is driven SOLELY by the [`OptimizationStrategy`], never by a
+    /// build flag: `default_icc_intents` always runs the lcms2 `PreOptimize`
+    /// matrix-merge at link time, and `cmsFLAGS_NOOPTIMIZE` is inert in rcms (the
+    /// linker ignores it). `Accurate` evaluates the linked pipeline in place;
+    /// `Lcms2Compat` applies the matrix-shaper / resampling optimizers on top.
     pub fn new_simple_with_formats_strategy(
         input: &Profile,
         output: &Profile,
