@@ -22,6 +22,7 @@ pub mod opt;
 pub mod pcs;
 pub mod pipeline;
 pub mod profile;
+pub mod ps;
 pub mod sig;
 pub mod transform;
 

@@ -525,6 +525,25 @@ unsafe extern "C" {
         flags: u32,
         out: *mut f64,
     ) -> i32;
+
+    // ==== slice9-ps ====
+    // PostScript CSA/CRD generation (cmsps2.c). Two-call: NULL out -> byte count.
+    fn rcms_oracle_get_postscript_csa(
+        bytes: *const u8,
+        len: u32,
+        intent: u32,
+        flags: u32,
+        out: *mut u8,
+        cap: u32,
+    ) -> u32;
+    fn rcms_oracle_get_postscript_crd(
+        bytes: *const u8,
+        len: u32,
+        intent: u32,
+        flags: u32,
+        out: *mut u8,
+        cap: u32,
+    ) -> u32;
 }
 
 /// lcms2 `cmsDetectBlackPoint` over a profile loaded from `bytes` at `intent` +
@@ -558,6 +577,79 @@ pub fn detect_destination_black_point(bytes: &[u8], intent: u32, flags: u32) -> 
         )
     };
     (ok != 0, out)
+}
+
+// ==== slice9-ps ====
+
+/// Serializes the PostScript oracle calls. lcms2's `cmsps2.c` keeps a mutable
+/// `static int _cmsPSActualColumn` (the CLUT hex-dump column counter), so two
+/// concurrent `cmsGetPostScriptCSA/CRD` calls race on it and produce corrupted
+/// output. Tests run multi-threaded by default, so guard the C entry points here.
+static PS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// lcms2 `cmsGetPostScriptCSA` (Color Space Array) over a profile loaded from
+/// `bytes` at `intent` + `flags`. Returns the emitted PostScript as bytes, or
+/// `None` if lcms2 declined (profile open failure, unsupported colorspace/intent
+/// — the C returns a zero byte count).
+pub fn get_postscript_csa(bytes: &[u8], intent: u32, flags: u32) -> Option<Vec<u8>> {
+    get_postscript(bytes, intent, flags, false)
+}
+
+/// lcms2 `cmsGetPostScriptCRD` (Color Rendering Dictionary) over a profile loaded
+/// from `bytes` at `intent` + `flags`. Returns the emitted PostScript as bytes,
+/// or `None` if lcms2 declined.
+pub fn get_postscript_crd(bytes: &[u8], intent: u32, flags: u32) -> Option<Vec<u8>> {
+    get_postscript(bytes, intent, flags, true)
+}
+
+fn get_postscript(bytes: &[u8], intent: u32, flags: u32, crd: bool) -> Option<Vec<u8>> {
+    // Hold the lock for the whole two-call sequence (the static column counter is
+    // touched on every emit). Poisoning is irrelevant — the C call cannot panic.
+    let _guard = PS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: `bytes` is a valid readable slice; the C side only reads it (copied
+    // into an opened profile that it then closes). intent/flags are plain u32.
+    // First call passes a null `out` with cap 0 to obtain the required length.
+    let needed = unsafe {
+        let f = if crd {
+            rcms_oracle_get_postscript_crd
+        } else {
+            rcms_oracle_get_postscript_csa
+        };
+        f(
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            intent,
+            flags,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; needed as usize];
+    // SAFETY: `bytes` as above; `buf` is a freshly-allocated writable slice of
+    // exactly `needed` bytes, and `cap` describes its true length.
+    let got = unsafe {
+        let f = if crd {
+            rcms_oracle_get_postscript_crd
+        } else {
+            rcms_oracle_get_postscript_csa
+        };
+        f(
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            intent,
+            flags,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    };
+    if got == 0 {
+        return None;
+    }
+    buf.truncate(got as usize);
+    Some(buf)
 }
 
 /// Like [`do_transform_packed`] but with lcms2's **DEFAULT** optimizer enabled

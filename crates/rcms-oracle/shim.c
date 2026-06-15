@@ -2422,3 +2422,37 @@ int rcms_oracle_detect_destination_black_point(const uint8_t* bytes, uint32_t le
     cmsCloseProfile(h);
     return ok ? 1 : 0;
 }
+
+/* ==== slice9-ps ==== */
+/* PostScript Color Space Array (CSA) and Color Rendering Dictionary (CRD)
+   generation (cmsps2.c). Open a profile from raw bytes, run
+   cmsGetPostScriptCSA / cmsGetPostScriptCRD with the given intent + flags, and
+   write the emitted PostScript bytes into `out`. Follows the two-call pattern:
+   pass out == NULL to obtain the required byte count, then a sufficiently large
+   buffer to receive the bytes. Returns the byte count (0 on any failure: profile
+   open, unsupported profile/intent, or insufficient capacity). */
+uint32_t rcms_oracle_get_postscript_csa(const uint8_t* bytes, uint32_t len,
+                                        uint32_t intent, uint32_t flags,
+                                        uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = cmsOpenProfileFromMem((const void*) bytes, len);
+    if (!h) return 0;
+    cmsUInt32Number needed = cmsGetPostScriptCSA(NULL, h, intent, flags, NULL, 0);
+    if (out == NULL) { cmsCloseProfile(h); return needed; }
+    if (needed == 0 || needed > cap) { cmsCloseProfile(h); return 0; }
+    cmsUInt32Number got = cmsGetPostScriptCSA(NULL, h, intent, flags, out, cap);
+    cmsCloseProfile(h);
+    return got;
+}
+
+uint32_t rcms_oracle_get_postscript_crd(const uint8_t* bytes, uint32_t len,
+                                        uint32_t intent, uint32_t flags,
+                                        uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = cmsOpenProfileFromMem((const void*) bytes, len);
+    if (!h) return 0;
+    cmsUInt32Number needed = cmsGetPostScriptCRD(NULL, h, intent, flags, NULL, 0);
+    if (out == NULL) { cmsCloseProfile(h); return needed; }
+    if (needed == 0 || needed > cap) { cmsCloseProfile(h); return 0; }
+    cmsUInt32Number got = cmsGetPostScriptCRD(NULL, h, intent, flags, out, cap);
+    cmsCloseProfile(h);
+    return got;
+}
