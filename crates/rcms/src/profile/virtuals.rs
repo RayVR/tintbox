@@ -188,8 +188,16 @@ fn quantize_val(i: u32, max_samples: u32) -> u16 {
     Lcms2Floor::quick_saturate_word(x)
 }
 
-/// `_cmsStageAllocIdentityCurves(n)` (`cmslut.c`): a tone-curve stage of `n`
+/// `_cmsStageAllocIdentityCurves(n)` (`cmslut.c:300`): a tone-curve stage of `n`
 /// gamma-1.0 (`cmsBuildGamma(1.0)`) identity curves.
+///
+/// NOTE: lcms2 marks this stage `Implements == cmsSigIdentityElemType`, so its
+/// `_Remove1Op` drops it during `PreOptimize`. rcms does NOT set the identity
+/// flag here, so `pre_optimize` keeps it. This is currently harmless: the only
+/// consumers (Lab4/XYZ `A2B0`) are always serialized→reparsed before linking, at
+/// which point lcms2 ALSO sees an unmarked curve stage (a disk curve defaults to
+/// its own type). It would become a real divergence only if a future caller links
+/// one of these curve virtuals NATIVE (un-reparsed) — set the identity flag then.
 fn identity_curves_stage(n: usize) -> Stage {
     Stage::ToneCurves((0..n).map(|_| build_gamma(1.0)).collect())
 }
