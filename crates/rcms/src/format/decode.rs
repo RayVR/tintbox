@@ -207,6 +207,12 @@ pub const TYPE_CMYK_DBL: u32 = float_sh(1) | colorspace_sh(PT_CMYK) | channels_s
 pub const TYPE_LAB_DBL: u32 = float_sh(1) | colorspace_sh(PT_LAB) | channels_sh(3) | bytes_sh(0);
 pub const TYPE_XYZ_DBL: u32 = float_sh(1) | colorspace_sh(PT_XYZ) | channels_sh(3) | bytes_sh(0);
 
+/// `TYPE_NAMED_COLOR_INDEX` (lcms2.h:944): the named-color transform's INPUT
+/// format — one 16-bit color INDEX per pixel (`CHANNELS_SH(1) | BYTES_SH(2)`,
+/// colorspace `PT_ANY`/0). The 1-channel u16 unpack reads the index into the
+/// pipeline's single input channel; the `NamedColor` stage maps it to PCS/device.
+pub const TYPE_NAMED_COLOR_INDEX: u32 = channels_sh(1) | bytes_sh(2);
+
 // Float marker (used by decoder tests).
 pub const fn float_marker(a: u32) -> u32 {
     float_sh(a)

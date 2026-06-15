@@ -11,7 +11,7 @@ pub mod float;
 pub mod formatters;
 
 pub use alpha::AlphaCopyPlan;
-pub use decode::PixelFormat;
+pub use decode::{PixelFormat, TYPE_NAMED_COLOR_INDEX};
 pub use formatters::MAX_CHANNELS;
 
 /// An unpack formatter: read one packed pixel from `accum` into `values`,

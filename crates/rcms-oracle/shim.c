@@ -2597,3 +2597,59 @@ uint32_t rcms_oracle_get_postscript_crd(const uint8_t* bytes, uint32_t len,
     cmsCloseProfile(h);
     return got;
 }
+
+/* ==== slice9-named ====
+   Named-color transform (cmsnamed.c / cmsxform.c). Open a named-color profile
+   from `named_bytes` and, when `second_len > 0`, a second profile from
+   `second_bytes`. Build a transform whose INPUT format is
+   TYPE_NAMED_COLOR_INDEX (CHANNELS_SH(1)|BYTES_SH(2): one u16 color index per
+   pixel) and whose OUTPUT format is a generic `out_chans`-channel u16
+   (COLORSPACE_SH(PT_ANY)|CHANNELS_SH(out_chans)|BYTES_SH(2)). Forces
+   cmsFLAGS_NOOPTIMIZE so the unoptimized device link (with the
+   cmsSigNamedColorElemType stage + LabV2ToV4) runs as the differential
+   reference. Runs cmsDoTransform over the `n_pixels` indices, writing
+   n_pixels*out_chans u16 into `out_vals`. With one profile the output is the
+   named profile's device colorants (EvalNamedColor); with a second Lab profile
+   the output is the PCS Lab triple (EvalNamedColorPCS then the PCS chain).
+   Returns 1 on success, 0 if a profile fails to open or the transform cannot be
+   created. */
+int rcms_oracle_named_transform_16(const uint8_t* named_bytes, uint32_t named_len,
+                                   const uint8_t* second_bytes, uint32_t second_len,
+                                   uint32_t intent, const uint16_t* in_indices,
+                                   uint32_t n_pixels, uint16_t* out_vals,
+                                   uint32_t out_chans) {
+    cmsHPROFILE pn = cmsOpenProfileFromMem((const void*) named_bytes, named_len);
+    if (!pn) return 0;
+
+    uint32_t out_fmt = COLORSPACE_SH(PT_ANY) | CHANNELS_SH(out_chans) | BYTES_SH(2);
+    cmsHTRANSFORM xform = NULL;
+
+    if (second_len > 0) {
+        cmsHPROFILE ps = cmsOpenProfileFromMem((const void*) second_bytes, second_len);
+        if (!ps) { cmsCloseProfile(pn); return 0; }
+        cmsHPROFILE profiles[2] = { pn, ps };
+        cmsBool         bpcArr[2]  = { FALSE, FALSE };
+        cmsUInt32Number intArr[2]  = { intent, intent };
+        cmsFloat64Number adArr[2]  = { 1.0, 1.0 };
+        xform = cmsCreateExtendedTransform(
+            NULL, 2, profiles, bpcArr, intArr, adArr,
+            NULL, 0, TYPE_NAMED_COLOR_INDEX, out_fmt, cmsFLAGS_NOOPTIMIZE);
+        if (xform) cmsDoTransform(xform, in_indices, out_vals, n_pixels);
+        cmsCloseProfile(ps);
+    } else {
+        cmsHPROFILE profiles[1] = { pn };
+        cmsBool         bpcArr[1]  = { FALSE };
+        cmsUInt32Number intArr[1]  = { intent };
+        cmsFloat64Number adArr[1]  = { 1.0 };
+        xform = cmsCreateExtendedTransform(
+            NULL, 1, profiles, bpcArr, intArr, adArr,
+            NULL, 0, TYPE_NAMED_COLOR_INDEX, out_fmt, cmsFLAGS_NOOPTIMIZE);
+        if (xform) cmsDoTransform(xform, in_indices, out_vals, n_pixels);
+    }
+
+    int ok = xform != NULL ? 1 : 0;
+    if (xform) cmsDeleteTransform(xform);
+    cmsCloseProfile(pn);
+    return ok;
+}
+/* ==== end slice9-named ==== */

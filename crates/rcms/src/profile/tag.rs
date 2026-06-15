@@ -133,6 +133,34 @@ pub struct NamedColorList {
     pub prefix: String,
     pub suffix: String,
     pub colors: Vec<NamedColor>,
+    /// lcms2 `cmsNAMEDCOLORLIST::ColorantCount` (the ncl2 `nDeviceCoords`). All
+    /// colors share this device-channel width. Kept explicitly because a list may
+    /// legitimately carry zero colors yet still declare a colorant count, and the
+    /// named-color transform's device output width is driven by it.
+    pub colorant_count: usize,
+}
+
+impl NamedColorList {
+    /// `cmsNamedColorCount` (cmsnamed.c:856): the number of spot colors.
+    pub fn count(&self) -> usize {
+        self.colors.len()
+    }
+
+    /// The device-colorant channel width (`cmsNAMEDCOLORLIST::ColorantCount`,
+    /// the ncl2 `nDeviceCoords`).
+    pub fn colorant_count(&self) -> usize {
+        self.colorant_count
+    }
+
+    /// `cmsNamedColorIndex` (cmsnamed.c:890): the index of the color whose root
+    /// name matches `name` case-insensitively (lcms2 `cmsstrcasecmp`, ASCII),
+    /// or `None` if absent (the C returns `-1`). The prefix/suffix are not part
+    /// of the comparison.
+    pub fn index(&self, name: &str) -> Option<usize> {
+        self.colors
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
+    }
 }
 
 /// One `cmsPSEQDESC` record of `Type_ProfileSequenceDesc_Read` (`cmstypes.c:3541`):

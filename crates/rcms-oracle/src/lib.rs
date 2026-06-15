@@ -558,6 +558,24 @@ unsafe extern "C" {
         out: *mut u8,
         cap: u32,
     ) -> u32;
+
+    // ==== slice9-named ====
+    // Named-color transform (cmsnamed.c / cmsxform.c): open a named-color profile
+    // (and optionally a second profile) from bytes, create a transform whose INPUT
+    // format is TYPE_NAMED_COLOR_INDEX, and run cmsDoTransform over the index
+    // buffer, producing `out_chans` u16 per pixel.
+    fn rcms_oracle_named_transform_16(
+        named_bytes: *const u8,
+        named_len: u32,
+        second_bytes: *const u8,
+        second_len: u32,
+        intent: u32,
+        in_indices: *const u16,
+        n_pixels: u32,
+        out_vals: *mut u16,
+        out_chans: u32,
+    ) -> i32;
+    // ==== end slice9-named ====
 }
 
 /// lcms2 `cmsDetectBlackPoint` over a profile loaded from `bytes` at `intent` +
@@ -3204,6 +3222,50 @@ pub fn save_virtual_profile(which: i32) -> Option<Vec<u8>> {
     out.truncate(written as usize);
     Some(out)
 }
+
+// ==== slice9-named ====
+/// Run lcms2's named-color transform over a list of color indices. The named-color
+/// profile (`named_bytes`) is the transform input with `TYPE_NAMED_COLOR_INDEX`;
+/// when `second` is `Some`, it is the second profile (e.g. a Lab profile so the
+/// output is the PCS Lab triple), otherwise the named-color profile alone produces
+/// its device colorants. `out_chans` is the number of u16 the output format
+/// carries per pixel. Returns the `n * out_chans` u16 outputs, or `None` if the
+/// transform could not be built.
+pub fn named_transform_16(
+    named_bytes: &[u8],
+    second: Option<&[u8]>,
+    intent: u32,
+    indices: &[u16],
+    out_chans: u32,
+) -> Option<Vec<u16>> {
+    let n = indices.len();
+    let mut out = vec![0u16; n * out_chans as usize];
+    let (sec_ptr, sec_len) = match second {
+        Some(b) => (b.as_ptr(), b.len() as u32),
+        None => (std::ptr::null(), 0u32),
+    };
+    // SAFETY: named_bytes/indices describe valid readable slices; `out` has
+    // exactly n*out_chans u16 the C writes into; sec_ptr/sec_len are either a
+    // valid slice or (null, 0) which the C treats as "no second profile".
+    let ok = unsafe {
+        rcms_oracle_named_transform_16(
+            named_bytes.as_ptr(),
+            named_bytes.len() as u32,
+            sec_ptr,
+            sec_len,
+            intent,
+            indices.as_ptr(),
+            n as u32,
+            out.as_mut_ptr(),
+            out_chans,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    Some(out)
+}
+// ==== end slice9-named ====
 
 #[cfg(test)]
 mod tests {
