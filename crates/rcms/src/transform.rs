@@ -38,12 +38,13 @@
 //!    later task.
 
 use crate::color::CIEXYZ;
+use crate::context::Context;
 use crate::format::{
     self, formatter_is_float, get_input_formatter, get_input_formatter_float, get_output_formatter,
     get_output_formatter_float, AlphaCopyPlan, PackFloatFn, PackFn, UnpackFloatFn, UnpackFn,
     MAX_CHANNELS,
 };
-use crate::link::{default_icc_intents, link_bpc_mutation};
+use crate::link::{link_bpc_mutation, link_icc_intents_in};
 use crate::math::whitepoint::D50;
 use crate::opt::{OptimizationStrategy, OptimizedEval};
 use crate::pipeline::Pipeline;
@@ -294,11 +295,31 @@ fn pixel_bytes(fmt: u32) -> usize {
 }
 
 impl Transform {
-    /// lcms2 `cmsCreateExtendedTransform` (the device-link build). Applies the
-    /// `_cmsLinkProfiles` BPC-array mutation (a copy — the caller's `bpc` is not
-    /// touched), builds the link via [`default_icc_intents`], and records the
-    /// entry/exit color spaces, media white points, and rendering intent.
+    /// lcms2 `cmsCreateExtendedTransform` (the device-link build), builtin path.
+    /// Delegates to [`Transform::new_in`] with an empty [`Context`], so existing
+    /// callers (and every differential test) hit the builtin
+    /// [`default_icc_intents`](crate::link::default_icc_intents) link verbatim —
+    /// no plugin dispatch.
     pub fn new(
+        profiles: &[&Profile],
+        intents: &[RenderingIntent],
+        bpc: &[bool],
+        adaptation: &[f64],
+        flags: Flags,
+    ) -> Result<Transform> {
+        Transform::new_in(&Context::new(), profiles, intents, bpc, adaptation, flags)
+    }
+
+    /// lcms2 `cmsCreateExtendedTransform` (the device-link build), dispatching the
+    /// link through `ctx`'s [`RenderingIntentPlugin`](crate::plugin::RenderingIntentPlugin)
+    /// registry. Applies the `_cmsLinkProfiles` BPC-array mutation (a copy — the
+    /// caller's `bpc` is not touched), builds the link via
+    /// [`link_icc_intents_in`](crate::link::link_icc_intents_in) (which runs the
+    /// builtin [`default_icc_intents`](crate::link::default_icc_intents) unless a
+    /// registered custom intent in the chain claims it), and records the entry/exit
+    /// color spaces, media white points, and rendering intent.
+    pub fn new_in(
+        ctx: &Context,
         profiles: &[&Profile],
         intents: &[RenderingIntent],
         bpc: &[bool],
@@ -324,8 +345,10 @@ impl Transform {
         let mut bpc_mut = bpc.to_vec();
         link_bpc_mutation(intents, profiles, &mut bpc_mut);
 
-        // Build the device-link pipeline (cmsxform.c:1194, _cmsLinkProfiles).
-        let lut = default_icc_intents(profiles, intents, &bpc_mut, adaptation, flags.bits())?;
+        // Build the device-link pipeline (cmsxform.c:1194, _cmsLinkProfiles),
+        // dispatching to a registered custom intent plugin if the chain requests
+        // one; otherwise the builtin `default_icc_intents`.
+        let lut = link_icc_intents_in(ctx, profiles, intents, &bpc_mut, adaptation, flags.bits())?;
 
         // White points (cmsxform.c:1221-1222, SetWhitePoint over cmsReadTag).
         let entry_white_point = transform_white_point(profiles[0]);

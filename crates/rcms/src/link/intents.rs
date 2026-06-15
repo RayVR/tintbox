@@ -21,6 +21,7 @@
 //! transforms).
 
 use crate::color::CIEXYZ;
+use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::link::black_point::{
     compute_black_point_compensation, detect_black_point, detect_destination_black_point,
@@ -609,6 +610,43 @@ pub fn default_icc_intents(
     }
 
     Ok(result)
+}
+
+/// Intent-dispatching entry point (lcms2 `_cmsLinkProfiles` →
+/// `cmsGetIntentsFromProfile`/`SearchIntent`): scan `intents`; if any equals a
+/// registered [`RenderingIntentPlugin`]'s `intent()`, the FIRST such plugin's
+/// `link` runs instead of the builtin. lcms2's `_cmsLinkProfiles` walks the chain
+/// looking for the first intent that has a registered handler and dispatches to
+/// it; with no custom intent in the chain (or an empty registry) this is
+/// [`default_icc_intents`] verbatim — the BUILTIN path.
+///
+/// A custom plugin's `link` may itself recurse into [`default_icc_intents`] for
+/// the non-custom legs, exactly as lcms2's custom intent functions do.
+///
+/// The `*_in(ctx, …)` convention: the no-`ctx` builtin builder remains
+/// [`default_icc_intents`]; callers that want plugin dispatch route through here.
+pub fn link_icc_intents_in(
+    ctx: &Context,
+    profiles: &[&Profile],
+    intents: &[RenderingIntent],
+    bpc: &[bool],
+    adaptation: &[f64],
+    flags: u32,
+) -> Result<Pipeline> {
+    let registry = &ctx.plugins().intents;
+    if !registry.is_empty() {
+        // First intent in the chain that a registered plugin services wins
+        // (lcms2 dispatches to the first matching handler found while walking the
+        // chain). Builtins are matched implicitly by `default_icc_intents`, so a
+        // plugin can only claim an intent number it registered.
+        for &intent in intents {
+            let raw = intent.to_raw();
+            if let Some(plugin) = registry.iter().find(|p| p.intent() == raw) {
+                return plugin.link(ctx, profiles, intents, bpc, adaptation, flags);
+            }
+        }
+    }
+    default_icc_intents(profiles, intents, bpc, adaptation, flags)
 }
 
 #[cfg(test)]
