@@ -2311,7 +2311,7 @@ pub fn mlu_entries(buf: &[u8], sig: u32) -> Option<Vec<OracleMluEntry>> {
             return None;
         }
         units.truncate(n as usize);
-        let text = char::decode_utf16(units.into_iter())
+        let text = char::decode_utf16(units)
             .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
             .collect();
         out.push(OracleMluEntry {
