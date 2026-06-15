@@ -203,6 +203,56 @@ pub struct Mlu {
     pub entries: Vec<MluEntry>,
 }
 
+impl Mlu {
+    /// A one-entry MLU carrying `text` under the `cmsNoLanguage`/`cmsNoCountry`
+    /// codes (`"\0\0"`), mirroring `cmsMLUsetASCII(mlu, cmsNoLanguage,
+    /// cmsNoCountry, text)`. This is how lcms2 holds a plain `TextType` value
+    /// before `DecideType` chooses the on-disk type, so the serializer can build
+    /// any text-family body from a bare string.
+    pub fn from_ascii(text: &str) -> Mlu {
+        Mlu {
+            entries: vec![MluEntry {
+                language: [0, 0],
+                country: [0, 0],
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    /// The entry lcms2 `_cmsMLUgetWide` selects for `(lang, country)`: an exact
+    /// `language == lang` match (preferring an exact country too), else the first
+    /// entry. `lang`/`country` are the raw 2-byte codes (`cmsNoLanguage` is
+    /// `[0,0]`, `cmsV2Unicode` is `[0xFF,0xFF]`). Returns `None` only for an empty
+    /// MLU.
+    pub(crate) fn select(&self, lang: [u8; 2], country: [u8; 2]) -> Option<&MluEntry> {
+        let mut best: Option<&MluEntry> = None;
+        for e in &self.entries {
+            if e.language == lang {
+                if best.is_none() {
+                    best = Some(e);
+                }
+                if e.country == country {
+                    return Some(e); // exact language+country match wins.
+                }
+            }
+        }
+        best.or_else(|| self.entries.first())
+    }
+
+    /// The ASCII representation lcms2's writers obtain via `cmsMLUgetASCII(mlu,
+    /// cmsNoLanguage, cmsNoCountry, ...)`: select the `[0,0]`-or-first entry and
+    /// downcast each code unit (`< 0xFF` → that byte, else `'?'`).
+    pub(crate) fn preferred_ascii(&self) -> String {
+        let Some(e) = self.select([0, 0], [0, 0]) else {
+            return String::new();
+        };
+        e.text
+            .encode_utf16()
+            .map(|u| if u < 0xff { u as u8 as char } else { '?' })
+            .collect()
+    }
+}
+
 /// `cmsICCMeasurementConditions` (`include/lcms2.h:1051`). `flare` is the
 /// s15Fixed16 `Flare` field decoded to f64 (lcms2 reads it via
 /// `_cmsRead15Fixed16Number`); the three `u32` fields are the raw wire values.

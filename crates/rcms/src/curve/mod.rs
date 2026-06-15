@@ -366,6 +366,14 @@ impl ToneCurve {
     pub fn table16(&self) -> &[u16] {
         &self.table16
     }
+
+    /// The floating-point segment description (lcms2 `cmsToneCurve.Segments`).
+    /// Empty for a pure tabulated curve. The serializer inspects
+    /// `nSegments`/`Segments[0].Type`/`Params` to mirror `Type_Curve_Write`'s
+    /// gamma special case and `DecideCurveType`.
+    pub fn segments(&self) -> &[CurveSegment] {
+        &self.segments
+    }
 }
 
 /// lcms2 `GetInterval` (cmsgamma.c:1015-1067): find the table interval whose

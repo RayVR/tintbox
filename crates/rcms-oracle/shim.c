@@ -1995,6 +1995,140 @@ uint32_t rcms_oracle_save_single_tag(int which, uint8_t* out, uint32_t cap) {
     return rcms_oracle_finish_save(h, out, cap);
 }
 
+/* ---- Curve/parametric + MLU/textDescription serializer oracle (slice 7 T2) ---
+   Build a profile carrying ONE tag whose body exercises a curv/para/mluc/desc
+   (or pseq) writer, using a per-case profile version so DecideCurveType /
+   DecideTextType / DecideTextDescType select the intended on-disk type. rcms
+   constructs the identical structure and the whole-profile bytes must match. */
+enum {
+    RCMS_T2_CURV_GAMMA_V2 = 0, /* gamma curve, v2  -> curv (8Fixed8 path)  */
+    RCMS_T2_CURV_TABLE_V2,     /* tabulated curve, v2 -> curv (table path) */
+    RCMS_T2_CURV_TABLE_V4,     /* tabulated curve, v4 -> curv (nSeg != 1)  */
+    RCMS_T2_PARA_GAMMA_V4,     /* gamma curve, v4  -> para type 0          */
+    RCMS_T2_PARA_TYPE1_V4,     /* para ICC type 1 (lcms2 type 2)           */
+    RCMS_T2_PARA_TYPE2_V4,     /* para ICC type 2 (lcms2 type 3)           */
+    RCMS_T2_PARA_TYPE3_V4,     /* para ICC type 3 (lcms2 type 4, sRGB-ish) */
+    RCMS_T2_PARA_TYPE4_V4,     /* para ICC type 4 (lcms2 type 5)           */
+    RCMS_T2_MLUC_V4,           /* cprt MLU, multiple langs + non-ASCII     */
+    RCMS_T2_DESC_V2,           /* profileDesc textDescription, v2 -> desc  */
+    RCMS_T2_PSEQ_V4,           /* profile sequence desc, v4 (mluc embeds)  */
+    RCMS_T2_PSEQ_V2            /* profile sequence desc, v2 (desc embeds)  */
+};
+
+uint32_t rcms_oracle_save_curve_mlu_tag(int which, uint8_t* out, uint32_t cap) {
+    cmsHPROFILE h = cmsCreateProfilePlaceholder(NULL);
+    if (!h) return 0;
+    rcms_oracle_set_fixed_header(h);
+
+    switch (which) {
+
+    case RCMS_T2_CURV_GAMMA_V2: {
+        cmsSetProfileVersion(h, 2.1);
+        cmsToneCurve* c = cmsBuildGamma(NULL, 2.4);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_CURV_TABLE_V2:
+    case RCMS_T2_CURV_TABLE_V4: {
+        cmsSetProfileVersion(h, which == RCMS_T2_CURV_TABLE_V2 ? 2.1 : 4.4);
+        cmsUInt16Number tbl[5] = { 0, 0x3000, 0x7000, 0xB000, 0xFFFF };
+        cmsToneCurve* c = cmsBuildTabulatedToneCurve16(NULL, 5, tbl);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_PARA_GAMMA_V4: {
+        cmsSetProfileVersion(h, 4.4);
+        cmsToneCurve* c = cmsBuildGamma(NULL, 2.4);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_PARA_TYPE1_V4: {
+        cmsSetProfileVersion(h, 4.4);
+        cmsFloat64Number p[3] = { 2.4, 0.9, 0.1 };
+        cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, 2, p);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_PARA_TYPE2_V4: {
+        cmsSetProfileVersion(h, 4.4);
+        cmsFloat64Number p[4] = { 2.4, 0.9, 0.1, 0.05 };
+        cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, 3, p);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_PARA_TYPE3_V4: {
+        cmsSetProfileVersion(h, 4.4);
+        /* sRGB-like type-4 lcms2 (ICC type 3): g, a, b, c, d. */
+        cmsFloat64Number p[5] = { 2.4, 1.0/1.055, 0.055/1.055, 1.0/12.92, 0.04045 };
+        cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, 4, p);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_PARA_TYPE4_V4: {
+        cmsSetProfileVersion(h, 4.4);
+        cmsFloat64Number p[7] = { 2.4, 1.0/1.055, 0.055/1.055, 1.0/12.92, 0.04045, 0.1, 0.2 };
+        cmsToneCurve* c = cmsBuildParametricToneCurve(NULL, 5, p);
+        cmsWriteTag(h, cmsSigRedTRCTag, c);
+        cmsFreeToneCurve(c);
+        break;
+    }
+    case RCMS_T2_MLUC_V4: {
+        cmsSetProfileVersion(h, 4.4);
+        cmsMLU* mlu = cmsMLUalloc(NULL, 3);
+        /* en/US ASCII, de/DE with a non-ASCII umlaut, ja/JP with CJK. */
+        cmsMLUsetWide(mlu, "en", "US", L"Hello");
+        /* Split adjacent \x escapes so trailing hex-like letters aren't absorbed
+           into the previous escape (C \x is greedy). "Grüße". */
+        cmsMLUsetWide(mlu, "de", "DE", L"Gr" L"\x00fc" L"\x00df" L"e");
+        cmsMLUsetWide(mlu, "ja", "JP", L"\x65e5" L"\x672c" L"\x8a9e"); /* 日本語 */
+        cmsWriteTag(h, cmsSigCopyrightTag, mlu);
+        cmsMLUfree(mlu);
+        break;
+    }
+    case RCMS_T2_DESC_V2: {
+        cmsSetProfileVersion(h, 2.1);
+        cmsMLU* mlu = cmsMLUalloc(NULL, 1);
+        cmsMLUsetASCII(mlu, cmsNoLanguage, cmsNoCountry, "rcms desc test");
+        cmsWriteTag(h, cmsSigProfileDescriptionTag, mlu);
+        cmsMLUfree(mlu);
+        break;
+    }
+    case RCMS_T2_PSEQ_V4:
+    case RCMS_T2_PSEQ_V2: {
+        cmsSetProfileVersion(h, which == RCMS_T2_PSEQ_V4 ? 4.4 : 2.1);
+        cmsSEQ* seq = cmsAllocProfileSequenceDescription(NULL, 2);
+        for (int i = 0; i < 2; i++) {
+            seq->seq[i].deviceMfg   = (cmsSignature) (0x4D464731 + i); /* MFG1.. */
+            seq->seq[i].deviceModel = (cmsSignature) (0x4D4F4431 + i); /* MOD1.. */
+            seq->seq[i].attributes  = (cmsUInt64Number) (i + 1);
+            seq->seq[i].technology  = (cmsTechnologySignature) 0x6D6E7472; /* mntr */
+            /* The seq MLUs start NULL; allocate before setting (cmsMLUsetASCII on
+               a NULL handle is a no-op). */
+            seq->seq[i].Manufacturer = cmsMLUalloc(NULL, 1);
+            seq->seq[i].Model        = cmsMLUalloc(NULL, 1);
+            cmsMLUsetASCII(seq->seq[i].Manufacturer, cmsNoLanguage, cmsNoCountry,
+                           i == 0 ? "MakerOne" : "MakerTwo");
+            cmsMLUsetASCII(seq->seq[i].Model, cmsNoLanguage, cmsNoCountry,
+                           i == 0 ? "ModelOne" : "ModelTwo");
+        }
+        cmsWriteTag(h, cmsSigProfileSequenceDescTag, seq);
+        cmsFreeProfileSequenceDescription(seq);
+        break;
+    }
+    default:
+        cmsCloseProfile(h);
+        return 0;
+    }
+
+    return rcms_oracle_finish_save(h, out, cap);
+}
+
 /* Returns bytes written (>0) on success, or 0 on failure. If out==NULL just
    returns the required length (size query). link!=0 links gXYZ/bXYZ to rXYZ. */
 uint32_t rcms_oracle_save_basic_profile(int link, uint8_t* out, uint32_t cap) {

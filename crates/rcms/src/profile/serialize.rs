@@ -40,10 +40,14 @@
 //! entry inherits them. Required for sRGB's three linked TRCs (T4).
 
 use crate::color::{CIExyYTriple, CIEXYZ};
+use crate::curve::ToneCurve;
 use crate::error::{Error, Result};
+use crate::fixed::U8Fixed8;
 use crate::io::{CountWriter, MemWriter, ProfileWriter};
 use crate::profile::header::{DateTime, Header};
-use crate::profile::tag::{Cicp, ColorantTableEntry, Measurement, Tag, ViewingConditions};
+use crate::profile::tag::{
+    Cicp, ColorantTableEntry, Measurement, Mlu, ProfileSequenceItem, Tag, ViewingConditions,
+};
 use crate::sig::Signature;
 
 /// The content of one tag slot: either an owned tag value (a body to serialize)
@@ -159,8 +163,9 @@ pub fn save_to_mem(profile: &WritableProfile) -> Result<Vec<u8>> {
             continue; // Linked tags are not written (cmsio0.c:1410).
         };
         let begin = body_start + counter.len(); // io->UsedSpace at body start.
-        counter.write_type_base(write_type_for(slot.sig, value, version)?)?;
-        write_tag_body(&mut counter, value)?;
+        let ty = write_type_for(slot.sig, value, version)?;
+        counter.write_type_base(ty)?;
+        write_tag_body(&mut counter, value, ty, version)?;
         let size = (body_start + counter.len()) - begin; // pre-alignment size.
         counter.write_alignment()?;
         layouts[i] = Some(TagLayout {
@@ -196,8 +201,9 @@ pub fn save_to_mem(profile: &WritableProfile) -> Result<Vec<u8>> {
         let SlotContent::Body(ref value) = slot.content else {
             continue;
         };
-        w.write_type_base(write_type_for(slot.sig, value, version)?)?;
-        write_tag_body(&mut w, value)?;
+        let ty = write_type_for(slot.sig, value, version)?;
+        w.write_type_base(ty)?;
+        write_tag_body(&mut w, value, ty, version)?;
         w.write_alignment()?;
     }
 
@@ -299,6 +305,9 @@ const SIG_VCGT_TYPE: Signature = Signature::from_raw(0x7663_6774); // 'vcgt'
 const SIG_LUT16_TYPE: Signature = Signature::from_raw(0x6D667432); // 'mft2'
 const SIG_LUT_ATOB_TYPE: Signature = Signature::from_raw(0x6D414220); // 'mAB '
 const SIG_LUT_BTOA_TYPE: Signature = Signature::from_raw(0x6D424120); // 'mBA '
+const SIG_CURVE_TYPE: Signature = Signature::from_raw(0x6375_7276); // 'curv'
+const SIG_PARAMETRIC_TYPE: Signature = Signature::from_raw(0x7061_7261); // 'para'
+const SIG_PSEQ_TYPE: Signature = Signature::from_raw(0x7073_6571); // 'pseq'
 
 // Tag signatures (`cmsTagSignature`, include/lcms2.h) needed by the descriptor
 // table — only those whose default type or decider is non-obvious from the value.
@@ -359,9 +368,13 @@ fn write_type_for(sig: Signature, value: &Tag, version: f64) -> Result<Signature
         Tag::Text(_) => Ok(decide_text(sig, version)),
         Tag::Mlu(_) => Ok(decide_text(sig, version)),
 
-        // DecideCurveType (cmstypes.c:1436) inspects the curve's segments, and the
-        // curv/para body writers land in T2; stub with a clear Unsupported.
-        Tag::Curve(_) => Err(Error::Unsupported("curv/para writer is T2")),
+        // DecideCurveType (cmstypes.c:1436) inspects the curve's segments to pick
+        // `curv` vs `para`; the body writers honour the choice.
+        Tag::Curve(c) => Ok(decide_curve(c, version)),
+
+        // ProfileSequenceDescType has a fixed type signature ('pseq'); the embedded
+        // per-item descriptions select desc/mluc by version inside the writer.
+        Tag::ProfileSequenceDesc(_) => Ok(SIG_PSEQ_TYPE),
 
         // LUT type selection is DecideLUTtypeA2B/B2A (version + pipeline shape, T3).
         Tag::Lut(_) => Ok(decide_lut(sig, version)),
@@ -419,6 +432,26 @@ fn decide_text(sig: Signature, version: f64) -> Signature {
     }
 }
 
+/// lcms2 `DecideCurveType` (cmstypes.c:1438). A curve writes `curv` unless the
+/// profile is v4 AND the curve is a single non-inverted ICC parametric segment
+/// (`nSegments == 1`, `0 <= Segments[0].Type <= 5`), in which case it writes
+/// `para`. A pure tabulated curve (no segments) always writes `curv`.
+fn decide_curve(curve: &ToneCurve, version: f64) -> Signature {
+    if version < 4.0 {
+        return SIG_CURVE_TYPE;
+    }
+    let segs = curve.segments();
+    if segs.len() != 1 {
+        return SIG_CURVE_TYPE; // Only 1-segment curves can be parametric.
+    }
+    // `DecideCurveType` rejects inverted (Type < 0) and non-ICC (Type > 5) curves;
+    // only ICC parametric types 1..=5 (and the 0/sampled guard) select `para`.
+    if !(0..=5).contains(&segs[0].seg_type) {
+        return SIG_CURVE_TYPE;
+    }
+    SIG_PARAMETRIC_TYPE
+}
+
 /// lcms2 `DecideLUTtypeA2B` (cmstypes.c:1840) / `DecideLUTtypeB2A`
 /// (cmstypes.c:1854). For v4 the A2B tags write `mAB ` and the B2A/gamut/preview
 /// tags write `mBA `; for v2 they write `mft1`/`mft2` by the pipeline's
@@ -448,10 +481,21 @@ fn decide_lut(sig: Signature, version: f64) -> Signature {
 /// Write a tag's body (NOT the type-base — the caller writes that). Dispatches on
 /// the cooked [`Tag`] value, mirroring each `Type_*_Write` in cmstypes.c. The
 /// curve/MLU/LUT/MPE bodies arrive in T2/T3 and return `Unsupported` here.
-fn write_tag_body<W: ProfileWriter>(w: &mut W, value: &Tag) -> Result<()> {
+fn write_tag_body<W: ProfileWriter>(
+    w: &mut W,
+    value: &Tag,
+    ty: Signature,
+    version: f64,
+) -> Result<()> {
     match value {
         Tag::Xyz(xyz) => write_xyz(w, xyz),
-        Tag::Text(s) => write_text(w, s),
+        // The text-family tags (text/desc/mluc) all decode to one cooked value in
+        // lcms2 (a `cmsMLU`); the BODY written is the one `DecideType` picked, so
+        // we dispatch on the resolved type signature, building the missing
+        // representation (a single ASCII string ↔ a one-entry MLU) as lcms2's
+        // public API does.
+        Tag::Text(s) => write_text_family(w, ty, &Mlu::from_ascii(s)),
+        Tag::Mlu(m) => write_text_family(w, ty, m),
         Tag::Signature(s) => write_signature(w, *s),
         Tag::Data { flag, data } => write_data(w, *flag, data),
         Tag::DateTime(d) => write_datetime(w, d),
@@ -464,7 +508,32 @@ fn write_tag_body<W: ProfileWriter>(w: &mut W, value: &Tag) -> Result<()> {
         Tag::ViewingConditions(v) => write_viewing_conditions(w, v),
         Tag::ColorantTable(entries) => write_colorant_table(w, entries),
         Tag::Cicp(c) => write_cicp(w, c),
+        Tag::Curve(c) => write_curve(w, ty, c),
+        Tag::ProfileSequenceDesc(items) => write_pseq(w, items, version),
         _ => Err(Error::Unsupported("tag type writer not yet implemented")),
+    }
+}
+
+/// Dispatch a text-family body by the type `DecideType` selected: `text` writes a
+/// plain ASCII string, `desc` the legacy `textDescription` layout, `mluc` the
+/// multi-localized pool. All three derive from the one cooked MLU value, matching
+/// how lcms2 holds every text-family tag as a single `cmsMLU`.
+fn write_text_family<W: ProfileWriter>(w: &mut W, ty: Signature, mlu: &Mlu) -> Result<()> {
+    match ty {
+        SIG_TEXT_TYPE => write_text(w, &mlu.preferred_ascii()),
+        SIG_DESC_TYPE => write_text_description(w, mlu),
+        SIG_MLUC_TYPE => write_mlu(w, mlu),
+        _ => Err(Error::Unsupported("unexpected text-family type signature")),
+    }
+}
+
+/// Dispatch a curve body by the type `DecideCurveType` selected: `curv` writes the
+/// gamma special case or the tabulated table; `para` the parametric form.
+fn write_curve<W: ProfileWriter>(w: &mut W, ty: Signature, curve: &ToneCurve) -> Result<()> {
+    match ty {
+        SIG_CURVE_TYPE => write_curve_curv(w, curve),
+        SIG_PARAMETRIC_TYPE => write_curve_para(w, curve),
+        _ => Err(Error::Unsupported("unexpected curve type signature")),
     }
 }
 
@@ -612,6 +681,195 @@ fn write_cicp<W: ProfileWriter>(w: &mut W, c: &Cicp) -> Result<()> {
     w.write_u8(c.matrix_coefficients)?;
     w.write_u8(c.video_full_range_flag)?;
     Ok(())
+}
+
+/// `Type_Curve_Write` (cmstypes.c:1387), the `curv` form. The GAMMA special case
+/// fires when the curve is a single ICC type-1 parametric segment: write
+/// `count = 1` then one u16 holding the gamma as a `cmsU8Fixed8Number`
+/// (`_cmsDoubleTo8Fixed8`). Otherwise write `nEntries` (u32) followed by the
+/// 16-bit approximation table — `Type_Curve_Write` always uses `Table16`, even
+/// for a multi-segment curve (the table is the materialized approximation).
+fn write_curve_curv<W: ProfileWriter>(w: &mut W, curve: &ToneCurve) -> Result<()> {
+    let segs = curve.segments();
+    if segs.len() == 1 && segs[0].seg_type == 1 {
+        // Single gamma, preserve number (cmstypes.c:1389-1396).
+        let gamma = U8Fixed8::from_f64(segs[0].params[0]);
+        w.write_u32(1)?;
+        w.write_u16(gamma.to_raw())?;
+        return Ok(());
+    }
+    let table = curve.table16();
+    w.write_u32(u32::try_from(table.len()).map_err(|_| Error::Range)?)?;
+    for &v in table {
+        w.write_u16(v)?;
+    }
+    Ok(())
+}
+
+/// lcms2 `ParamsByType` for `Type_ParametricCurve_Write` (cmstypes.c:1490),
+/// indexed by the lcms2 segment type (ICC type + 1): type 1→1 param, 2→3, 3→4,
+/// 4→5, 5→7. Index 0 is unused (a type-0/sampled segment never reaches here).
+const PARAMETRIC_PARAMS_BY_TYPE: [usize; 6] = [0, 1, 3, 4, 5, 7];
+
+/// `Type_ParametricCurve_Write` (cmstypes.c:1486), the `para` form. Write the ICC
+/// parametric type (`Segments[0].Type - 1`) as a u16, a reserved u16 of 0, then
+/// `ParamsByType[type]` parameters as s15Fixed16. Only single-segment,
+/// non-inverted ICC types (1..=5) reach here (guaranteed by `DecideCurveType`).
+fn write_curve_para<W: ProfileWriter>(w: &mut W, curve: &ToneCurve) -> Result<()> {
+    let segs = curve.segments();
+    if segs.len() != 1 {
+        return Err(Error::Unsupported("multisegment parametric curve"));
+    }
+    let typen = segs[0].seg_type;
+    if !(1..=5).contains(&typen) {
+        return Err(Error::Unsupported("unsupported parametric curve type"));
+    }
+    let n_params = PARAMETRIC_PARAMS_BY_TYPE[typen as usize];
+    w.write_u16(u16::try_from(typen - 1).map_err(|_| Error::Range)?)?;
+    w.write_u16(0)?; // reserved
+    for &p in &segs[0].params[..n_params] {
+        w.write_s15fixed16(p)?;
+    }
+    Ok(())
+}
+
+/// `Type_MLU_Write` (cmstypes.c:1772): a u32 used-entry count, a u32 record size
+/// (always 12), one `(lang, country, len, offset)` record per entry, then the
+/// UTF-16BE string pool. lcms2 stores `Len`/`StrW` in host `wchar_t` units in
+/// memory and converts back to u16 units on write — the width cancels, so we
+/// build the pool directly from the entries' code-unit sequences. `len` is the
+/// entry's byte length (`code_units * 2`); `offset` is `cumulative_units * 2 +
+/// HeaderSize + 8` with `HeaderSize = 12 * UsedEntries + 8` (cmstypes.c:1788).
+/// An empty entry stores a single `0x0000` unit (lcms2 forces one wide NUL).
+fn write_mlu<W: ProfileWriter>(w: &mut W, mlu: &Mlu) -> Result<()> {
+    let count = mlu.entries.len();
+    w.write_u32(u32::try_from(count).map_err(|_| Error::Range)?)?;
+    w.write_u32(12)?; // record size
+
+    let header_size = 12u32 * u32::try_from(count).map_err(|_| Error::Range)? + 8;
+
+    // Pre-encode each entry's UTF-16 code units; an empty string is a single 0.
+    let units: Vec<Vec<u16>> = mlu
+        .entries
+        .iter()
+        .map(|e| {
+            let v: Vec<u16> = e.text.encode_utf16().collect();
+            if v.is_empty() {
+                vec![0]
+            } else {
+                v
+            }
+        })
+        .collect();
+
+    let mut cumulative: u32 = 0; // u16 units written into the pool so far.
+    for (e, u) in mlu.entries.iter().zip(&units) {
+        let len_bytes = u32::try_from(u.len() * 2).map_err(|_| Error::Range)?;
+        let offset = cumulative * 2 + header_size + 8;
+        w.write_u16(u16::from_be_bytes(e.language))?;
+        w.write_u16(u16::from_be_bytes(e.country))?;
+        w.write_u32(len_bytes)?;
+        w.write_u32(offset)?;
+        cumulative += u32::try_from(u.len()).map_err(|_| Error::Range)?;
+    }
+
+    // The UTF-16BE pool, entries back-to-back.
+    for u in &units {
+        for &unit in u {
+            w.write_u16(unit)?;
+        }
+    }
+    Ok(())
+}
+
+/// `Type_Text_Description_Write` (cmstypes.c:1198), the legacy v2 `desc` layout:
+/// `len_text` u32 (ASCII length incl. NUL); the ASCII body; a u32 unicode-lang
+/// (0); a u32 unicode-count (= `len_text`); the UTF-16BE unicode body of
+/// `len_text` units; a u16 scriptcode (0); a u8 mac count (0); a 67-byte mac
+/// buffer; then the writer's OWN alignment pad to `_cmsALIGNLONG` of the full tag
+/// requirement (which includes the 8-byte type base). lcms2 derives the ASCII via
+/// `cmsMLUgetASCII(cmsNoLanguage, cmsNoCountry)` and the wide via
+/// `cmsMLUgetWide(cmsV2Unicode, cmsV2Unicode)`, both clipped to `len_text` units.
+fn write_text_description<W: ProfileWriter>(w: &mut W, mlu: &Mlu) -> Result<()> {
+    // ASCII representation (cmsNoLanguage/cmsNoCountry select).
+    let ascii = mlu.preferred_ascii();
+    // strlen(Text)+1: stop at the first embedded NUL, then add the terminator.
+    let ascii_body: &str = ascii.split('\0').next().unwrap_or("");
+    let len_text = u32::try_from(ascii_body.len() + 1).map_err(|_| Error::Range)?;
+
+    // Wide representation (cmsV2Unicode select), clipped/zero-filled to len_text
+    // code units (lcms2 calloc's a len_text buffer, copies the wide string, and
+    // writes exactly len_text units — the tail is the NUL terminator + zeros).
+    let wide_src: Vec<u16> = mlu
+        .select([0xff, 0xff], [0xff, 0xff])
+        .map(|e| e.text.encode_utf16().collect())
+        .unwrap_or_default();
+    let mut wide = vec![0u16; len_text as usize];
+    let n = wide.len().saturating_sub(1).min(wide_src.len());
+    wide[..n].copy_from_slice(&wide_src[..n]);
+
+    // count + ascii body (with NUL terminator).
+    w.write_u32(len_text)?;
+    w.write_all(ascii_body.as_bytes())?;
+    w.write_u8(0)?;
+
+    // unicode language code (0) + count + body.
+    w.write_u32(0)?;
+    w.write_u32(len_text)?;
+    for &unit in &wide {
+        w.write_u16(unit)?;
+    }
+
+    // ScriptCode code (u16) + count (u8) + 67-byte buffer, all zero.
+    w.write_u16(0)?;
+    w.write_u8(0)?;
+    w.write_all(&[0u8; 67])?;
+
+    // lcms2's own end-of-tag pad: _cmsALIGNLONG(len_tag_requirement) where the
+    // requirement INCLUDES the 8-byte type base (cmstypes.c:1249-1251). The outer
+    // serializer also aligns, but this internal pad fires when the ASCII count is
+    // not 4-aligned and must be reproduced for byte-identity.
+    let len_tag_requirement = 8 + 4 + len_text + 4 + 4 + 2 * len_text + 2 + 1 + 67;
+    let len_aligned = (len_tag_requirement + 3) & !3u32;
+    for _ in 0..(len_aligned - len_tag_requirement) {
+        w.write_u8(0)?;
+    }
+    Ok(())
+}
+
+/// `Type_ProfileSequenceDesc_Write` (cmstypes.c:3608): a u32 record count, then per
+/// item deviceMfg (u32), deviceModel (u32), attributes (u64), technology (u32),
+/// and the two embedded descriptions (manufacturer, model) via `SaveDescription`.
+/// `SaveDescription` (cmstypes.c:3596) writes an 8-byte type base then the desc
+/// (`Type_Text_Description_Write`) or mluc (`Type_MLU_Write`) body, chosen by the
+/// profile version (v2 → `desc`, v4 → `mluc`).
+fn write_pseq<W: ProfileWriter>(
+    w: &mut W,
+    items: &[ProfileSequenceItem],
+    version: f64,
+) -> Result<()> {
+    w.write_u32(u32::try_from(items.len()).map_err(|_| Error::Range)?)?;
+    for item in items {
+        w.write_u32(item.device_mfg.to_raw())?;
+        w.write_u32(item.device_model.to_raw())?;
+        w.write_u64(item.attributes)?;
+        w.write_u32(item.technology.to_raw())?;
+        write_embedded_description(w, &item.manufacturer, version)?;
+        write_embedded_description(w, &item.model, version)?;
+    }
+    Ok(())
+}
+
+/// lcms2 `SaveDescription` (cmstypes.c:3596): write the embedded text-description
+/// type base (`desc` at v2, `mluc` at v4) followed by the matching body.
+fn write_embedded_description<W: ProfileWriter>(w: &mut W, mlu: &Mlu, version: f64) -> Result<()> {
+    if version < 4.0 {
+        w.write_type_base(SIG_DESC_TYPE)?;
+        write_text_description(w, mlu)
+    } else {
+        w.write_type_base(SIG_MLUC_TYPE)?;
+        write_mlu(w, mlu)
+    }
 }
 
 #[cfg(test)]
@@ -995,7 +1253,13 @@ mod tests {
     #[test]
     fn ui32_and_uf32_body_layout() {
         let mut w = MemWriter::new();
-        write_tag_body(&mut w, &Tag::U32Array(vec![1, 0x1020_3040, 0xFFFF_FFFF, 7])).unwrap();
+        write_tag_body(
+            &mut w,
+            &Tag::U32Array(vec![1, 0x1020_3040, 0xFFFF_FFFF, 7]),
+            SIG_UINT32_TYPE,
+            4.4,
+        )
+        .unwrap();
         assert_eq!(
             w.as_bytes(),
             &[
@@ -1010,7 +1274,7 @@ mod tests {
         // u16Fixed16 raw words = floor(v*65536 + 0.5), kept verbatim by the reader.
         let raws = [0x0001_8000u32, 0x0002_4000, 0x0000_0000]; // 1.5, 2.25, 0.0
         let vals: Vec<U16Fixed16> = raws.iter().map(|&r| U16Fixed16::from_raw(r)).collect();
-        write_tag_body(&mut w, &Tag::U16Fixed16Array(vals)).unwrap();
+        write_tag_body(&mut w, &Tag::U16Fixed16Array(vals), SIG_U16F16_TYPE, 4.4).unwrap();
         let mut expect = Vec::new();
         for r in raws {
             expect.extend_from_slice(&r.to_be_bytes());
@@ -1053,5 +1317,243 @@ mod tests {
         assert!((profile_version_float(0x0440_0000) - 4.4).abs() < 1e-9);
         assert!((profile_version_float(0x0210_0000) - 2.1).abs() < 1e-9);
         assert!((profile_version_float(0x0400_0000) - 4.0).abs() < 1e-9);
+    }
+
+    // ---- T2: curv/para + mluc/desc (+pseq) writers, diff-tested vs lcms2 ----
+
+    use crate::curve::{build_gamma, build_parametric, build_tabulated_16};
+    use crate::profile::tag::{Mlu, MluEntry, ProfileSequenceItem};
+
+    // `which` selectors mirroring shim.c's `RCMS_T2_*` enum.
+    const T2_CURV_GAMMA_V2: i32 = 0;
+    const T2_CURV_TABLE_V2: i32 = 1;
+    const T2_CURV_TABLE_V4: i32 = 2;
+    const T2_PARA_GAMMA_V4: i32 = 3;
+    const T2_PARA_TYPE1_V4: i32 = 4;
+    const T2_PARA_TYPE2_V4: i32 = 5;
+    const T2_PARA_TYPE3_V4: i32 = 6;
+    const T2_PARA_TYPE4_V4: i32 = 7;
+    const T2_MLUC_V4: i32 = 8;
+    const T2_DESC_V2: i32 = 9;
+    const T2_PSEQ_V4: i32 = 10;
+    const T2_PSEQ_V2: i32 = 11;
+
+    const RED_TRC: Signature = Signature::from_bytes(*b"rTRC");
+    const CPRT: Signature = Signature::from_bytes(*b"cprt");
+    const DESC_TAG: Signature = Signature::from_bytes(*b"desc");
+    const PSEQ_TAG: Signature = Signature::from_bytes(*b"pseq");
+
+    /// `basic_header` re-versioned (the serializer ignores `size`/`illuminant`;
+    /// only `version` matters for the DecideType deciders).
+    fn header_versioned(version: u32) -> Header {
+        Header {
+            version,
+            ..basic_header()
+        }
+    }
+
+    fn mlu_entry(lang: &[u8; 2], country: &[u8; 2], text: &str) -> MluEntry {
+        MluEntry {
+            language: *lang,
+            country: *country,
+            text: text.to_string(),
+        }
+    }
+
+    /// Build the rcms single-tag profile for T2 selector `which`, matching the
+    /// structure shim.c constructs (same curve/MLU/pseq values + profile version).
+    fn build_t2(which: i32) -> WritableProfile {
+        match which {
+            T2_CURV_GAMMA_V2 => {
+                let mut p = WritableProfile::new(header_versioned(0x0210_0000));
+                p.add_tag(RED_TRC, Tag::Curve(build_gamma(2.4)));
+                p
+            }
+            T2_CURV_TABLE_V2 | T2_CURV_TABLE_V4 => {
+                let version = if which == T2_CURV_TABLE_V2 {
+                    0x0210_0000
+                } else {
+                    0x0440_0000
+                };
+                let mut p = WritableProfile::new(header_versioned(version));
+                let tbl = [0u16, 0x3000, 0x7000, 0xB000, 0xFFFF];
+                p.add_tag(RED_TRC, Tag::Curve(build_tabulated_16(&tbl)));
+                p
+            }
+            T2_PARA_GAMMA_V4 => {
+                let mut p = WritableProfile::new(header_versioned(0x0440_0000));
+                p.add_tag(RED_TRC, Tag::Curve(build_gamma(2.4)));
+                p
+            }
+            T2_PARA_TYPE1_V4 => {
+                let mut p = WritableProfile::new(header_versioned(0x0440_0000));
+                let c = build_parametric(2, &[2.4, 0.9, 0.1]).unwrap();
+                p.add_tag(RED_TRC, Tag::Curve(c));
+                p
+            }
+            T2_PARA_TYPE2_V4 => {
+                let mut p = WritableProfile::new(header_versioned(0x0440_0000));
+                let c = build_parametric(3, &[2.4, 0.9, 0.1, 0.05]).unwrap();
+                p.add_tag(RED_TRC, Tag::Curve(c));
+                p
+            }
+            T2_PARA_TYPE3_V4 => {
+                let mut p = WritableProfile::new(header_versioned(0x0440_0000));
+                let c =
+                    build_parametric(4, &[2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045])
+                        .unwrap();
+                p.add_tag(RED_TRC, Tag::Curve(c));
+                p
+            }
+            T2_PARA_TYPE4_V4 => {
+                let mut p = WritableProfile::new(header_versioned(0x0440_0000));
+                let c = build_parametric(
+                    5,
+                    &[
+                        2.4,
+                        1.0 / 1.055,
+                        0.055 / 1.055,
+                        1.0 / 12.92,
+                        0.04045,
+                        0.1,
+                        0.2,
+                    ],
+                )
+                .unwrap();
+                p.add_tag(RED_TRC, Tag::Curve(c));
+                p
+            }
+            T2_MLUC_V4 => {
+                let mut p = WritableProfile::new(header_versioned(0x0440_0000));
+                let mlu = Mlu {
+                    entries: vec![
+                        mlu_entry(b"en", b"US", "Hello"),
+                        mlu_entry(b"de", b"DE", "Gr\u{00fc}\u{00df}e"),
+                        mlu_entry(b"ja", b"JP", "\u{65e5}\u{672c}\u{8a9e}"),
+                    ],
+                };
+                p.add_tag(CPRT, Tag::Mlu(mlu));
+                p
+            }
+            T2_DESC_V2 => {
+                let mut p = WritableProfile::new(header_versioned(0x0210_0000));
+                // lcms2 holds a single cmsNoLanguage/cmsNoCountry ASCII entry.
+                let mlu = Mlu {
+                    entries: vec![mlu_entry(&[0, 0], &[0, 0], "rcms desc test")],
+                };
+                p.add_tag(DESC_TAG, Tag::Mlu(mlu));
+                p
+            }
+            T2_PSEQ_V4 | T2_PSEQ_V2 => {
+                let version = if which == T2_PSEQ_V4 {
+                    0x0440_0000
+                } else {
+                    0x0210_0000
+                };
+                let mut p = WritableProfile::new(header_versioned(version));
+                let mk = |i: u32, mfg: &str, model: &str| ProfileSequenceItem {
+                    device_mfg: Signature::from_raw(0x4D46_4731 + i),
+                    device_model: Signature::from_raw(0x4D4F_4431 + i),
+                    attributes: u64::from(i + 1),
+                    technology: Signature::from_raw(0x6D6E_7472),
+                    manufacturer: Mlu {
+                        entries: vec![mlu_entry(&[0, 0], &[0, 0], mfg)],
+                    },
+                    model: Mlu {
+                        entries: vec![mlu_entry(&[0, 0], &[0, 0], model)],
+                    },
+                };
+                p.add_tag(
+                    PSEQ_TAG,
+                    Tag::ProfileSequenceDesc(vec![
+                        mk(0, "MakerOne", "ModelOne"),
+                        mk(1, "MakerTwo", "ModelTwo"),
+                    ]),
+                );
+                p
+            }
+            other => panic!("unknown T2 selector {other}"),
+        }
+    }
+
+    fn assert_t2_identical(which: i32, label: &str) {
+        let rust = save_to_mem(&build_t2(which)).expect("rcms serialize");
+        let c = rcms_oracle::save_curve_mlu_tag(which).expect("lcms2 serialize");
+        assert_eq!(
+            rust.len(),
+            c.len(),
+            "{label}: length mismatch rcms={} lcms2={}",
+            rust.len(),
+            c.len()
+        );
+        if rust != c {
+            let first = rust.iter().zip(&c).position(|(a, b)| a != b);
+            panic!(
+                "{label}: byte mismatch at {first:?}\n rcms={:02x?}\n lcms={:02x?}",
+                rust, c
+            );
+        }
+    }
+
+    #[test]
+    fn curve_gamma_v2_curv_byte_identical() {
+        assert_t2_identical(T2_CURV_GAMMA_V2, "curv/gamma v2");
+    }
+    #[test]
+    fn curve_table_v2_curv_byte_identical() {
+        assert_t2_identical(T2_CURV_TABLE_V2, "curv/table v2");
+    }
+    #[test]
+    fn curve_table_v4_curv_byte_identical() {
+        assert_t2_identical(T2_CURV_TABLE_V4, "curv/table v4");
+    }
+    #[test]
+    fn curve_gamma_v4_para_byte_identical() {
+        assert_t2_identical(T2_PARA_GAMMA_V4, "para/gamma v4");
+    }
+    #[test]
+    fn para_type1_byte_identical() {
+        assert_t2_identical(T2_PARA_TYPE1_V4, "para type1");
+    }
+    #[test]
+    fn para_type2_byte_identical() {
+        assert_t2_identical(T2_PARA_TYPE2_V4, "para type2");
+    }
+    #[test]
+    fn para_type3_byte_identical() {
+        assert_t2_identical(T2_PARA_TYPE3_V4, "para type3");
+    }
+    #[test]
+    fn para_type4_byte_identical() {
+        assert_t2_identical(T2_PARA_TYPE4_V4, "para type4");
+    }
+    #[test]
+    fn mluc_multilang_byte_identical() {
+        assert_t2_identical(T2_MLUC_V4, "mluc multilang");
+    }
+    #[test]
+    fn desc_v2_byte_identical() {
+        assert_t2_identical(T2_DESC_V2, "desc v2");
+    }
+    #[test]
+    fn pseq_v4_byte_identical() {
+        assert_t2_identical(T2_PSEQ_V4, "pseq v4 (mluc embeds)");
+    }
+    #[test]
+    fn pseq_v2_byte_identical() {
+        assert_t2_identical(T2_PSEQ_V2, "pseq v2 (desc embeds)");
+    }
+
+    /// DecideCurveType: v2 always `curv`; v4 single non-inverted ICC parametric
+    /// (type 1..5) → `para`, multi-segment / tabulated → `curv`.
+    #[test]
+    fn decide_curve_type_selection() {
+        let gamma = build_gamma(2.2);
+        let table = build_tabulated_16(&[0, 0x8000, 0xFFFF]);
+        assert_eq!(decide_curve(&gamma, 2.1), SIG_CURVE_TYPE);
+        assert_eq!(decide_curve(&gamma, 4.4), SIG_PARAMETRIC_TYPE);
+        assert_eq!(decide_curve(&table, 4.4), SIG_CURVE_TYPE);
+        let para5 = build_parametric(5, &[2.4, 0.9, 0.1, 0.05, 0.1, 0.2, 0.3]).unwrap();
+        assert_eq!(decide_curve(&para5, 4.4), SIG_PARAMETRIC_TYPE);
     }
 }
