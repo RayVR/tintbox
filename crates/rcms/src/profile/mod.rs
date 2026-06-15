@@ -12,9 +12,10 @@ pub mod virtuals;
 
 pub use directory::TagEntry;
 pub use header::{ColorSpace, DateTime, Header, ProfileClass, RenderingIntent};
-pub use serialize::{save_to_mem, SlotContent, TagSlot, WritableProfile};
+pub use serialize::{save_to_mem, save_to_mem_in, SlotContent, TagSlot, WritableProfile};
 pub use tag::{CustomTagData, Tag};
 
+use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::io::{MemReader, ProfileReader};
 use crate::sig::Signature;
@@ -193,6 +194,24 @@ impl<'a> Profile<'a> {
     ///    (`cmsio0.c:1852`); else corruption.
     /// 6. Cache and return.
     pub fn read_tag(&self, sig: Signature) -> Result<Tag> {
+        // Legacy entry point: builtin path only. Delegates with an empty Context,
+        // so behaviour is byte-for-byte the pre-plugin path (no registry consulted).
+        self.read_tag_in(&Context::new(), sig)
+    }
+
+    /// lcms2 `cmsReadTag` with the plugin registry consulted (slice-8 T4). Same
+    /// §7.5 flow as [`read_tag`](Self::read_tag), but:
+    /// - the type/elem-count descriptor is resolved BUILTIN-FIRST
+    ///   ([`descriptor::descriptor`]); a tag with no builtin descriptor falls
+    ///   through to a [`TagDescriptor`](crate::plugin::TagDescriptor) registered in
+    ///   `ctx` (its `supported_types` act as the `allowed_types` gate, with no
+    ///   element-count floor), so a custom logical tag can be read; and
+    /// - the type dispatch goes through [`types::read_tag_value_in`], which lets a
+    ///   registered tag-type plugin claim an otherwise-unsupported type signature.
+    ///
+    /// Builtins are never shadowed: builtin descriptors and builtin type arms are
+    /// matched before any registry lookup.
+    pub fn read_tag_in(&self, ctx: &Context, sig: Signature) -> Result<Tag> {
         // 1. Locate + chase links. The cache is keyed by the resolved signature so
         //    two links to the same data share one entry (lcms2 caches per slot n).
         let entry = *self.search_tag(sig).ok_or(Error::Range)?;
@@ -208,8 +227,21 @@ impl<'a> Profile<'a> {
         }
 
         // The descriptor for the ORIGINAL sig drives the type/elem-count check
-        // (lcms2 looks up `_cmsGetTagDescriptor(Icc, sig)`). Unknown tag → error.
-        let desc = descriptor::descriptor(sig).ok_or(Error::BadType(sig))?;
+        // (lcms2 looks up `_cmsGetTagDescriptor(Icc, sig)`). Builtin descriptors
+        // win; an unknown sig falls through to a registered custom tag descriptor.
+        let (allowed_types, elem_floor): (Vec<Signature>, u32) = match descriptor::descriptor(sig) {
+            Some(desc) => (desc.allowed_types.to_vec(), desc.elem_count),
+            None => {
+                let custom = ctx
+                    .plugins()
+                    .tags
+                    .iter()
+                    .find(|(s, _)| *s == sig)
+                    .map(|(_, d)| d)
+                    .ok_or(Error::BadType(sig))?;
+                (custom.supported_types.clone(), 0)
+            }
+        };
 
         // 2. TagSize < 8 is corruption (cmsio0.c:1772).
         if entry.size < 8 {
@@ -220,17 +252,18 @@ impl<'a> Profile<'a> {
         let mut r = MemReader::new(self.bytes);
         r.seek(entry.offset as u64)?;
         let type_sig = r.read_type_base()?;
-        if !desc.allowed_types.contains(&type_sig) {
+        if !allowed_types.contains(&type_sig) {
             return Err(Error::BadType(type_sig));
         }
 
-        // 4. Dispatch; the handler gets TagSize - 8 payload bytes.
+        // 4. Dispatch; the handler gets TagSize - 8 payload bytes. The `_in`
+        //    dispatcher consults the tag-type plugin registry after the builtins.
         let payload = entry.size - 8;
-        let value = types::read_tag_value(type_sig, &mut r, payload)?;
+        let value = types::read_tag_value_in(ctx, type_sig, &mut r, payload)?;
 
         // 5. Element-count check (cmsio0.c:1852): the decoded count must be at
         //    least the descriptor's required ElemCount.
-        if elem_count(&value) < desc.elem_count {
+        if elem_count(&value) < elem_floor {
             return Err(Error::Corrupt("inconsistent element count"));
         }
 
