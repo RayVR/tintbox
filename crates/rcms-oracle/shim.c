@@ -1378,3 +1378,75 @@ int rcms_oracle_tag_read_succeeds(const uint8_t* buf, uint32_t len, uint32_t sig
     cmsCloseProfile(p);
     return ok;
 }
+
+/* ---- Profile -> pipeline LUT extraction (cmsio1.c) --------------------------
+   _cmsReadInputLUT / _cmsReadOutputLUT / _cmsReadDevicelinkLUT are CMSCHECKPOINT-
+   exported internals (lcms2_internal.h:964-966). These shims open a profile from
+   memory, build the requested LUT for `intent`, and evaluate `nSamples` input
+   vectors through it via cmsPipelineEvalFloat. `which`: 0 = input, 1 = output,
+   2 = devicelink. `inputs` is `nSamples * nIn` f32 row-major; `out` receives
+   `nSamples * nOut` f32 row-major. `nInOut[0]/[1]` receive the pipeline's in/out
+   channel counts. Returns 1 on success (LUT built), 0 if the profile cannot be
+   opened or lcms2 returns NULL for the requested LUT. */
+static cmsPipeline* read_lut_which(cmsHPROFILE p, uint32_t which, uint32_t intent) {
+    switch (which) {
+        case 0:  return _cmsReadInputLUT(p, intent);
+        case 1:  return _cmsReadOutputLUT(p, intent);
+        case 2:  return _cmsReadDevicelinkLUT(p, intent);
+        default: return NULL;
+    }
+}
+
+/* Report whether lcms2 builds a LUT for (which, intent) and its channel counts. */
+int rcms_oracle_read_lut_channels(const uint8_t* buf, uint32_t len, uint32_t which,
+                                  uint32_t intent, uint32_t* nIn, uint32_t* nOut) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsPipeline* lut = read_lut_which(p, which, intent);
+    int ok = 0;
+    if (lut) {
+        *nIn = cmsPipelineInputChannels(lut);
+        *nOut = cmsPipelineOutputChannels(lut);
+        cmsPipelineFree(lut);
+        ok = 1;
+    }
+    cmsCloseProfile(p);
+    return ok;
+}
+
+/* Build the LUT for (which, intent) and evaluate nSamples input vectors through
+   it in the float domain. Returns 1 on success, 0 if no LUT. */
+int rcms_oracle_read_lut_eval_float(const uint8_t* buf, uint32_t len, uint32_t which,
+                                    uint32_t intent, const float* inputs,
+                                    uint32_t nSamples, float* out) {
+    cmsHPROFILE p = cmsOpenProfileFromMem((const void*)buf, len);
+    if (!p) return 0;
+    cmsPipeline* lut = read_lut_which(p, which, intent);
+    if (!lut) { cmsCloseProfile(p); return 0; }
+    uint32_t nIn = cmsPipelineInputChannels(lut);
+    uint32_t nOut = cmsPipelineOutputChannels(lut);
+    for (uint32_t s = 0; s < nSamples; s++) {
+        cmsPipelineEvalFloat(inputs + (size_t) s * nIn, out + (size_t) s * nOut, lut);
+    }
+    cmsPipelineFree(lut);
+    cmsCloseProfile(p);
+    return 1;
+}
+
+/* ---- cmsReverseToneCurve (cmsgamma.c) --------------------------------------
+   Build a 16-bit tabulated tone curve from `table` (length n), reverse it via
+   cmsReverseToneCurve, and evaluate the reversed curve via cmsEvalToneCurveFloat
+   at the `nx` points in `xs`, writing `nx` floats into `ys`. Returns 1 on
+   success, 0 on allocation failure. */
+int rcms_oracle_reverse_tabulated16_eval_float(const uint16_t* table, uint32_t n,
+                                               const float* xs, uint32_t nx,
+                                               float* ys) {
+    cmsToneCurve* c = cmsBuildTabulatedToneCurve16(NULL, n, table);
+    if (!c) return 0;
+    cmsToneCurve* rev = cmsReverseToneCurve(c);
+    if (!rev) { cmsFreeToneCurve(c); return 0; }
+    for (uint32_t i = 0; i < nx; i++) ys[i] = cmsEvalToneCurveFloat(rev, xs[i]);
+    cmsFreeToneCurve(rev);
+    cmsFreeToneCurve(c);
+    return 1;
+}

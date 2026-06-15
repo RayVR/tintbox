@@ -267,6 +267,7 @@ fn read_mpe_clut<R: ProfileReader>(r: &mut R, lut: &mut Pipeline) -> Result<()> 
     lut.insert_stage_at_end(Stage::Clut(Clut {
         table: ClutTable::F32(table),
         params,
+        is_trilinear: false,
     }))
 }
 

@@ -15,6 +15,7 @@ pub mod error;
 pub mod fixed;
 pub mod interp;
 pub mod io;
+pub mod link;
 pub mod math;
 pub mod pcs;
 pub mod pipeline;
@@ -29,11 +30,12 @@ pub mod prelude {
     pub use crate::context::{Context, Logger};
     pub use crate::curve::{
         build_gamma, build_parametric, build_segmented, build_tabulated_16, build_tabulated_float,
-        eval_parametric, CurveSegment, ToneCurve,
+        eval_parametric, reverse_tone_curve, reverse_tone_curve_ex, CurveSegment, ToneCurve,
     };
     pub use crate::error::{Error, Result};
     pub use crate::fixed::{Half, S15Fixed16, U16Fixed16, U8Fixed8};
     pub use crate::io::{ProfileReader, ProfileWriter};
+    pub use crate::link::{read_devicelink_lut, read_input_lut, read_output_lut};
     pub use crate::pipeline::{Pipeline, Stage};
     pub use crate::profile::{Header, Profile, Tag};
     pub use crate::sig::Signature;

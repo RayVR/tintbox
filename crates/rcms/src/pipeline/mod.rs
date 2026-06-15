@@ -153,6 +153,19 @@ impl Pipeline {
         Ok(())
     }
 
+    /// lcms2 `ChangeInterpolationToTrilinear` (cmsio1.c:516-534): set the
+    /// `CMS_LERP_FLAGS_TRILINEAR` hint on every CLUT stage. For a 3-input CLUT this
+    /// flips the interpolation from tetrahedral to trilinear — a different numeric
+    /// result. `_cmsReadOutputLUT`/`_cmsReadDevicelinkLUT` call this when the PCS is
+    /// Lab.
+    pub fn change_interpolation_to_trilinear(&mut self) {
+        for stage in &mut self.stages {
+            if let Stage::Clut(clut) = stage {
+                clut.is_trilinear = true;
+            }
+        }
+    }
+
     /// Evaluate in the float domain (lcms2 `_LUTevalFloat`, cmslut.c:1355-1374).
     ///
     /// Copies `input_channels` floats into the first ping-pong buffer, walks the

@@ -364,6 +364,30 @@ unsafe extern "C" {
         n_samples: u32,
         out: *mut f32,
     ) -> i32;
+    fn rcms_oracle_read_lut_channels(
+        buf: *const u8,
+        len: u32,
+        which: u32,
+        intent: u32,
+        n_in: *mut u32,
+        n_out: *mut u32,
+    ) -> i32;
+    fn rcms_oracle_read_lut_eval_float(
+        buf: *const u8,
+        len: u32,
+        which: u32,
+        intent: u32,
+        inputs: *const f32,
+        n_samples: u32,
+        out: *mut f32,
+    ) -> i32;
+    fn rcms_oracle_reverse_tabulated16_eval_float(
+        table: *const u16,
+        n: u32,
+        xs: *const f32,
+        nx: u32,
+        ys: *mut f32,
+    ) -> i32;
 }
 
 /// Flat mirror of `rcms_oracle_header` in shim.c (must match field order/layout).
@@ -2202,6 +2226,103 @@ pub fn lut_eval_float(
     };
     if ok != 0 {
         Some(out)
+    } else {
+        None
+    }
+}
+
+/// Which LUT-extraction entry point to drive in [`read_lut_channels`] /
+/// [`read_lut_eval_float`]: 0 = `_cmsReadInputLUT`, 1 = `_cmsReadOutputLUT`,
+/// 2 = `_cmsReadDevicelinkLUT` (all `cmsio1.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadLut {
+    Input = 0,
+    Output = 1,
+    Devicelink = 2,
+}
+
+/// lcms2 `_cmsReadInputLUT` / `_cmsReadOutputLUT` / `_cmsReadDevicelinkLUT`
+/// (`cmsio1.c`) for `intent`: report whether lcms2 builds a LUT and its
+/// `(input_channels, output_channels)`, or `None` if the profile cannot be
+/// opened or lcms2 returns NULL for the requested LUT.
+pub fn read_lut_channels(buf: &[u8], which: ReadLut, intent: u32) -> Option<(u32, u32)> {
+    let mut n_in = 0u32;
+    let mut n_out = 0u32;
+    // SAFETY: buf/len describe a valid readable slice C only reads; n_in/n_out are
+    // valid u32 the C writes only when it returns nonzero. The profile and the
+    // built pipeline are opened and freed entirely inside the call.
+    let ok = unsafe {
+        rcms_oracle_read_lut_channels(
+            buf.as_ptr(),
+            buf.len() as u32,
+            which as u32,
+            intent,
+            &mut n_in,
+            &mut n_out,
+        )
+    };
+    if ok != 0 {
+        Some((n_in, n_out))
+    } else {
+        None
+    }
+}
+
+/// Build the LUT lcms2's `_cmsRead{Input,Output,Devicelink}LUT` produces for
+/// `intent` and evaluate `n_samples` input vectors (`inputs` is
+/// `n_samples * n_in` f32 row-major) through it via `cmsPipelineEvalFloat`.
+/// Returns the `n_samples * n_out` f32 outputs row-major, or `None` if no LUT.
+/// `n_in`/`n_out` must match [`read_lut_channels`].
+pub fn read_lut_eval_float(
+    buf: &[u8],
+    which: ReadLut,
+    intent: u32,
+    inputs: &[f32],
+    n_samples: usize,
+    n_out: usize,
+) -> Option<Vec<f32>> {
+    let mut out = vec![0f32; n_samples * n_out];
+    // SAFETY: buf/len describe a valid readable slice C only reads; `inputs` is
+    // `n_samples * n_in` readable f32; `out` has `n_samples * n_out` f32 of room
+    // (the pipeline output width). C reads inputs and writes exactly that many
+    // outputs; the profile and pipeline are opened and freed inside the call.
+    let ok = unsafe {
+        rcms_oracle_read_lut_eval_float(
+            buf.as_ptr(),
+            buf.len() as u32,
+            which as u32,
+            intent,
+            inputs.as_ptr(),
+            n_samples as u32,
+            out.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// lcms2 `cmsBuildTabulatedToneCurve16(table)` + `cmsReverseToneCurve` +
+/// `cmsEvalToneCurveFloat`: reverse a 16-bit tabulated curve and evaluate the
+/// reversed curve at each `x` in `xs`. Returns the `xs.len()` outputs, or `None`
+/// on allocation failure.
+pub fn reverse_tabulated16_eval_float(table: &[u16], xs: &[f32]) -> Option<Vec<f32>> {
+    let mut ys = vec![0f32; xs.len()];
+    // SAFETY: `table` is `n` readable u16, `xs` is `nx` readable f32, `ys` has `nx`
+    // f32 of room. C builds/reverses/evaluates a curve and frees it inside the call.
+    let ok = unsafe {
+        rcms_oracle_reverse_tabulated16_eval_float(
+            table.as_ptr(),
+            table.len() as u32,
+            xs.as_ptr(),
+            xs.len() as u32,
+            ys.as_mut_ptr(),
+        )
+    };
+    if ok != 0 {
+        Some(ys)
     } else {
         None
     }

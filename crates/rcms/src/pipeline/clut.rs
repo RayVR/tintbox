@@ -41,6 +41,13 @@ pub struct Clut {
     pub table: ClutTable,
     /// Interpolation parameters (sample counts, domain, opta strides).
     pub params: InterpParams,
+    /// Whether the `CMS_LERP_FLAGS_TRILINEAR` hint is set (lcms2
+    /// `_cmsStageCLutData::Params->dwFlags`). The `cmsStageAllocCLut*` allocators
+    /// never set it (so a freshly-read CLUT is `false` = tetrahedral for 3D), but
+    /// `ChangeInterpolationToTrilinear` (cmsio1.c:516-534) ORs it in on every CLUT
+    /// stage of an output/devicelink LUT whose PCS is Lab — flipping a 3-input
+    /// CLUT from tetrahedral to trilinear, a *different* numeric result.
+    pub is_trilinear: bool,
 }
 
 impl Clut {
@@ -61,10 +68,10 @@ impl Clut {
     ///
     /// The 16-bit table takes lcms2's `EvaluateCLUTfloatIn16` path; the float
     /// table takes the `EvaluateCLUTfloat` path. The interpolation routine is
-    /// resolved by [`interp_factory`] with the matching `is_float` flag and
-    /// `is_trilinear = false` — exactly the selection `cmsStageAllocCLut*`
-    /// makes (those allocators pass `CMS_LERP_FLAGS_16BITS` / `_FLOAT`, never
-    /// `CMS_LERP_FLAGS_TRILINEAR`, so a 3-input CLUT is always tetrahedral).
+    /// resolved by [`interp_factory`] with the matching `is_float` flag and the
+    /// `is_trilinear` hint. `cmsStageAllocCLut*` never sets the trilinear flag (so
+    /// a freshly-read CLUT is tetrahedral for 3D), but
+    /// `ChangeInterpolationToTrilinear` can flip it (see [`Clut::is_trilinear`]).
     pub fn eval(&self, input: &[f32], output: &mut [f32]) {
         let n_in = self.params.n_inputs;
         let n_out = self.params.n_outputs;
@@ -72,7 +79,7 @@ impl Clut {
         match &self.table {
             ClutTable::U16(table) => {
                 // EvaluateCLUTfloatIn16: FromFloatTo16 -> Lerp16 -> From16ToFloat.
-                let fnsel = interp_factory(n_in, n_out, false, false);
+                let fnsel = interp_factory(n_in, n_out, false, self.is_trilinear);
                 let lerp16 = match fnsel {
                     InterpFn::Lerp16(l) => l,
                     InterpFn::LerpFloat(_) => unreachable!("16-bit CLUT selects a Lerp16 routine"),
@@ -95,7 +102,7 @@ impl Clut {
             }
             ClutTable::F32(table) => {
                 // EvaluateCLUTfloat: the float interpolator runs directly.
-                let fnsel = interp_factory(n_in, n_out, true, false);
+                let fnsel = interp_factory(n_in, n_out, true, self.is_trilinear);
                 let lerpf = match fnsel {
                     InterpFn::LerpFloat(l) => l,
                     InterpFn::Lerp16(_) => unreachable!("float CLUT selects a LerpFloat routine"),

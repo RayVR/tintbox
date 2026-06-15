@@ -102,6 +102,18 @@ impl<'a> Profile<'a> {
         self.bytes.get(off..end).ok_or(Error::Range)
     }
 
+    /// lcms2 `_cmsGetTagTrueType` (`cmsio0.c:1889`): the on-disk tag-TYPE
+    /// signature for `sig` — the 8-byte type base lcms2 records while reading the
+    /// tag. Links are chased to the resolved entry (matching `read_tag`). Returns
+    /// `None` if the tag is absent or its byte range falls outside the profile.
+    /// Needed by the V2↔V4 LUT gates, which key on `OriginalType == Lut16Type`.
+    pub fn tag_true_type(&self, sig: Signature) -> Option<Signature> {
+        let entry = self.search_tag(sig)?;
+        let mut r = MemReader::new(self.bytes);
+        r.seek(entry.offset as u64).ok()?;
+        r.read_type_base().ok()
+    }
+
     /// lcms2 `cmsReadTag` (`cmsio0.c:1722-1876`), §7.5 flow, returning the decoded
     /// [`Tag`] (a clone of the cached value).
     ///
