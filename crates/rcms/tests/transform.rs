@@ -753,3 +753,287 @@ fn dense_8bit_to_16bit_matrix_shaper_bit_identical_to_lcms2_nooptimize() {
     );
     assert!(cells > 0, "expected at least one RGB pair × intent cell");
 }
+
+// --- cmsFLAGS_COPY_ALPHA: extra-channel copy ---------------------------------
+
+/// Bytes one packed pixel of `fmt` occupies (color + extra channels), double = 8.
+fn px_bytes(fmt: u32) -> usize {
+    let f = PixelFormat(fmt);
+    let s = match f.bytes() {
+        0 => 8,
+        b => b as usize,
+    };
+    (f.channels() + f.extra()) as usize * s
+}
+
+/// Encode a 0..1 color value into one sample of `fmt`'s kind at `dst`.
+fn enc_color(dst: &mut [u8], v: f32, fmt: u32) {
+    let f = PixelFormat(fmt);
+    if f.is_float() {
+        if f.bytes() == 0 {
+            dst[..8].copy_from_slice(&(v as f64).to_le_bytes());
+        } else {
+            dst[..4].copy_from_slice(&v.to_le_bytes());
+        }
+    } else if f.bytes() == 2 {
+        let q = (v as f64 * 65535.0 + 0.5).floor().clamp(0.0, 65535.0) as u16;
+        dst[..2].copy_from_slice(&q.to_le_bytes());
+    } else {
+        dst[0] = (v as f64 * 255.0 + 0.5).floor().clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// Write a random alpha sample into `dst` for `fmt`'s kind, returning the bytes
+/// written so the test can prove the depth conversion ran. Alpha is the LAST
+/// color+extra sample of a plain (no-swap) RGBA/CMYKA format.
+fn enc_random_alpha(dst: &mut [u8], rng: &mut rcms_oracle::Rng, fmt: u32) {
+    let f = PixelFormat(fmt);
+    if f.is_float() {
+        // 0..1-ish float alpha (a few values just outside to exercise saturation).
+        let u = (rng.next_u64() & 0xffff_ffff) as u32;
+        let a = ((u as f64) / (u32::MAX as f64)) as f32 * 1.1 - 0.05;
+        if f.bytes() == 0 {
+            dst[..8].copy_from_slice(&(a as f64).to_le_bytes());
+        } else {
+            dst[..4].copy_from_slice(&a.to_le_bytes());
+        }
+    } else if f.bytes() == 2 {
+        let a = (rng.next_u64() & 0xffff) as u16;
+        dst[..2].copy_from_slice(&a.to_le_bytes());
+    } else {
+        dst[0] = (rng.next_u64() & 0xff) as u8;
+    }
+}
+
+/// RGBA/CMYKA COPY_ALPHA sweep: for several depth-conversion format pairs over
+/// loadable testbed RGB→RGB (and a CMYK case) pairs, build the rcms transform
+/// with `COPY_ALPHA` and diff `do_transform` byte-for-byte against lcms2
+/// `cmsCreateExtendedTransform(COPY_ALPHA | NOOPTIMIZE)` + `cmsDoTransform`. The
+/// alpha values are random so the conversion (FROM_8_TO_16, /255, saturate, …)
+/// is exercised, not just identity.
+#[test]
+fn copy_alpha_extra_channel_matches_lcms2() {
+    let files = testbed_icc();
+
+    // RGB profiles for RGBA cases; any-CMYK for the CMYKA case.
+    let mut rgb: Vec<Loaded> = Vec::new();
+    let mut cmyk: Vec<Loaded> = Vec::new();
+    for path in &files {
+        let bytes = fs::read(path).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if !rcms_oracle::open_succeeds(&bytes) {
+            continue;
+        }
+        let Ok(prof) = Profile::open(&bytes) else {
+            continue;
+        };
+        match prof.header().color_space {
+            ColorSpace::Rgb => rgb.push(Loaded { name, bytes }),
+            ColorSpace::Cmyk => cmyk.push(Loaded { name, bytes }),
+            _ => {}
+        }
+    }
+    assert!(rgb.len() >= 2, "need >= 2 loadable RGB testbed profiles");
+
+    let intents = [
+        RenderingIntent::RelativeColorimetric,
+        RenderingIntent::Perceptual,
+    ];
+
+    // (in_fmt, out_fmt, n_color_chans): depth-conversion pairs.
+    let rgba_pairs: &[(u32, u32)] = &[
+        (decode::TYPE_RGBA_8, decode::TYPE_RGBA_8), // 8 -> 8 identity
+        (decode::TYPE_RGBA_8, decode::TYPE_RGBA_16), // 8 -> 16 (FROM_8_TO_16)
+        (decode::TYPE_RGBA_16, decode::TYPE_RGBA_8), // 16 -> 8 (FROM_16_TO_8)
+        (decode::TYPE_RGBA_16, decode::TYPE_RGBA_FLT), // 16 -> float (/65535)
+        (decode::TYPE_RGBA_8, decode::TYPE_RGBA_FLT), // 8 -> float (/255)
+        (decode::TYPE_RGBA_FLT, decode::TYPE_RGBA_16), // float -> 16 (saturate)
+        (decode::TYPE_RGBA_FLT, decode::TYPE_RGBA_8), // float -> 8 (saturate byte)
+        (decode::TYPE_RGBA_FLT, decode::TYPE_RGBA_FLT), // float -> float
+    ];
+
+    let mut rng = rcms_oracle::Rng::new(0x00A1_FA00);
+    let n = 64usize; // pixels per cell
+    let mut cells = 0usize;
+    let mut alpha_samples = 0usize;
+
+    let flags = rcms::transform::Flags::NOOPTIMIZE.union(rcms::transform::Flags::COPY_ALPHA);
+
+    // A few RGB pairs (keep the matrix small but multiple).
+    'pairs: for a in &rgb {
+        for b in &rgb {
+            if a.name == b.name {
+                continue;
+            }
+            let pa = Profile::open(&a.bytes).unwrap();
+            let pb = Profile::open(&b.bytes).unwrap();
+
+            for &intent in &intents {
+                let intents_raw = [intent.to_raw(), intent.to_raw()];
+
+                for &(in_fmt, out_fmt) in rgba_pairs {
+                    let in_stride = px_bytes(in_fmt);
+                    let out_stride = px_bytes(out_fmt);
+
+                    // Build input: random-ish color in 0..1 + random alpha.
+                    let mut packed_in = vec![0u8; n * in_stride];
+                    let in_sb = in_stride / 4; // 4 samples (RGBA), bytes per sample
+                    for p in 0..n {
+                        let base = p * in_stride;
+                        for ch in 0..3 {
+                            let u = (rng.next_u64() & 0xffff) as f32 / 65535.0;
+                            enc_color(&mut packed_in[base + ch * in_sb..], u, in_fmt);
+                        }
+                        // alpha = last sample
+                        enc_random_alpha(&mut packed_in[base + 3 * in_sb..], &mut rng, in_fmt);
+                    }
+
+                    let mut oracle_out = vec![0u8; n * out_stride];
+                    let ok = rcms_oracle::do_transform_packed_copyalpha(
+                        &[&a.bytes, &b.bytes],
+                        &intents_raw,
+                        &[false, false],
+                        &[1.0, 1.0],
+                        in_fmt,
+                        out_fmt,
+                        &packed_in,
+                        &mut oracle_out,
+                        n,
+                    );
+                    if !ok {
+                        continue;
+                    }
+
+                    let xform = match Transform::new_simple_with_formats_flags(
+                        &pa, &pb, intent, false, in_fmt, out_fmt, flags,
+                    ) {
+                        Ok(x) => x,
+                        Err(_) => continue,
+                    };
+                    let mut rcms_out = vec![0u8; n * out_stride];
+                    xform.do_transform(&packed_in, &mut rcms_out, n);
+
+                    assert_eq!(
+                        rcms_out, oracle_out,
+                        "COPY_ALPHA {} -> {} ({intent:?}) in={in_fmt:#x} out={out_fmt:#x}: \
+                         byte mismatch (color or alpha)",
+                        a.name, b.name
+                    );
+
+                    cells += 1;
+                    alpha_samples += n;
+                }
+            }
+            // Two RGB source profiles' worth of pairs is plenty.
+            if cells >= rgba_pairs.len() * 2 * intents.len() {
+                break 'pairs;
+            }
+        }
+    }
+    assert!(cells > 0, "expected at least one RGBA COPY_ALPHA cell");
+
+    // CMYKA case (CMYK + 1 extra), if a CMYK testbed pair exists.
+    let mut cmyka_cells = 0usize;
+    if cmyk.len() >= 2 {
+        let pa = Profile::open(&cmyk[0].bytes).unwrap();
+        let pb = Profile::open(&cmyk[1].bytes).unwrap();
+        let intent = RenderingIntent::RelativeColorimetric;
+        let intents_raw = [intent.to_raw(), intent.to_raw()];
+        let in_fmt = decode::TYPE_CMYKA_8;
+        let out_fmt = decode::TYPE_CMYKA_8;
+        let in_stride = px_bytes(in_fmt);
+        let out_stride = px_bytes(out_fmt);
+        let mut packed_in = vec![0u8; n * in_stride];
+        for p in 0..n {
+            let base = p * in_stride;
+            for ch in 0..4 {
+                let u = (rng.next_u64() & 0xffff) as f32 / 65535.0;
+                enc_color(&mut packed_in[base + ch..], u, in_fmt);
+            }
+            enc_random_alpha(&mut packed_in[base + 4..], &mut rng, in_fmt);
+        }
+        let mut oracle_out = vec![0u8; n * out_stride];
+        let ok = rcms_oracle::do_transform_packed_copyalpha(
+            &[&cmyk[0].bytes, &cmyk[1].bytes],
+            &intents_raw,
+            &[false, false],
+            &[1.0, 1.0],
+            in_fmt,
+            out_fmt,
+            &packed_in,
+            &mut oracle_out,
+            n,
+        );
+        if ok {
+            if let Ok(xform) = Transform::new_simple_with_formats_flags(
+                &pa, &pb, intent, false, in_fmt, out_fmt, flags,
+            ) {
+                let mut rcms_out = vec![0u8; n * out_stride];
+                xform.do_transform(&packed_in, &mut rcms_out, n);
+                assert_eq!(rcms_out, oracle_out, "CMYKA COPY_ALPHA byte mismatch");
+                cmyka_cells += 1;
+                alpha_samples += n;
+            }
+        }
+    }
+
+    println!(
+        "COPY_ALPHA sweep: {cells} RGBA cells + {cmyka_cells} CMYKA cell(s) bit-exact \
+         vs lcms2 (COPY_ALPHA|NOOPTIMIZE), {alpha_samples} alpha samples (random)."
+    );
+}
+
+/// COPY_ALPHA must NOT perturb the no-extra-channel path: RGB→RGB with the flag
+/// set produces exactly the same bytes as without it (no extra channels to copy).
+#[test]
+fn copy_alpha_noop_when_no_extra_channels() {
+    let files = testbed_icc();
+    let mut rgb: Vec<Loaded> = Vec::new();
+    for path in &files {
+        let bytes = fs::read(path).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if !rcms_oracle::open_succeeds(&bytes) {
+            continue;
+        }
+        let Ok(prof) = Profile::open(&bytes) else {
+            continue;
+        };
+        if prof.header().color_space == ColorSpace::Rgb {
+            rgb.push(Loaded { name, bytes });
+        }
+    }
+    assert!(rgb.len() >= 2);
+
+    let pa = Profile::open(&rgb[0].bytes).unwrap();
+    let pb = Profile::open(&rgb[1].bytes).unwrap();
+    let intent = RenderingIntent::RelativeColorimetric;
+    let in_fmt = decode::TYPE_RGB_8;
+    let out_fmt = decode::TYPE_RGB_16;
+
+    let n = 256usize;
+    let mut packed_in = vec![0u8; n * 3];
+    for v in 0..n {
+        packed_in[v * 3] = v as u8;
+        packed_in[v * 3 + 1] = ((v * 7 + 3) % 256) as u8;
+        packed_in[v * 3 + 2] = ((v * 13 + 17) % 256) as u8;
+    }
+
+    let plain =
+        Transform::new_simple_with_formats(&pa, &pb, intent, false, in_fmt, out_fmt).unwrap();
+    let with_alpha = Transform::new_simple_with_formats_flags(
+        &pa,
+        &pb,
+        intent,
+        false,
+        in_fmt,
+        out_fmt,
+        rcms::transform::Flags::NOOPTIMIZE.union(rcms::transform::Flags::COPY_ALPHA),
+    )
+    .unwrap();
+
+    let mut out_plain = vec![0u8; n * 6];
+    let mut out_alpha = vec![0u8; n * 6];
+    plain.do_transform(&packed_in, &mut out_plain, n);
+    with_alpha.do_transform(&packed_in, &mut out_alpha, n);
+    assert_eq!(out_plain, out_alpha, "COPY_ALPHA changed the no-extra path");
+}

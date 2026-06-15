@@ -5,10 +5,12 @@
 //! lcms2's `cmspack.c`. [`get_input_formatter`] / [`get_output_formatter`]
 //! select a formatter for a format word, mirroring lcms2's stock table match.
 
+pub mod alpha;
 pub mod decode;
 pub mod float;
 pub mod formatters;
 
+pub use alpha::AlphaCopyPlan;
 pub use decode::PixelFormat;
 pub use formatters::MAX_CHANNELS;
 

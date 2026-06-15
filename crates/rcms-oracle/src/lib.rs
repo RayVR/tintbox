@@ -441,6 +441,24 @@ unsafe extern "C" {
         n_pixels: u32,
     ) -> i32;
 
+    // Format-aware do_transform with cmsFLAGS_COPY_ALPHA (| NOOPTIMIZE): copies
+    // the extra (alpha) channels straight from input to output with depth
+    // conversion via lcms2's _cmsHandleExtraChannels.
+    #[allow(clippy::too_many_arguments)]
+    fn rcms_oracle_do_transform_packed_copyalpha(
+        bufs: *const *const u8,
+        lens: *const u32,
+        n: u32,
+        intents: *const u32,
+        bpc: *const i32,
+        adaptation: *const f64,
+        in_fmt: u32,
+        out_fmt: u32,
+        in_buf: *const u8,
+        out_buf: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+
     // Format-aware do_transform with lcms2's DEFAULT optimizer (no NOOPTIMIZE):
     // exercises OptimizeMatrixShaper (MatShaperEval16) for RGB matrix-shaper
     // transforms with an 8-bit input format.
@@ -696,6 +714,57 @@ pub fn do_transform_packed(
     // The transform and all profiles are freed inside the call.
     let ok = unsafe {
         rcms_oracle_do_transform_packed(
+            bufs.as_ptr(),
+            lens.as_ptr(),
+            n as u32,
+            intents.as_ptr(),
+            bpc_i.as_ptr(),
+            adaptation.as_ptr(),
+            in_fmt,
+            out_fmt,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            n_pixels as u32,
+        )
+    };
+    ok != 0
+}
+
+/// Like [`do_transform_packed`] but builds the transform with
+/// `cmsFLAGS_COPY_ALPHA | cmsFLAGS_NOOPTIMIZE`, so lcms2's
+/// `_cmsHandleExtraChannels` copies the extra (alpha) channels straight from
+/// input to output (depth-converting them via `_cmsGetFormatterAlpha`) WITHOUT
+/// color-transforming them. The reference for rcms's COPY_ALPHA extra-channel
+/// copy. `input`/`output` are sized per the in/out format bytes-per-pixel.
+#[allow(clippy::too_many_arguments)]
+pub fn do_transform_packed_copyalpha(
+    profiles: &[&[u8]],
+    intents: &[u32],
+    bpc: &[bool],
+    adaptation: &[f64],
+    in_fmt: u32,
+    out_fmt: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    let n = profiles.len();
+    assert_eq!(intents.len(), n);
+    assert_eq!(bpc.len(), n);
+    assert_eq!(adaptation.len(), n);
+
+    let bufs: Vec<*const u8> = profiles.iter().map(|p| p.as_ptr()).collect();
+    let lens: Vec<u32> = profiles.iter().map(|p| p.len() as u32).collect();
+    let bpc_i: Vec<i32> = bpc.iter().map(|&b| b as i32).collect();
+
+    // SAFETY: identical contract to `do_transform_packed` — `bufs`/`lens`
+    // describe `n` readable profile slices; `intents`/`bpc_i`/`adaptation` are
+    // `n`-element readable arrays; C reads `n_pixels` packed pixels of `in_fmt`
+    // from `input` and writes `n_pixels` packed pixels of `out_fmt` into
+    // `output` (the caller sizes both). The only difference is the transform is
+    // built with cmsFLAGS_COPY_ALPHA so extra channels are copied across.
+    let ok = unsafe {
+        rcms_oracle_do_transform_packed_copyalpha(
             bufs.as_ptr(),
             lens.as_ptr(),
             n as u32,

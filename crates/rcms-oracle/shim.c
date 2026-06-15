@@ -1735,3 +1735,50 @@ int rcms_oracle_transform_eval_default_16(const uint8_t* const* bufs, const uint
     return rcms_oracle_do_transform_default(bufs, lens, n, intents, bpc, adaptation,
                                             inFmt, outFmt, inBuf, outBuf, nPixels);
 }
+
+/* ---- Format-aware do_transform with cmsFLAGS_COPY_ALPHA --------------------
+   Identical to rcms_oracle_do_transform_packed but builds the transform with
+   (cmsFLAGS_COPY_ALPHA | cmsFLAGS_NOOPTIMIZE), so lcms2's _cmsHandleExtraChannels
+   copies the extra (alpha) channels straight from input to output with depth
+   conversion (the _cmsGetFormatterAlpha table) WITHOUT color-transforming them.
+   Used to diff-test rcms's COPY_ALPHA extra-channel copy. */
+int rcms_oracle_do_transform_packed_copyalpha(const uint8_t* const* bufs, const uint32_t* lens,
+                                              uint32_t n, const uint32_t* intents,
+                                              const int32_t* bpc, const double* adaptation,
+                                              uint32_t inFmt, uint32_t outFmt,
+                                              const uint8_t* inBuf, uint8_t* outBuf,
+                                              uint32_t nPixels) {
+    if (n == 0 || n > 255) return 0;
+    cmsHPROFILE* profiles = (cmsHPROFILE*) calloc(n, sizeof(cmsHPROFILE));
+    cmsBool*     bpcArr    = (cmsBool*)    calloc(n, sizeof(cmsBool));
+    cmsUInt32Number* intArr = (cmsUInt32Number*) calloc(n, sizeof(cmsUInt32Number));
+    cmsFloat64Number* adArr = (cmsFloat64Number*) calloc(n, sizeof(cmsFloat64Number));
+    if (!profiles || !bpcArr || !intArr || !adArr) {
+        free(profiles); free(bpcArr); free(intArr); free(adArr);
+        return 0;
+    }
+    int ok = 1;
+    for (uint32_t i = 0; i < n; i++) {
+        profiles[i] = cmsOpenProfileFromMem((const void*) bufs[i], lens[i]);
+        if (!profiles[i]) ok = 0;
+        bpcArr[i] = bpc[i] ? TRUE : FALSE;
+        intArr[i] = intents[i];
+        adArr[i]  = adaptation[i];
+    }
+
+    cmsHTRANSFORM xform = NULL;
+    if (ok) {
+        xform = cmsCreateExtendedTransform(
+            NULL, n, profiles, bpcArr, intArr, adArr,
+            NULL, 0, inFmt, outFmt, cmsFLAGS_COPY_ALPHA | cmsFLAGS_NOOPTIMIZE);
+    }
+    if (xform) {
+        cmsDoTransform(xform, inBuf, outBuf, nPixels);
+        cmsDeleteTransform(xform);
+    } else {
+        ok = 0;
+    }
+    for (uint32_t i = 0; i < n; i++) if (profiles[i]) cmsCloseProfile(profiles[i]);
+    free(profiles); free(bpcArr); free(intArr); free(adArr);
+    return ok;
+}

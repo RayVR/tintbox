@@ -40,7 +40,8 @@
 use crate::color::CIEXYZ;
 use crate::format::{
     self, formatter_is_float, get_input_formatter, get_input_formatter_float, get_output_formatter,
-    get_output_formatter_float, PackFloatFn, PackFn, UnpackFloatFn, UnpackFn, MAX_CHANNELS,
+    get_output_formatter_float, AlphaCopyPlan, PackFloatFn, PackFn, UnpackFloatFn, UnpackFn,
+    MAX_CHANNELS,
 };
 use crate::link::{default_icc_intents, link_bpc_mutation};
 use crate::math::whitepoint::D50;
@@ -61,6 +62,11 @@ pub struct Flags {
 impl Flags {
     /// `cmsFLAGS_NOOPTIMIZE` (`0x0100`). Skip pipeline optimization.
     pub const NOOPTIMIZE: Flags = Flags { bits: 0x0100 };
+
+    /// `cmsFLAGS_COPY_ALPHA` (`0x0400_0000`, lcms2.h:1773). Copy the extra
+    /// (alpha) channels straight from input to output on `cmsDoTransform`,
+    /// depth-converting but NOT color-transforming them.
+    pub const COPY_ALPHA: Flags = Flags { bits: 0x0400_0000 };
 
     /// An empty flag set.
     pub const fn empty() -> Flags {
@@ -108,6 +114,10 @@ struct Formatters {
     // Float path (is_float == true).
     from_input_float: Option<UnpackFloatFn>,
     to_output_float: Option<PackFloatFn>,
+    // Extra-channel (alpha) copy plan, set when `cmsFLAGS_COPY_ALPHA` is on and
+    // both formats carry extra channels (lcms2 `_cmsHandleExtraChannels`). `None`
+    // means extra output bytes are left as the packer wrote them.
+    alpha_copy: Option<AlphaCopyPlan>,
 }
 
 /// A color transform: a device-link pipeline plus the recorded entry/exit color
@@ -198,8 +208,21 @@ fn xform_color_spaces(profiles: &[&Profile]) -> Result<(ColorSpace, ColorSpace)>
 
 /// Select the input/output formatters for `in_fmt`/`out_fmt`, choosing the float
 /// vs 16-bit path per lcms2 `_cmsFormatterIsFloat` (float if either end is float).
-fn select_formatters(in_fmt: u32, out_fmt: u32) -> Result<Formatters> {
+///
+/// When `flags` carries `cmsFLAGS_COPY_ALPHA` and both formats have extra
+/// channels, an [`AlphaCopyPlan`] is built so `do_transform` copies the extra
+/// channels across (lcms2 `_cmsHandleExtraChannels`); otherwise no alpha copy is
+/// performed.
+fn select_formatters(in_fmt: u32, out_fmt: u32, flags: Flags) -> Result<Formatters> {
     let is_float = formatter_is_float(in_fmt) || formatter_is_float(out_fmt);
+
+    // lcms2 `_cmsHandleExtraChannels` runs only with cmsFLAGS_COPY_ALPHA set;
+    // `AlphaCopyPlan::build` itself returns None unless both ends have extras.
+    let alpha_copy = if flags.contains(Flags::COPY_ALPHA) {
+        AlphaCopyPlan::build(in_fmt, out_fmt)
+    } else {
+        None
+    };
 
     if is_float {
         let from_input_float = get_input_formatter_float(in_fmt)
@@ -214,6 +237,7 @@ fn select_formatters(in_fmt: u32, out_fmt: u32) -> Result<Formatters> {
             to_output16: None,
             from_input_float: Some(from_input_float),
             to_output_float: Some(to_output_float),
+            alpha_copy,
         })
     } else {
         let from_input16 = get_input_formatter(in_fmt)
@@ -228,6 +252,7 @@ fn select_formatters(in_fmt: u32, out_fmt: u32) -> Result<Formatters> {
             to_output16: Some(to_output16),
             from_input_float: None,
             to_output_float: None,
+            alpha_copy,
         })
     }
 }
@@ -347,7 +372,7 @@ impl Transform {
         strategy: OptimizationStrategy,
     ) -> Result<Transform> {
         let mut xform = Transform::new(profiles, intents, bpc, adaptation, flags)?;
-        xform.formatters = Some(select_formatters(in_fmt, out_fmt)?);
+        xform.formatters = Some(select_formatters(in_fmt, out_fmt, flags)?);
         xform.strategy = strategy;
         xform.opt_eval = strategy.build(&xform.lut, in_fmt, out_fmt);
         Ok(xform)
@@ -369,6 +394,30 @@ impl Transform {
             &[bpc, bpc],
             &[1.0, 1.0],
             Flags::NOOPTIMIZE,
+            in_fmt,
+            out_fmt,
+        )
+    }
+
+    /// Convenience 2-profile format-aware constructor passing explicit `flags`
+    /// (lcms2 `cmsCreateTransform`). Default adaptation 1.0, same `intent`/`bpc`
+    /// on both links. Use this to set `cmsFLAGS_COPY_ALPHA` (the extra-channel
+    /// copy) — e.g. `Flags::NOOPTIMIZE.union(Flags::COPY_ALPHA)`.
+    pub fn new_simple_with_formats_flags(
+        input: &Profile,
+        output: &Profile,
+        intent: RenderingIntent,
+        bpc: bool,
+        in_fmt: u32,
+        out_fmt: u32,
+        flags: Flags,
+    ) -> Result<Transform> {
+        Transform::new_with_formats(
+            &[input, output],
+            &[intent, intent],
+            &[bpc, bpc],
+            &[1.0, 1.0],
+            flags,
             in_fmt,
             out_fmt,
         )
@@ -551,23 +600,32 @@ impl Transform {
             let to_output = fmts.to_output_float.as_ref().unwrap();
             let mut fin = [0f32; MAX_CHANNELS];
             for i in 0..n_pixels {
-                let acc = &input[i * in_stride..];
-                let out = &mut output[i * out_stride..];
+                let in_pixel = &input[i * in_stride..i * in_stride + in_stride];
+                let acc = in_pixel;
                 from_input(acc, &mut fin);
                 // Abstract eval (no inlined optimization — see module docs).
                 let res = self.lut.eval_float(&fin[..in_ch]);
                 let mut fout = [0f32; MAX_CHANNELS];
                 fout[..out_ch].copy_from_slice(&res);
-                to_output(&fout, out);
+                {
+                    let out = &mut output[i * out_stride..i * out_stride + out_stride];
+                    to_output(&fout, out);
+                }
+                // lcms2 `_cmsHandleExtraChannels`: copy the extra channels from the
+                // ORIGINAL input pixel to the output pixel, depth-converting only.
+                if let Some(plan) = &fmts.alpha_copy {
+                    let in_pixel = &input[i * in_stride..i * in_stride + in_stride];
+                    let out_pixel = &mut output[i * out_stride..i * out_stride + out_stride];
+                    plan.copy_pixel(in_pixel, out_pixel);
+                }
             }
         } else {
             let from_input = fmts.from_input16.as_ref().unwrap();
             let to_output = fmts.to_output16.as_ref().unwrap();
             let mut win = [0u16; MAX_CHANNELS];
             for i in 0..n_pixels {
-                let acc = &input[i * in_stride..];
-                let out = &mut output[i * out_stride..];
-                from_input(acc, &mut win);
+                let in_pixel = &input[i * in_stride..i * in_stride + in_stride];
+                from_input(in_pixel, &mut win);
                 let mut wout = [0u16; MAX_CHANNELS];
                 match &self.opt_eval {
                     // lcms2 `MatShaperEval16`: the 1.14-fixed RGB matrix-shaper
@@ -582,7 +640,17 @@ impl Transform {
                         wout[..out_ch].copy_from_slice(&res);
                     }
                 }
-                to_output(&wout, out);
+                {
+                    let out = &mut output[i * out_stride..i * out_stride + out_stride];
+                    to_output(&wout, out);
+                }
+                // lcms2 `_cmsHandleExtraChannels`: copy the extra channels from the
+                // ORIGINAL input pixel to the output pixel, depth-converting only.
+                if let Some(plan) = &fmts.alpha_copy {
+                    let in_pixel = &input[i * in_stride..i * in_stride + in_stride];
+                    let out_pixel = &mut output[i * out_stride..i * out_stride + out_stride];
+                    plan.copy_pixel(in_pixel, out_pixel);
+                }
             }
         }
     }
