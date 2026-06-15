@@ -243,31 +243,50 @@ impl Pipeline {
         let mut any = false;
         let mut i = 0;
         while i + 1 < self.stages.len() {
-            let pair = matrix_pair_mergeable(&self.stages[i], &self.stages[i + 1]);
-            if let Some((m1, m2)) = pair {
-                // res = m2 * m1 (apply m1 first, then m2).
-                let res = Mat3(m2).per(&Mat3(m1));
-                // Remove both matrices (pt2 then pt1, as in the C).
-                self.stages.remove(i + 1);
-                self.stages.remove(i);
-                if !is_float_matrix_identity(&res.0) {
-                    // Reinsert the combined matrix at the same position; the C
-                    // splices Multmat back into the chain where pt1 was.
-                    self.stages.insert(
-                        i,
-                        Stage::Matrix {
-                            rows: 3,
-                            cols: 3,
-                            m: res.0.to_vec(),
-                            offset: None,
-                        },
-                    );
-                }
-                any = true;
-                // The C advances pt1 only in the else branch, so after a merge it
-                // re-tests from the same slot (i unchanged).
-            } else {
+            // Mirror the C `Implements == cmsSigMatrixElemType` test on BOTH stages
+            // (cmsopt.c:203). lcms2 models LabV2/V4 and the float-PCS normalizers as
+            // matrix-type stages with an overridden Implements, so they are NOT
+            // MatrixElemType and never merge — rcms models them as distinct `Stage`
+            // variants, so `Stage::Matrix` already excludes them.
+            let both_matrix = matches!(self.stages[i], Stage::Matrix { .. })
+                && matches!(self.stages[i + 1], Stage::Matrix { .. });
+            if !both_matrix {
                 i += 1;
+                continue;
+            }
+            match matrix_pair_mergeable(&self.stages[i], &self.stages[i + 1]) {
+                Some((m1, m2)) => {
+                    // res = m2 * m1 (apply m1 first, then m2).
+                    let res = Mat3(m2).per(&Mat3(m1));
+                    // Remove both matrices (pt2 then pt1, as in the C).
+                    self.stages.remove(i + 1);
+                    self.stages.remove(i);
+                    if !is_float_matrix_identity(&res.0) {
+                        // Reinsert the combined matrix at the same position; the C
+                        // splices Multmat back into the chain where pt1 was.
+                        self.stages.insert(
+                            i,
+                            Stage::Matrix {
+                                rows: 3,
+                                cols: 3,
+                                m: res.0.to_vec(),
+                                offset: None,
+                            },
+                        );
+                    }
+                    any = true;
+                    // The C advances pt1 only when the stages aren't both matrices,
+                    // so after a merge it re-tests from the same slot (i unchanged).
+                }
+                None => {
+                    // Both stages ARE matrices but the offset/3x3 guard fails:
+                    // lcms2 `return FALSE` (cmsopt.c:213) — it BAILS the entire pass,
+                    // it does NOT skip past to merge a later pair. Load-bearing: an
+                    // `Matrix(offset), Matrix, Matrix` run must leave the trailing
+                    // pair UN-merged to match lcms2. Returning false (not `any`)
+                    // mirrors the C; the outer PreOptimize loop still converges.
+                    return false;
+                }
             }
         }
         any
