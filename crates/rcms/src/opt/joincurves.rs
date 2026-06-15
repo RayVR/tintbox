@@ -97,10 +97,10 @@ pub fn optimize_by_joining_curves(
         return None;
     }
 
-    // Only curve-set stages in this LUT.
-    if lut.stages().is_empty() {
-        return None;
-    }
+    // Only curve-set stages in this LUT. An empty pipeline passes this loop
+    // vacuously and is NOT declined — matching C (cmsopt.c:1413-1418, the stage
+    // loop simply never executes), so it collapses to the identity sampled from
+    // an empty pipeline and installs `FastIdentity16`, exactly as lcms2 does.
     for stage in lut.stages() {
         if !matches!(stage, Stage::ToneCurves(_)) {
             return None;

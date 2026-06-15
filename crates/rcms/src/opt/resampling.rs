@@ -590,6 +590,12 @@ pub fn optimize_by_computing_linearization(
     let n_out = lut.output_channels; // 3
     let n_grid = reasonable_gridpoints(PT_RGB); // 33
 
+    // lcms2 `cmsPipelineGetPtrToLastStage` + `if (last == NULL) goto Error`
+    // (cmsopt.c:1095-1096): an empty pipeline has no last stage and is declined
+    // here. Joining-curves (tried earlier in the chain) wins on the empty case.
+    if lut.stages().is_empty() {
+        return None;
+    }
     // If the last stage is a degenerate curve set, we cannot optimize.
     if let Some(Stage::ToneCurves(curves)) = lut.stages().last() {
         for c in curves {

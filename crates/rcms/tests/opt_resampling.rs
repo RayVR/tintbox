@@ -160,6 +160,10 @@ fn lcms2compat_resampling_bit_identical_to_lcms2_default_over_testbed() {
 
     let mut cells = 0usize;
     let mut byte_samples = 0usize;
+    // Cells where rcms legitimately declines to build (the deferred black-point
+    // detection-by-sampling path). Counted explicitly so a real optimizer
+    // regression cannot hide behind a bare `continue`.
+    let mut deferred = 0usize;
     // Per-optimizer-path cell counts.
     let mut path_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut mismatches: Vec<String> = Vec::new();
@@ -245,7 +249,19 @@ fn lcms2compat_resampling_bit_identical_to_lcms2_default_over_testbed() {
                         OptimizationStrategy::Lcms2Compat,
                     ) {
                         Ok(x) => x,
-                        Err(_) => continue, // deferred build cell
+                        // The ONLY acceptable build failure is the deferred
+                        // black-point detection-by-sampling path (`Unsupported`).
+                        // Any other error is a real regression and fails the test
+                        // rather than being silently skipped.
+                        Err(rcms::Error::Unsupported(_)) => {
+                            deferred += 1;
+                            continue;
+                        }
+                        Err(e) => panic!(
+                            "{} -> {} [{intent:?}] in={in_fmt:#x} out={out_fmt:#x}: \
+                             unexpected link error (not the deferred BPC path): {e:?}",
+                            a.name, b.name,
+                        ),
                     };
                     let mut rcms_out = vec![0u8; n * out_stride];
                     xform.do_transform(&packed_in, &mut rcms_out, n);
@@ -282,7 +298,8 @@ fn lcms2compat_resampling_bit_identical_to_lcms2_default_over_testbed() {
 
     eprintln!(
         "[resampling] Lcms2Compat == lcms2-default: {cells} bit-exact cells \
-         ({byte_samples} pixels). Path distribution: {path_counts:?}"
+         ({byte_samples} pixels), {deferred} deferred-BPC cells skipped. \
+         Path distribution: {path_counts:?}"
     );
     for m in &mismatches {
         eprintln!("[resampling][MISMATCH] {m}");
@@ -300,10 +317,10 @@ fn lcms2compat_resampling_bit_identical_to_lcms2_default_over_testbed() {
 /// cube (every-3rd byte → 86³ ≈ 636 k pixels would be huge, so step 9 → 29³) for
 /// every RGB→RGB pair under all 4 intents, 8-bit and 16-bit, asserting
 /// byte-identity to lcms2-default. This catches CLUT-node / `0x8001`-rounding
-/// boundaries the coarse cube above can miss, and specifically exercises the
-/// 16-bit matrix-shaper pairs that now route through
-/// `OptimizeByComputingLinearization` (the baked path) instead of the 8-bit
-/// `MatShaperEval16`.
+/// boundaries the coarse cube above can miss. The 8-bit RGB pairs route through
+/// `OptimizeByComputingLinearization`; the 16-bit pairs (which that optimizer
+/// declines — it is 8-bit-input only) fall through to `OptimizeByResampling`,
+/// the general baked-CLUT path.
 #[test]
 fn lcms2compat_baked_rgb_dense_bit_identical() {
     let loaded: Vec<_> = load_all()
