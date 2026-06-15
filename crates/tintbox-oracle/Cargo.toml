@@ -2,6 +2,8 @@
 name = "tintbox-oracle"
 version = "0.0.0"
 edition = "2021"
+license = "MIT"
+description = "Test-only differential oracle for tintbox: cc-builds the vendored C lcms2 so the pure-Rust crate can be verified bit-identical. Never published."
 publish = false
 
 [build-dependencies]
