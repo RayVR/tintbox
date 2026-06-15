@@ -38,12 +38,13 @@
 //!    later task.
 
 use crate::color::CIEXYZ;
+use crate::context::Context;
 use crate::format::{
     self, formatter_is_float, get_input_formatter, get_input_formatter_float, get_output_formatter,
     get_output_formatter_float, AlphaCopyPlan, PackFloatFn, PackFn, UnpackFloatFn, UnpackFn,
     MAX_CHANNELS,
 };
-use crate::link::{default_icc_intents, link_bpc_mutation};
+use crate::link::{link_bpc_mutation, link_icc_intents_in};
 use crate::math::whitepoint::D50;
 use crate::opt::{OptimizationStrategy, OptimizedEval};
 use crate::pipeline::Pipeline;
@@ -294,11 +295,31 @@ fn pixel_bytes(fmt: u32) -> usize {
 }
 
 impl Transform {
-    /// lcms2 `cmsCreateExtendedTransform` (the device-link build). Applies the
-    /// `_cmsLinkProfiles` BPC-array mutation (a copy — the caller's `bpc` is not
-    /// touched), builds the link via [`default_icc_intents`], and records the
-    /// entry/exit color spaces, media white points, and rendering intent.
+    /// lcms2 `cmsCreateExtendedTransform` (the device-link build), builtin path.
+    /// Delegates to [`Transform::new_in`] with an empty [`Context`], so existing
+    /// callers (and every differential test) hit the builtin
+    /// [`default_icc_intents`](crate::link::default_icc_intents) link verbatim —
+    /// no plugin dispatch.
     pub fn new(
+        profiles: &[&Profile],
+        intents: &[RenderingIntent],
+        bpc: &[bool],
+        adaptation: &[f64],
+        flags: Flags,
+    ) -> Result<Transform> {
+        Transform::new_in(&Context::new(), profiles, intents, bpc, adaptation, flags)
+    }
+
+    /// lcms2 `cmsCreateExtendedTransform` (the device-link build), dispatching the
+    /// link through `ctx`'s [`RenderingIntentPlugin`](crate::plugin::RenderingIntentPlugin)
+    /// registry. Applies the `_cmsLinkProfiles` BPC-array mutation (a copy — the
+    /// caller's `bpc` is not touched), builds the link via
+    /// [`link_icc_intents_in`](crate::link::link_icc_intents_in) (which runs the
+    /// builtin [`default_icc_intents`](crate::link::default_icc_intents) unless a
+    /// registered custom intent in the chain claims it), and records the entry/exit
+    /// color spaces, media white points, and rendering intent.
+    pub fn new_in(
+        ctx: &Context,
         profiles: &[&Profile],
         intents: &[RenderingIntent],
         bpc: &[bool],
@@ -324,8 +345,10 @@ impl Transform {
         let mut bpc_mut = bpc.to_vec();
         link_bpc_mutation(intents, profiles, &mut bpc_mut);
 
-        // Build the device-link pipeline (cmsxform.c:1194, _cmsLinkProfiles).
-        let lut = default_icc_intents(profiles, intents, &bpc_mut, adaptation, flags.bits())?;
+        // Build the device-link pipeline (cmsxform.c:1194, _cmsLinkProfiles),
+        // dispatching to a registered custom intent plugin if the chain requests
+        // one; otherwise the builtin `default_icc_intents`.
+        let lut = link_icc_intents_in(ctx, profiles, intents, &bpc_mut, adaptation, flags.bits())?;
 
         // White points (cmsxform.c:1221-1222, SetWhitePoint over cmsReadTag).
         let entry_white_point = transform_white_point(profiles[0]);
@@ -396,15 +419,20 @@ impl Transform {
         out_fmt: u32,
         strategy: OptimizationStrategy,
     ) -> Result<Transform> {
-        let mut xform = Transform::new(profiles, intents, bpc, adaptation, flags)?;
-        xform.formatters = Some(select_formatters(in_fmt, out_fmt, flags)?);
-        xform.strategy = strategy;
-        // lcms2 passes the LAST intent to `_cmsOptimizePipeline`
-        // (cmsxform.c:1145,1210 `LastIntent`); rcms stores it as
-        // `rendering_intent`.
-        let intent = xform.rendering_intent.to_raw();
-        xform.opt_eval = strategy.build(&xform.lut, in_fmt, out_fmt, intent);
-        Ok(xform)
+        // No-`ctx` wrapper (the plugin `*_in` convention): the empty default
+        // context carries no custom optimizer, so this hits the builtin strategy
+        // path verbatim — every existing caller and differential test is unchanged.
+        Transform::new_with_formats_strategy_in(
+            &crate::context::Context::new(),
+            profiles,
+            intents,
+            bpc,
+            adaptation,
+            flags,
+            in_fmt,
+            out_fmt,
+            strategy,
+        )
     }
 
     /// Convenience 2-profile format-aware constructor (lcms2 `cmsCreateTransform`
@@ -903,6 +931,92 @@ impl Transform {
             flags,
             in_fmt,
             out_fmt,
+        )
+    }
+}
+
+// ============================================================================
+// Optimization plugin wiring (lcms2 `cmsPluginOptimization`), slice8-opt (S8-T2).
+// Appended block: a single context-carrying ctor so the custom-optimizer path
+// merges cleanly alongside the parallel work on this file.
+// ============================================================================
+
+impl Transform {
+    /// Like [`Transform::new_with_formats_strategy`], but takes the plugin
+    /// [`Context`](crate::context::Context) as its first parameter (the slice-8
+    /// `*_in` convention) so a custom pipeline optimizer registered via
+    /// [`Context::set_optimizer`](crate::context::Context::set_optimizer) is
+    /// consulted.
+    ///
+    /// The optimizer is queried FIRST (lcms2 `_cmsOptimizePipeline` walks the
+    /// registered optimizer list before the builtin `DefaultOptimization[]`
+    /// chain): if it returns `Some(eval)` that eval is installed (lcms2
+    /// `return TRUE`); if it returns `None` it declined and the chosen builtin
+    /// `strategy` posture runs (`Accurate` → in-place pipeline eval,
+    /// `Lcms2Compat` → the builtin optimizer chain). With no optimizer registered
+    /// (the default context) this is byte-identical to
+    /// [`new_with_formats_strategy`](Transform::new_with_formats_strategy).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_formats_strategy_in(
+        ctx: &crate::context::Context,
+        profiles: &[&Profile],
+        intents: &[RenderingIntent],
+        bpc: &[bool],
+        adaptation: &[f64],
+        flags: Flags,
+        in_fmt: u32,
+        out_fmt: u32,
+        strategy: OptimizationStrategy,
+    ) -> Result<Transform> {
+        // Route the link through `new_in(ctx, …)` so a registered custom INTENT
+        // composes with the custom OPTIMIZER below (both plugins honored on the
+        // same transform). With an empty `ctx` this is identical to `new`.
+        let mut xform = Transform::new_in(ctx, profiles, intents, bpc, adaptation, flags)?;
+        xform.formatters = Some(select_formatters(in_fmt, out_fmt, flags)?);
+        xform.strategy = strategy;
+        // lcms2 passes the LAST intent to `_cmsOptimizePipeline`
+        // (cmsxform.c:1145,1210 `LastIntent`); rcms stores it as
+        // `rendering_intent`.
+        let intent = xform.rendering_intent.to_raw();
+        // Consult the context's custom optimizer first, then fall back to the
+        // builtin strategy posture (builtin-wins on decline).
+        xform.opt_eval = strategy.build_with_optimizer(
+            ctx.plugins().optimizer.as_ref(),
+            &xform.lut,
+            in_fmt,
+            out_fmt,
+            intent,
+        );
+        Ok(xform)
+    }
+
+    /// Convenience 2-profile context-carrying constructor (lcms2
+    /// `cmsCreateTransformTHR` with explicit format words + a chosen optimizer
+    /// posture). Default adaptation 1.0, same `intent`/`bpc` on both links,
+    /// `NOOPTIMIZE` flag (inert in rcms — optimization is driven by the
+    /// `strategy` + the context's optimizer, never the flag). Use this to drive a
+    /// custom [`Optimizer`](crate::opt::Optimizer) registered on `ctx`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_simple_with_formats_strategy_in(
+        ctx: &crate::context::Context,
+        input: &Profile,
+        output: &Profile,
+        intent: RenderingIntent,
+        bpc: bool,
+        in_fmt: u32,
+        out_fmt: u32,
+        strategy: OptimizationStrategy,
+    ) -> Result<Transform> {
+        Transform::new_with_formats_strategy_in(
+            ctx,
+            &[input, output],
+            &[intent, intent],
+            &[bpc, bpc],
+            &[1.0, 1.0],
+            Flags::NOOPTIMIZE,
+            in_fmt,
+            out_fmt,
+            strategy,
         )
     }
 }

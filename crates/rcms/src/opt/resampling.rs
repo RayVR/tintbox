@@ -687,6 +687,7 @@ fn build_baked_eval(
         let interp = match interp_factory(params.n_inputs, params.n_outputs, false, false) {
             InterpFn::Lerp16(l) => l,
             InterpFn::LerpFloat(_) => unreachable!("16-bit CLUT selects Lerp16"),
+            InterpFn::Custom(_) => unreachable!("builtin interp_factory never returns Custom"),
         };
         BakedEval::Prelin16(Box::new(Prelin16Eval {
             n_inputs: params.n_inputs,
@@ -725,6 +726,7 @@ fn apply_white_fixup(
     let interp = match interp_factory(params.n_inputs, params.n_outputs, false, false) {
         InterpFn::Lerp16(l) => l,
         InterpFn::LerpFloat(_) => unreachable!("16-bit CLUT selects Lerp16"),
+        InterpFn::Custom(_) => unreachable!("builtin interp_factory never returns Custom"),
     };
     let probe = Prelin16Eval {
         n_inputs: params.n_inputs,

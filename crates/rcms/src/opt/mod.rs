@@ -78,6 +78,28 @@ pub enum OptimizedEval {
     Baked(Box<BakedEval>),
 }
 
+/// A custom pipeline optimizer (lcms2 `cmsPluginOptimization`). Registered via
+/// [`Context::set_optimizer`](crate::context::Context::set_optimizer) and
+/// re-exported from [`crate::plugin`]. The optimizer is consulted at
+/// [`Transform`](crate::transform::Transform) construction (T2), BEFORE the
+/// builtin strategy chain; returning `None` declines and falls through to the
+/// builtin path, preserving the builtin-wins invariant. The lookup resolves to a
+/// concrete [`OptimizedEval`] before any hot loop, so the per-pixel path never
+/// touches `Context`/`Arc`.
+pub trait Optimizer: Send + Sync {
+    /// Resolve a specialized evaluator for `lut` under the given in/out format
+    /// words and rendering `intent`, or `None` to decline (fall through to the
+    /// builtin [`OptimizationStrategy`]). Mirrors lcms2's
+    /// `_cmsOptimizationPluginChunk` `OptimizePtr` callback.
+    fn optimize(
+        &self,
+        lut: &Pipeline,
+        in_fmt: u32,
+        out_fmt: u32,
+        intent: u32,
+    ) -> Option<OptimizedEval>;
+}
+
 impl OptimizationStrategy {
     /// Build the [`OptimizedEval`] for `lut` under the given in/out format words
     /// and rendering `intent` (lcms2 `_cmsOptimizePipeline`). `Accurate` always
@@ -95,6 +117,32 @@ impl OptimizationStrategy {
             OptimizationStrategy::Accurate => OptimizedEval::Pipeline,
             OptimizationStrategy::Lcms2Compat => Self::lcms2_compat(lut, in_fmt, out_fmt, intent),
         }
+    }
+
+    /// Build the [`OptimizedEval`], consulting an optional custom [`Optimizer`]
+    /// (lcms2 `cmsPluginOptimization`) FIRST. This mirrors lcms2's
+    /// `_cmsOptimizePipeline`, which walks the registered optimizer list before
+    /// the builtin `DefaultOptimization[]` chain and takes the first that returns
+    /// `TRUE`. If `optimizer` is `Some` and its
+    /// [`optimize`](Optimizer::optimize) returns `Some(eval)`, that eval is used
+    /// (lcms2 `return TRUE`); otherwise the optimizer declined (`None`) and we
+    /// fall through to the chosen builtin posture via [`build`](Self::build),
+    /// preserving the builtin-wins invariant. With no optimizer this is exactly
+    /// [`build`](Self::build).
+    pub fn build_with_optimizer(
+        self,
+        optimizer: Option<&std::sync::Arc<dyn Optimizer>>,
+        lut: &Pipeline,
+        in_fmt: u32,
+        out_fmt: u32,
+        intent: u32,
+    ) -> OptimizedEval {
+        if let Some(opt) = optimizer {
+            if let Some(eval) = opt.optimize(lut, in_fmt, out_fmt, intent) {
+                return eval;
+            }
+        }
+        self.build(lut, in_fmt, out_fmt, intent)
     }
 
     /// lcms2's DEFAULT optimizer chain, first-success-wins (cmsopt.c:1977-1985).

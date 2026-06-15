@@ -209,6 +209,7 @@ fn read_clut<R: ProfileReader>(
         params,
         is_trilinear: false,
         implements_identity: false,
+        resolved: Default::default(),
     }))
 }
 
@@ -433,6 +434,7 @@ fn read_clut_at<R: ProfileReader>(
         params,
         is_trilinear: false,
         implements_identity: false,
+        resolved: Default::default(),
     }))
 }
 
