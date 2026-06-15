@@ -595,6 +595,21 @@ unsafe extern "C" {
         out_chans: u32,
     ) -> i32;
     // ==== end slice9-named ====
+
+    // ==== perf-bench ====
+    fn tintbox_oracle_xform_create(
+        in_bytes: *const u8,
+        in_len: u32,
+        in_fmt: u32,
+        out_bytes: *const u8,
+        out_len: u32,
+        out_fmt: u32,
+        intent: u32,
+        dw_flags: u32,
+    ) -> usize;
+    fn tintbox_oracle_xform_do(handle: usize, in_buf: *const u8, out_buf: *mut u8, n_pixels: u32);
+    fn tintbox_oracle_xform_free(handle: usize);
+    // ==== end perf-bench ====
 }
 
 /// lcms2 `cmsDetectBlackPoint` over a profile loaded from `bytes` at `intent` +
@@ -3902,3 +3917,94 @@ impl Drop for OracleCam02 {
         unsafe { tintbox_oracle_cam02_done(self.handle) };
     }
 }
+
+// ==== perf-bench ====
+
+/// lcms2 `cmsFLAGS_NOOPTIMIZE` (lcms2.h): skip the transform optimizer, keeping
+/// the lossless device-link pipeline.
+pub const CMS_FLAGS_NOOPTIMIZE: u32 = 0x0100;
+/// lcms2 `cmsFLAGS_BLACKPOINTCOMPENSATION` (lcms2.h).
+pub const CMS_FLAGS_BLACKPOINTCOMPENSATION: u32 = 0x2000;
+
+/// A live lcms2 `cmsHTRANSFORM` built from in-memory profiles, for hot-path
+/// throughput benchmarking. The transform is created once (profiles opened,
+/// `cmsCreateTransform`, profiles closed) and reused across many
+/// [`OracleTransform::do_transform`] calls; [`Drop`] runs `cmsDeleteTransform`.
+///
+/// This deliberately splits create / do / free so a benchmark can build the
+/// transform OUTSIDE the timed region and measure only `cmsDoTransform`.
+pub struct OracleTransform {
+    handle: usize,
+}
+
+impl OracleTransform {
+    /// `cmsOpenProfileFromMem` both profiles, `cmsCreateTransform(in, in_fmt,
+    /// out, out_fmt, intent, dw_flags)`, then close both profiles. Returns `None`
+    /// if a profile fails to open or the transform cannot be built.
+    ///
+    /// `dw_flags` selects the optimizer posture, e.g.
+    /// `CMS_FLAGS_NOOPTIMIZE | CMS_FLAGS_BLACKPOINTCOMPENSATION` (lossless) vs
+    /// `CMS_FLAGS_BLACKPOINTCOMPENSATION` alone (lcms2's DEFAULT optimizer).
+    pub fn create(
+        in_bytes: &[u8],
+        in_fmt: u32,
+        out_bytes: &[u8],
+        out_fmt: u32,
+        intent: u32,
+        dw_flags: u32,
+    ) -> Option<OracleTransform> {
+        // SAFETY: `in_bytes`/`out_bytes` are valid readable slices the C only
+        // reads (each is copied into an in-memory profile that the C opens AND
+        // closes inside the call — lcms2 copies what the transform needs). The
+        // returned handle is an owning `cmsHTRANSFORM` (0 on failure) that this
+        // struct frees exactly once on Drop.
+        let handle = unsafe {
+            tintbox_oracle_xform_create(
+                in_bytes.as_ptr(),
+                in_bytes.len() as u32,
+                in_fmt,
+                out_bytes.as_ptr(),
+                out_bytes.len() as u32,
+                out_fmt,
+                intent,
+                dw_flags,
+            )
+        };
+        if handle == 0 {
+            None
+        } else {
+            Some(OracleTransform { handle })
+        }
+    }
+
+    /// Pure hot path: `cmsDoTransform` over `n_pixels` packed pixels. No
+    /// allocation, no transform construction — exactly the per-pixel loop to
+    /// time. `input` must hold `n_pixels` packed pixels of the input format and
+    /// `output` must have room for `n_pixels` packed pixels of the output format
+    /// (the caller sizes both to match the formats passed to [`create`]).
+    ///
+    /// [`create`]: OracleTransform::create
+    pub fn do_transform(&self, input: &[u8], output: &mut [u8], n_pixels: usize) {
+        // SAFETY: `self.handle` is a live `cmsHTRANSFORM` from `create`. `input`
+        // is a readable slice and `output` a writable slice; the caller
+        // guarantees both are sized for `n_pixels` packed pixels of the in/out
+        // formats the transform was built with (lcms2 reads/writes exactly that).
+        unsafe {
+            tintbox_oracle_xform_do(
+                self.handle,
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                n_pixels as u32,
+            )
+        }
+    }
+}
+
+impl Drop for OracleTransform {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` is a non-zero owning `cmsHTRANSFORM` from
+        // `create`, freed exactly once here via `cmsDeleteTransform`.
+        unsafe { tintbox_oracle_xform_free(self.handle) }
+    }
+}
+// ==== end perf-bench ====

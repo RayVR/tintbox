@@ -2782,3 +2782,42 @@ int tintbox_oracle_gbd_check(const double* addLab, uint32_t nAdd,
     cmsGBDFree(gbd);
     return 1;
 }
+
+// ==== perf-bench ====
+// Handle-based transform FFI for hot-path throughput benchmarking. Unlike the
+// one-shot do_transform helpers above (which open profiles + build + run + free
+// per call), these split create/do/free so a benchmark can build the transform
+// ONCE outside the timed loop and time only cmsDoTransform over a buffer.
+
+// Open both profiles from memory, build a transform with the caller's explicit
+// in/out formats, intent and flags, close both profiles (lcms2 copies what it
+// needs into the transform), and return the cmsHTRANSFORM as a usize handle
+// (0 on failure). `dwFlags` lets the caller pick cmsFLAGS_NOOPTIMIZE (0x100) vs
+// 0 (DEFAULT optimizer), and cmsFLAGS_BLACKPOINTCOMPENSATION (0x2000).
+uintptr_t tintbox_oracle_xform_create(
+        const uint8_t* inBytes, uint32_t inLen, uint32_t inFmt,
+        const uint8_t* outBytes, uint32_t outLen, uint32_t outFmt,
+        uint32_t intent, uint32_t dwFlags) {
+    cmsHPROFILE hin = cmsOpenProfileFromMem((const void*) inBytes, inLen);
+    cmsHPROFILE hout = cmsOpenProfileFromMem((const void*) outBytes, outLen);
+    cmsHTRANSFORM xform = NULL;
+    if (hin && hout) {
+        xform = cmsCreateTransform(hin, inFmt, hout, outFmt, intent, dwFlags);
+    }
+    if (hin) cmsCloseProfile(hin);
+    if (hout) cmsCloseProfile(hout);
+    return (uintptr_t) xform;
+}
+
+// Pure hot path: cmsDoTransform over `nPixels` packed pixels. No allocation, no
+// profile/transform construction. `handle` must come from xform_create.
+void tintbox_oracle_xform_do(uintptr_t handle, const uint8_t* inBuf,
+                          uint8_t* outBuf, uint32_t nPixels) {
+    cmsDoTransform((cmsHTRANSFORM) handle, inBuf, outBuf, nPixels);
+}
+
+// cmsDeleteTransform. Tolerates a null (0) handle.
+void tintbox_oracle_xform_free(uintptr_t handle) {
+    if (handle) cmsDeleteTransform((cmsHTRANSFORM) handle);
+}
+// ==== end perf-bench ====
