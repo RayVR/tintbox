@@ -11,8 +11,10 @@ pub mod named;
 pub mod structs;
 pub mod trivial;
 
+use crate::context::Context;
 use crate::error::{Error, Result};
 use crate::io::ProfileReader;
+use crate::plugin::ProfileReaderDyn;
 use crate::profile::tag::Tag;
 use crate::sig::Signature;
 
@@ -52,11 +54,31 @@ const T_LUT_A2B: u32 = 0x6D41_4220; // 'mAB '
 const T_LUT_B2A: u32 = 0x6D42_4120; // 'mBA '
 const T_MPE: u32 = 0x6D70_6574; // 'mpet' MultiProcessElement
 
+/// Decode the tag value for the on-disk `type_sig` through the BUILTIN path only
+/// (no plugin registry). Legacy entry point: delegates to [`read_tag_value_in`]
+/// with an empty [`Context`], so every existing caller (and every differential
+/// test) hits exactly the builtin dispatch verbatim.
+pub fn read_tag_value<R: ProfileReader>(type_sig: Signature, r: &mut R, size: u32) -> Result<Tag> {
+    read_tag_value_in(&Context::new(), type_sig, r, size)
+}
+
 /// Decode the tag value for the on-disk `type_sig`. `r` is positioned at the
 /// start of the type payload (already past the 8-byte type base); `size` is the
-/// payload byte count (`TagSize - 8`, lcms2's `SizeOfTag`). Unknown or
-/// not-yet-implemented (deferred) types return `Error::Unsupported`, never panic.
-pub fn read_tag_value<R: ProfileReader>(type_sig: Signature, r: &mut R, size: u32) -> Result<Tag> {
+/// payload byte count (`TagSize - 8`, lcms2's `SizeOfTag`).
+///
+/// The named BUILTIN type arms are matched FIRST, so a builtin signature can
+/// never be shadowed by a plugin. The `_ =>` fallthrough — previously a bare
+/// `Error::Unsupported` — now consults `ctx.plugins().tag_types` (slice-8 T4) in
+/// register-order: the first plugin whose [`type_sig`](crate::plugin::TagTypePlugin::type_sig)
+/// matches decodes the body and yields a [`Tag::Custom`]. A plugin can therefore
+/// only ever occupy a previously-`Unsupported` signature. Unknown types with no
+/// matching plugin still return `Error::Unsupported`, never panic.
+pub fn read_tag_value_in<R: ProfileReader>(
+    ctx: &Context,
+    type_sig: Signature,
+    r: &mut R,
+    size: u32,
+) -> Result<Tag> {
     match type_sig.to_raw() {
         T_XYZ | T_CORBIS_BROKEN_XYZ => trivial::read_xyz(r, size),
         T_S15FIXED16_ARRAY => trivial::read_s15fixed16_array(r, size),
@@ -90,6 +112,18 @@ pub fn read_tag_value<R: ProfileReader>(type_sig: Signature, r: &mut R, size: u3
         T_LUT_A2B => lut::read_lut_a2b(r, size),
         T_LUT_B2A => lut::read_lut_b2a(r, size),
         T_MPE => mpe::read_mpe(r, size),
-        _ => Err(Error::Unsupported("tag type deferred to a later slice")),
+        // Custom-after-builtin fallthrough (slice-8 T4): a registered tag-type
+        // plugin may claim this otherwise-unsupported signature. Register-order is
+        // priority (first match wins). The plugin reads the body off the same
+        // reader, viewed object-safely as `&mut dyn ProfileReaderDyn`.
+        _ => {
+            for plugin in &ctx.plugins().tag_types {
+                if plugin.type_sig() == type_sig {
+                    let dyn_r: &mut dyn ProfileReaderDyn = r;
+                    return plugin.read(dyn_r, size);
+                }
+            }
+            Err(Error::Unsupported("tag type deferred to a later slice"))
+        }
     }
 }

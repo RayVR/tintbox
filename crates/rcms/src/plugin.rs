@@ -280,3 +280,273 @@ pub struct Plugins {
 // `Context` lives in `crate::context`; its `Plugins` field and `register_*`
 // methods are defined there (it already owns `logger`). Keeping the methods on
 // `Context` next to the field avoids a split-impl across modules.
+
+#[cfg(test)]
+mod tag_type_tests {
+    //! Slice-8 T4: wiring of the TagType + Tag plugins (custom ICC tag types) into
+    //! the read dispatch (`read_tag_value_in` → `Profile::read_tag_in`) and the
+    //! serialize write dispatch (`save_to_mem_in`).
+    use super::*;
+    use crate::color::CIEXYZ;
+    use crate::io::{ProfileReader, ProfileWriter};
+    use crate::profile::header::{ColorSpace, DateTime, Header, ProfileClass, RenderingIntent};
+    use crate::profile::tag::CustomTagData;
+    use crate::profile::{save_to_mem, save_to_mem_in, Profile, Tag, WritableProfile};
+
+    /// A minimal valid v4 header for the writer (size/illuminant are ignored).
+    fn header() -> Header {
+        Header {
+            size: 0,
+            cmm: Signature::from_raw(0),
+            version: 0x0440_0000,
+            device_class: ProfileClass::Display,
+            color_space: ColorSpace::Rgb,
+            pcs: ColorSpace::XYZ,
+            date: DateTime {
+                year: 2026,
+                month: 6,
+                day: 15,
+                hours: 0,
+                minutes: 0,
+                seconds: 0,
+            },
+            platform: Signature::from_raw(0),
+            flags: 0,
+            manufacturer: Signature::from_raw(0),
+            model: 0,
+            attributes: 0,
+            rendering_intent: RenderingIntent::Perceptual,
+            illuminant: CIEXYZ {
+                x: 0.9642,
+                y: 1.0,
+                z: 0.8249,
+            },
+            creator: Signature::from_raw(0),
+            profile_id: [0u8; 16],
+        }
+    }
+
+    // ---- Functional round-trip: a custom type carrying a single u32. ----
+
+    /// The opaque cooked value the round-trip plugin reads/writes.
+    #[derive(Debug, PartialEq)]
+    struct MyVal(u32);
+
+    const CUST_TYPE: Signature = Signature::from_bytes(*b"cust");
+    const MTAG: Signature = Signature::from_bytes(*b"mTag");
+
+    struct CustPlugin;
+    impl TagTypePlugin for CustPlugin {
+        fn type_sig(&self) -> Signature {
+            CUST_TYPE
+        }
+        fn read(&self, r: &mut dyn ProfileReaderDyn, _size: u32) -> Result<Tag> {
+            // Drive the generic reader helpers through the dyn shim.
+            let mut r = r;
+            let n = r.read_u32()?;
+            Ok(Tag::Custom(CustomTagData {
+                type_sig: CUST_TYPE,
+                data: std::sync::Arc::new(MyVal(n)),
+            }))
+        }
+        fn write(&self, w: &mut dyn ProfileWriterDyn, tag: &Tag) -> Result<()> {
+            let Tag::Custom(c) = tag else {
+                return Err(crate::error::Error::Unsupported("not a custom tag"));
+            };
+            let v = c.data.downcast_ref::<MyVal>().expect("MyVal payload");
+            let mut w = w;
+            w.write_u32(v.0)
+        }
+    }
+
+    fn cust_ctx() -> Context<'static> {
+        let mut ctx = Context::new();
+        ctx.register_tag_type(std::sync::Arc::new(CustPlugin));
+        ctx.register_tag(
+            MTAG,
+            std::sync::Arc::new(TagDescriptor {
+                supported_types: vec![CUST_TYPE],
+                decide_type: |_v, _t| CUST_TYPE,
+            }),
+        );
+        ctx
+    }
+
+    #[test]
+    fn custom_tag_round_trips_through_serialize_and_read() {
+        let ctx = cust_ctx();
+        let mut p = WritableProfile::new(header());
+        p.add_tag(
+            MTAG,
+            Tag::Custom(CustomTagData {
+                type_sig: CUST_TYPE,
+                data: std::sync::Arc::new(MyVal(0xDEAD_BEEF)),
+            }),
+        );
+
+        let bytes = save_to_mem_in(&ctx, &p).expect("serialize with plugin");
+        let prof = Profile::open(&bytes).expect("reopen");
+        let tag = prof.read_tag_in(&ctx, MTAG).expect("read custom tag");
+
+        match tag {
+            Tag::Custom(c) => {
+                assert_eq!(c.type_sig, CUST_TYPE);
+                let v = c.data.downcast_ref::<MyVal>().expect("MyVal");
+                assert_eq!(*v, MyVal(0xDEAD_BEEF));
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_tag_in_without_registration_rejects_custom_tag() {
+        // Same bytes, but read with an EMPTY context: the tag sig has no builtin
+        // descriptor and no registered descriptor, so it is rejected (BadType).
+        let ctx = cust_ctx();
+        let mut p = WritableProfile::new(header());
+        p.add_tag(
+            MTAG,
+            Tag::Custom(CustomTagData {
+                type_sig: CUST_TYPE,
+                data: std::sync::Arc::new(MyVal(1)),
+            }),
+        );
+        let bytes = save_to_mem_in(&ctx, &p).expect("serialize");
+        let prof = Profile::open(&bytes).expect("reopen");
+        assert!(
+            prof.read_tag(MTAG).is_err(),
+            "legacy read must not decode it"
+        );
+    }
+
+    // ---- Differential bonus: a custom type reusing the builtin XYZ encoding. ----
+
+    const XYZ2_TYPE: Signature = Signature::from_bytes(*b"xyz2");
+    const XTAG: Signature = Signature::from_bytes(*b"xTg ");
+    // A real builtin XYZ-valued tag, to obtain the reference 'XYZ ' bytes.
+    const WTPT: Signature = Signature::from_bytes(*b"wtpt");
+
+    struct Xyz2Plugin;
+    impl TagTypePlugin for Xyz2Plugin {
+        fn type_sig(&self) -> Signature {
+            XYZ2_TYPE
+        }
+        fn read(&self, r: &mut dyn ProfileReaderDyn, _size: u32) -> Result<Tag> {
+            let mut r = r;
+            let xyz = r.read_xyz()?; // reuse the builtin s15Fixed16×3 decode.
+            Ok(Tag::Custom(CustomTagData {
+                type_sig: XYZ2_TYPE,
+                data: std::sync::Arc::new(xyz),
+            }))
+        }
+        fn write(&self, w: &mut dyn ProfileWriterDyn, tag: &Tag) -> Result<()> {
+            let Tag::Custom(c) = tag else {
+                return Err(crate::error::Error::Unsupported("not a custom tag"));
+            };
+            let xyz = c.data.downcast_ref::<CIEXYZ>().expect("CIEXYZ payload");
+            let mut w = w;
+            // Mirror Type_XYZ_Write exactly: three s15Fixed16.
+            w.write_s15fixed16(xyz.x)?;
+            w.write_s15fixed16(xyz.y)?;
+            w.write_s15fixed16(xyz.z)
+        }
+    }
+
+    #[test]
+    fn custom_xyz_body_bytes_equal_builtin_xyz_body() {
+        let xyz = CIEXYZ {
+            x: 0.5,
+            y: 0.25,
+            z: 0.125,
+        };
+
+        // Plugin profile: custom 'xyz2' type under a custom tag.
+        let mut ctx = Context::new();
+        ctx.register_tag_type(std::sync::Arc::new(Xyz2Plugin));
+        ctx.register_tag(
+            XTAG,
+            std::sync::Arc::new(TagDescriptor {
+                supported_types: vec![XYZ2_TYPE],
+                decide_type: |_v, _t| XYZ2_TYPE,
+            }),
+        );
+        let mut pc = WritableProfile::new(header());
+        pc.add_tag(
+            XTAG,
+            Tag::Custom(CustomTagData {
+                type_sig: XYZ2_TYPE,
+                data: std::sync::Arc::new(xyz),
+            }),
+        );
+        let custom_bytes = save_to_mem_in(&ctx, &pc).expect("serialize custom");
+
+        // Builtin profile: a real XYZ tag (wtpt) with the same value.
+        let mut pb = WritableProfile::new(header());
+        pb.add_tag(WTPT, Tag::Xyz(xyz));
+        let builtin_bytes = save_to_mem(&pb).expect("serialize builtin");
+
+        // Both single-tag profiles have identical header+directory layout, so the
+        // tag bodies sit at the same offset. Extract each body (8-byte type base +
+        // payload) and assert the PAYLOADS are byte-identical (only the 4-byte type
+        // signature in the base differs: 'xyz2' vs 'XYZ ').
+        let cust_entry = Profile::open(&custom_bytes)
+            .unwrap()
+            .tag_entry(XTAG)
+            .copied()
+            .expect("xTg entry");
+        let bi_entry = Profile::open(&builtin_bytes)
+            .unwrap()
+            .tag_entry(WTPT)
+            .copied()
+            .expect("wtpt entry");
+        assert_eq!(cust_entry.size, bi_entry.size, "tag sizes differ");
+
+        let cust_body =
+            &custom_bytes[cust_entry.offset as usize + 8..][..cust_entry.size as usize - 8];
+        let bi_body = &builtin_bytes[bi_entry.offset as usize + 8..][..bi_entry.size as usize - 8];
+        assert_eq!(cust_body, bi_body, "custom XYZ body != builtin XYZ body");
+
+        // And the custom type base carries 'xyz2', confirming the plugin path ran.
+        let base = &custom_bytes[cust_entry.offset as usize..][..4];
+        assert_eq!(base, b"xyz2");
+    }
+
+    #[test]
+    fn builtin_type_sig_cannot_be_shadowed() {
+        // Register a plugin claiming the builtin 'XYZ ' type sig. A real XYZ tag
+        // must STILL decode via the builtin (Tag::Xyz), never the plugin.
+        struct Shadow;
+        impl TagTypePlugin for Shadow {
+            fn type_sig(&self) -> Signature {
+                Signature::from_bytes(*b"XYZ ")
+            }
+            fn read(&self, _r: &mut dyn ProfileReaderDyn, _size: u32) -> Result<Tag> {
+                panic!("builtin XYZ must not reach the plugin");
+            }
+            fn write(&self, _w: &mut dyn ProfileWriterDyn, _t: &Tag) -> Result<()> {
+                panic!("builtin XYZ must not reach the plugin");
+            }
+        }
+        let mut ctx = Context::new();
+        ctx.register_tag_type(std::sync::Arc::new(Shadow));
+
+        let mut p = WritableProfile::new(header());
+        p.add_tag(
+            WTPT,
+            Tag::Xyz(CIEXYZ {
+                x: 0.9642,
+                y: 1.0,
+                z: 0.8249,
+            }),
+        );
+        // Write through the plugin-aware path: must use the builtin XYZ writer.
+        let bytes = save_to_mem_in(&ctx, &p).expect("serialize");
+        let prof = Profile::open(&bytes).expect("reopen");
+        // The builtin XYZ reader (not the panicking plugin) decoded the body; the
+        // s15Fixed16 round-trip quantizes 0.9642, so compare within tolerance.
+        match prof.read_tag_in(&ctx, WTPT).expect("read wtpt") {
+            Tag::Xyz(v) => assert!((v.x - 0.9642).abs() < 1e-4, "x={}", v.x),
+            other => panic!("expected builtin Xyz, got {other:?}"),
+        }
+    }
+}

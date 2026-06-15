@@ -40,12 +40,14 @@
 //! entry inherits them. Required for sRGB's three linked TRCs (T4).
 
 use crate::color::{CIExyYTriple, CIEXYZ};
+use crate::context::Context;
 use crate::curve::ToneCurve;
 use crate::error::{Error, Result};
 use crate::fixed::U8Fixed8;
 use crate::io::{CountWriter, MemWriter, ProfileWriter};
 use crate::pipeline::clut::ClutTable;
 use crate::pipeline::{Pipeline, Stage};
+use crate::plugin::ProfileWriterDyn;
 use crate::profile::header::{DateTime, Header};
 use crate::profile::tag::{
     Cicp, ColorantTableEntry, Measurement, Mlu, ProfileIdItem, ProfileSequenceItem, Tag,
@@ -146,6 +148,19 @@ fn header_and_directory_len(tag_count: usize) -> usize {
 /// resolved and pass 2 writes the header (with the patched profile size), the
 /// directory, and the tag bodies for real.
 pub fn save_to_mem(profile: &WritableProfile) -> Result<Vec<u8>> {
+    // Legacy entry point: builtin path only. Delegates with an empty Context, so
+    // the byte stream is identical to the pre-plugin serializer.
+    save_to_mem_in(&Context::new(), profile)
+}
+
+/// Serialize `profile` to ICC bytes with the tag-type/tag plugin registry in `ctx`
+/// consulted (slice-8 T4). Same two-pass layout as [`save_to_mem`], but the
+/// per-tag type choice and body writer fall through to a registered
+/// [`TagTypePlugin`](crate::plugin::TagTypePlugin) / `decide_type` AFTER the
+/// builtins, so a [`Tag::Custom`] (or a tag whose write-type resolves to a
+/// registered plugin) is encoded by that plugin. The framework always writes the
+/// 8-byte type base; the plugin writes only the body. Builtins are never shadowed.
+pub fn save_to_mem_in(ctx: &Context, profile: &WritableProfile) -> Result<Vec<u8>> {
     let tag_count = profile.tags.len();
 
     // ---- Pass 1: lay out tag bodies, compute offset/size + total. ----
@@ -166,9 +181,9 @@ pub fn save_to_mem(profile: &WritableProfile) -> Result<Vec<u8>> {
             continue; // Linked tags are not written (cmsio0.c:1410).
         };
         let begin = body_start + counter.len(); // io->UsedSpace at body start.
-        let ty = write_type_for(slot.sig, value, version)?;
+        let ty = write_type_for_in(ctx, slot.sig, value, version)?;
         counter.write_type_base(ty)?;
-        write_tag_body(&mut counter, value, ty, version)?;
+        write_tag_body_in(ctx, &mut counter, value, ty, version)?;
         let size = (body_start + counter.len()) - begin; // pre-alignment size.
         counter.write_alignment()?;
         layouts[i] = Some(TagLayout {
@@ -204,9 +219,9 @@ pub fn save_to_mem(profile: &WritableProfile) -> Result<Vec<u8>> {
         let SlotContent::Body(ref value) = slot.content else {
             continue;
         };
-        let ty = write_type_for(slot.sig, value, version)?;
+        let ty = write_type_for_in(ctx, slot.sig, value, version)?;
         w.write_type_base(ty)?;
-        write_tag_body(&mut w, value, ty, version)?;
+        write_tag_body_in(ctx, &mut w, value, ty, version)?;
         w.write_alignment()?;
     }
 
@@ -375,6 +390,48 @@ pub(crate) fn profile_version_float(version: u32) -> f64 {
 /// the version-dependent deciders (curv/para, text/mluc/desc, LUT selection) need
 /// the tag SIGNATURE plus the profile version. We mirror the descriptor table.
 pub(crate) fn write_type_for(sig: Signature, value: &Tag, version: f64) -> Result<Signature> {
+    write_type_for_in(&Context::new(), sig, value, version)
+}
+
+/// The tag-TYPE signature to write, with the plugin registry in `ctx` consulted
+/// (slice-8 T4) AFTER the builtins. A [`Tag::Custom`] writes as its own carried
+/// `type_sig`. For any other tag, the builtin [`write_type_for`] decides first;
+/// only if no builtin claims it do we honour a registered
+/// [`TagDescriptor`](crate::plugin::TagDescriptor) — its `decide_type(version,
+/// value)` if it yields a non-zero signature, else its `supported_types[0]`.
+/// Builtins therefore can never be shadowed.
+pub(crate) fn write_type_for_in(
+    ctx: &Context,
+    sig: Signature,
+    value: &Tag,
+    version: f64,
+) -> Result<Signature> {
+    // A custom value carries the on-disk type it round-trips as.
+    if let Tag::Custom(c) = value {
+        return Ok(c.type_sig);
+    }
+    match write_type_for_builtin(sig, value, version) {
+        Ok(ty) => Ok(ty),
+        Err(_) => {
+            // No builtin type for this tag; consult a registered tag descriptor.
+            if let Some((_, desc)) = ctx.plugins().tags.iter().find(|(s, _)| *s == sig) {
+                let chosen = (desc.decide_type)(version, value);
+                if chosen.to_raw() != 0 {
+                    return Ok(chosen);
+                }
+                if let Some(default) = desc.supported_types.first() {
+                    return Ok(*default);
+                }
+            }
+            Err(Error::Unsupported("tag type writer not yet implemented"))
+        }
+    }
+}
+
+/// The BUILTIN tag→type decision (lcms2's per-tag `DecideType`/`SupportedTypes[0]`
+/// shape). Split out so [`write_type_for_in`] can try it first and fall through to
+/// the plugin registry only when it declines (`Err`).
+fn write_type_for_builtin(sig: Signature, value: &Tag, version: f64) -> Result<Signature> {
     match value {
         // XYZType: rXYZ/gXYZ/bXYZ go through DecideXYZtype (always 'XYZ '); all
         // other XYZ-valued tags (wtpt/bkpt/lumi) default to 'XYZ '.
@@ -515,7 +572,15 @@ fn decide_lut(sig: Signature, version: f64) -> Signature {
 /// Write a tag's body (NOT the type-base — the caller writes that). Dispatches on
 /// the cooked [`Tag`] value, mirroring each `Type_*_Write` in cmstypes.c. The
 /// curve/MLU/LUT/MPE bodies arrive in T2/T3 and return `Unsupported` here.
-fn write_tag_body<W: ProfileWriter>(
+/// Write a tag's body with the plugin registry in `ctx` consulted (slice-8 T4).
+/// The BUILTIN value arms are matched FIRST; the `_ =>` fallthrough (previously a
+/// bare `Error::Unsupported`) now resolves a [`TagTypePlugin`](crate::plugin::TagTypePlugin)
+/// for the chosen on-disk type `ty` — either because the value is a
+/// [`Tag::Custom`] or because a registered plugin handles `ty` — and lets it write
+/// the body. The plugin sees the writer object-safely as `&mut dyn ProfileWriterDyn`.
+/// Builtin types are never shadowed.
+fn write_tag_body_in<W: ProfileWriter>(
+    ctx: &Context,
     w: &mut W,
     value: &Tag,
     ty: Signature,
@@ -547,7 +612,19 @@ fn write_tag_body<W: ProfileWriter>(
         Tag::ProfileSequenceDesc(items) => write_pseq(w, items, version),
         Tag::ProfileSequenceId(items) => write_psid(w, items, version),
         Tag::Lut(lut) => write_lut(w, ty, lut),
-        _ => Err(Error::Unsupported("tag type writer not yet implemented")),
+        // Custom-after-builtin fallthrough (slice-8 T4): the chosen on-disk type
+        // `ty` is handled by a registered tag-type plugin. The framework has
+        // already written the 8-byte type base; the plugin writes only the body,
+        // viewing the writer object-safely as `&mut dyn ProfileWriterDyn`.
+        _ => {
+            for plugin in &ctx.plugins().tag_types {
+                if plugin.type_sig() == ty {
+                    let dyn_w: &mut dyn ProfileWriterDyn = w;
+                    return plugin.write(dyn_w, value);
+                }
+            }
+            Err(Error::Unsupported("tag type writer not yet implemented"))
+        }
     }
 }
 
@@ -1813,6 +1890,17 @@ fn write_mpe_clut<W: ProfileWriter>(w: &mut W, clut: &crate::pipeline::Clut) -> 
 mod tests {
     use super::*;
     use crate::profile::header::{ColorSpace, DateTime, Header, ProfileClass, RenderingIntent};
+
+    /// Builtin-path body writer used by the byte-layout tests: drives
+    /// [`write_tag_body_in`] with an empty context (no plugins).
+    fn write_tag_body<W: ProfileWriter>(
+        w: &mut W,
+        value: &Tag,
+        ty: Signature,
+        version: f64,
+    ) -> Result<()> {
+        write_tag_body_in(&Context::new(), w, value, ty, version)
+    }
 
     // Tag signatures used by the oracle's `save_basic_profile` (lcms2 sigs).
     const WTPT: Signature = Signature::from_raw(0x7774_7074); // 'wtpt'
