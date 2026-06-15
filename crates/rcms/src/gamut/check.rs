@@ -338,6 +338,7 @@ pub fn create_gamut_check_pipeline(
         params,
         is_trilinear: false,
         implements_identity: false,
+        resolved: Default::default(),
     };
     gamut_pipe.insert_stage_at_end(Stage::Clut(clut))?;
 

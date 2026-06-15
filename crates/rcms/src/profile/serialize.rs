@@ -2796,6 +2796,7 @@ mod tests {
             params,
             is_trilinear: false,
             implements_identity: false,
+            resolved: Default::default(),
         }))
         .unwrap();
 

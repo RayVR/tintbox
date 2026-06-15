@@ -152,12 +152,65 @@ impl InterpFloat {
 /// The interpolator [`interp_factory`] resolves for a given channel count and
 /// flags — either the 16-bit or the float routine, per `is_float`. Mirrors the
 /// `cmsInterpFunction` union that `DefaultInterpolatorsFactory` fills.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The builtin factory only ever produces [`InterpFn::Lerp16`] /
+/// [`InterpFn::LerpFloat`]. The [`InterpFn::Custom`] arm is produced exclusively
+/// by [`interp_factory_in`] when a registered [`InterpolatorFactory`](crate::plugin::InterpolatorFactory)
+/// claims the combination; it carries the plugin's resolved
+/// [`CustomInterp`](crate::plugin::CustomInterp) so the per-pixel loop can call it
+/// without revisiting the registry.
+///
+/// Holding a [`CustomInterp`](crate::plugin::CustomInterp) (an `Arc<dyn Fn>`)
+/// means `InterpFn` is neither `Copy` nor `Eq`; the two builtin arms are still
+/// cheap value types.
+#[derive(Clone)]
 pub enum InterpFn {
     /// 16-bit interpolation routine.
     Lerp16(Interp16),
     /// Float interpolation routine.
     LerpFloat(InterpFloat),
+    /// A custom interpolator resolved by a registered plugin factory at
+    /// CLUT-build time. Never produced by the builtin [`interp_factory`]. Boxed to
+    /// break the [`InterpFn`] ↔ [`CustomInterp`](crate::plugin::CustomInterp)
+    /// recursive-type cycle (`CustomInterp::Builtin` holds an `InterpFn`).
+    Custom(Box<crate::plugin::CustomInterp>),
+}
+
+impl core::fmt::Debug for InterpFn {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // `CustomInterp` wraps an `Arc<dyn Fn>` with no `Debug`, so render the
+        // custom arm opaquely; the builtin arms forward to their derived `Debug`.
+        match self {
+            InterpFn::Lerp16(l) => f.debug_tuple("Lerp16").field(l).finish(),
+            InterpFn::LerpFloat(l) => f.debug_tuple("LerpFloat").field(l).finish(),
+            InterpFn::Custom(_) => f.write_str("Custom(..)"),
+        }
+    }
+}
+
+impl PartialEq for InterpFn {
+    /// The two builtin arms compare by value; a `Custom` arm compares by `Arc`
+    /// pointer identity of the underlying closure (two clones of the same
+    /// resolved interpolator are equal, distinct closures are not). `CustomInterp`
+    /// itself carries an `Arc<dyn Fn>` and so cannot be value-compared; this is the
+    /// only meaningful equality, and it keeps the builtin-only `assert_eq!`s in the
+    /// existing interp tests working unchanged.
+    fn eq(&self, other: &Self) -> bool {
+        use crate::plugin::CustomInterp;
+        match (self, other) {
+            (InterpFn::Lerp16(a), InterpFn::Lerp16(b)) => a == b,
+            (InterpFn::LerpFloat(a), InterpFn::LerpFloat(b)) => a == b,
+            (InterpFn::Custom(a), InterpFn::Custom(b)) => match (a.as_ref(), b.as_ref()) {
+                (CustomInterp::Builtin(x), CustomInterp::Builtin(y)) => x == y,
+                (CustomInterp::Lerp16(x), CustomInterp::Lerp16(y)) => std::sync::Arc::ptr_eq(x, y),
+                (CustomInterp::LerpFloat(x), CustomInterp::LerpFloat(y)) => {
+                    std::sync::Arc::ptr_eq(x, y)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
 }
 
 /// Select the interpolation routine for `(n_inputs, is_float, is_trilinear)`,
@@ -231,6 +284,39 @@ pub fn interp_factory(
         }
         _ => panic!("interp_factory: n_inputs must be in 1..=15, got {n_inputs}"),
     }
+}
+
+/// Context-aware interpolator selection (slice-8 task T5). Consults the
+/// registered [`InterpolatorFactory`](crate::plugin::InterpolatorFactory) plugins
+/// FIRST, in register-order (first `Some` wins); if every factory declines (or
+/// none is registered), falls through to the builtin [`interp_factory`].
+///
+/// A factory that returns [`CustomInterp::Builtin`](crate::plugin::CustomInterp::Builtin)
+/// resolves to that builtin [`InterpFn`] directly; a custom
+/// [`Lerp16`](crate::plugin::CustomInterp::Lerp16) /
+/// [`LerpFloat`](crate::plugin::CustomInterp::LerpFloat) resolves to
+/// [`InterpFn::Custom`]. The resolution happens at CLUT-build time, so the
+/// per-pixel loop never touches the [`Context`](crate::context::Context).
+///
+/// # Panics
+/// Same as [`interp_factory`] when it is reached (no factory claims the combo).
+#[must_use]
+pub fn interp_factory_in(
+    ctx: &crate::context::Context,
+    n_inputs: usize,
+    n_outputs: usize,
+    is_float: bool,
+    is_trilinear: bool,
+) -> InterpFn {
+    for factory in &ctx.plugins().interpolators {
+        if let Some(custom) = factory.factory(n_inputs, n_outputs, is_float, is_trilinear) {
+            return match custom {
+                crate::plugin::CustomInterp::Builtin(f) => f,
+                other => InterpFn::Custom(Box::new(other)),
+            };
+        }
+    }
+    interp_factory(n_inputs, n_outputs, is_float, is_trilinear)
 }
 
 /// 16-bit 3D tetrahedral interpolation, bit-identical to

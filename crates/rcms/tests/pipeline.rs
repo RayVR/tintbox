@@ -387,6 +387,7 @@ fn clut_stage_u16_3d_and_4d() {
                 params: InterpParams::new(grid, n_in, n_out),
                 is_trilinear: false,
                 implements_identity: false,
+                resolved: Default::default(),
             };
             let mut pl = Pipeline::new(n_in, n_out);
             pl.insert_stage_at_end(Stage::Clut(clut)).unwrap();
@@ -426,6 +427,7 @@ fn clut_stage_f32_3d() {
                 params: InterpParams::new(grid, n_in, n_out),
                 is_trilinear: false,
                 implements_identity: false,
+                resolved: Default::default(),
             };
             let mut pl = Pipeline::new(n_in, n_out);
             pl.insert_stage_at_end(Stage::Clut(clut)).unwrap();
@@ -512,6 +514,7 @@ fn pipeline_clut_curves_matrix_float() {
             params: InterpParams::new(grid, n_in, n_out),
             is_trilinear: false,
             implements_identity: false,
+            resolved: Default::default(),
         }))
         .unwrap();
         pl.insert_stage_at_end(Stage::ToneCurves(curves)).unwrap();
@@ -588,6 +591,7 @@ fn concat_curves_matrix_then_clut_float() {
             params: InterpParams::new(grid, n, n),
             is_trilinear: false,
             implements_identity: false,
+            resolved: Default::default(),
         }))
         .unwrap();
 
