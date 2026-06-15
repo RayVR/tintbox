@@ -78,6 +78,82 @@ The default optimization strategy is `Accurate` (full-precision, lossless, and
 bit-identical to lcms2 run with `cmsFLAGS_NOOPTIMIZE`). Opt into
 `OptimizationStrategy::Lcms2Compat` for drop-in parity with stock lcms2-default.
 
+## Extending rcms (plugins)
+
+lcms2 is extensible through a C plugin ABI. `rcms` exposes the same extension
+points as **idiomatic Rust traits**, registered on a `Context`:
+
+| Trait | Register | Real-world use |
+|-------|----------|----------------|
+| `RenderingIntentPlugin` | `ctx.register_intent` | Black/ink preservation, custom gamut mapping |
+| `TagTypePlugin` + `TagDescriptor` | `ctx.register_tag_type` | Read/write a vendor's private ICC tags so they survive a round-trip |
+| `ParametricCurvePlugin` | `ctx.register_parametric_curve` | A new transfer function (a measured TRC, an HDR curve) |
+| `Optimizer` | `ctx.set_optimizer` | Drop in a SIMD/GPU fast path for a pipeline shape you care about |
+| `InterpolatorFactory` | `ctx.register_interpolator` | A higher-order CLUT interpolant for smoother gradients |
+
+The registry is consulted at construction/link/read time and resolves to a
+concrete value *before* the per-pixel loop runs, so a plugin never slows the hot
+path. Crucially, **built-ins are always matched first** — a plugin can only
+service an id the engine doesn't already handle, so registering one *cannot
+perturb* the bit-identical built-in paths. An empty `Context` behaves exactly
+like stock rcms.
+
+### Motivating example: keep black text black
+
+In CMYK print production, a plain relative-colorimetric conversion re-expresses
+100%-K text and hairlines as **4-color "rich black."** On press, all four plates
+must then register perfectly or black text shows colored fringing and looks
+fuzzy — a classic, expensive prepress headache. The fix is a *black-preserving*
+rendering intent (lcms2 ships `INTENT_PRESERVE_K_ONLY_*` as plugins). Here it is
+as a Rust trait:
+
+```rust
+use std::sync::Arc;
+use rcms::prelude::*;
+use rcms::link::default_icc_intents;
+
+struct PreserveBlack;
+
+impl RenderingIntentPlugin for PreserveBlack {
+    fn intent(&self) -> u32 { 10 }  // lcms2 INTENT_PRESERVE_K_ONLY_PERCEPTUAL
+    fn description(&self) -> &str { "Preserve pure-K black (print production)" }
+
+    fn link(
+        &self,
+        ctx: &Context,
+        profiles: &[&Profile],
+        intents: &[RenderingIntent],
+        bpc: &[bool],
+        adaptation: &[f64],
+        flags: u32,
+    ) -> Result<Pipeline> {
+        // Reuse the bit-identical built-in color link for the chromatic path…
+        let pipeline = default_icc_intents(profiles, intents, bpc, adaptation, flags)?;
+        // …then append your K-restoration stage so K-only input stays on the K
+        // plate alone. The plugin owns this ink policy; the engine stays generic.
+        Ok(pipeline)
+    }
+}
+
+// Register once; then build transforms with the custom intent number.
+let mut ctx = Context::new();
+ctx.register_intent(Arc::new(PreserveBlack));
+
+let xform = Transform::new_in(
+    &ctx,
+    &[&cmyk_press, &cmyk_proof],
+    &[RenderingIntent::Other(10), RenderingIntent::Other(10)],
+    &[/* bpc */ true, true],
+    &[1.0, 1.0],
+    Flags::empty(),
+)?;
+```
+
+The same pattern handles the other categories: register a `TagTypePlugin` to
+carry a proprietary spot-ink or spectral tag through a profile round-trip, or
+`set_optimizer` to swap in a hand-tuned fast path while every other transform
+keeps using the verified default.
+
 ## Building & testing
 
 The workspace has two crates: `rcms` (the library) and `rcms-oracle` (test-only,
