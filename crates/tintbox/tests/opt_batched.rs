@@ -135,6 +135,8 @@ fn batched_is_byte_identical_to_accurate_and_lcms2_nooptimize() {
     let mut total_cells = 0usize;
     let mut total_pixels = 0usize;
     let mut batched_fired_cells = 0usize;
+    let mut u16_chain_cells = 0usize;
+    let mut nonfloat_in_cells = 0usize;
     let mut mismatches = 0usize;
 
     for (an, in_rgb, bn, out_rgb) in pairs() {
@@ -220,6 +222,16 @@ fn batched_is_byte_identical_to_accurate_and_lcms2_nooptimize() {
                     if fast.batched_fired() {
                         batched_fired_cells += 1;
                     }
+                    // The pure u16-domain chain (the big lossless lever) must fire
+                    // for every non-float-INPUT cell of a Curve/U16-CLUT pipeline
+                    // (these testbed device links are exactly that shape).
+                    let in_is_float = in_fmt == inflt;
+                    if !in_is_float {
+                        nonfloat_in_cells += 1;
+                        if fast.batched_uses_u16_chain() {
+                            u16_chain_cells += 1;
+                        }
+                    }
 
                     if fast_out != oracle {
                         mismatches += 1;
@@ -269,9 +281,18 @@ fn batched_is_byte_identical_to_accurate_and_lcms2_nooptimize() {
         "expected the batched fast path to fire for nearly all cells, got \
          {batched_fired_cells}/{total_cells}"
     );
+    // The fused u16-domain run (the big lossless lever) must fire for EVERY
+    // non-float-input cell: every testbed device link has at least one Curve/
+    // U16-CLUT run bounded by 16-bit quantization points (the CLUT->output-curves
+    // tail at minimum). Proves the lever is live across the whole sweep.
+    assert_eq!(
+        u16_chain_cells, nonfloat_in_cells,
+        "the fused u16-domain run must fire for every non-float-input cell"
+    );
     eprintln!(
         "[batched] AccurateFast == Accurate == lcms2-NOOPTIMIZE byte-for-byte: \
          {total_cells} cells, {total_pixels} pixels checked, 0 mismatches; \
-         batched fired in {batched_fired_cells}/{total_cells} cells"
+         batched fired in {batched_fired_cells}/{total_cells} cells; \
+         u16-domain chain fired in {u16_chain_cells}/{nonfloat_in_cells} non-float-input cells"
     );
 }

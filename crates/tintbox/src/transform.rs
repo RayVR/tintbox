@@ -544,6 +544,12 @@ impl Transform {
         matches!(self.opt_eval, OptimizedEval::Batched(_))
     }
 
+    /// Whether the batched fast path built the pure u16-domain chain (the big
+    /// lossless lever): the 16-bit eval runs wholly in u16, no f32 round-trips.
+    pub fn batched_uses_u16_chain(&self) -> bool {
+        matches!(&self.opt_eval, OptimizedEval::Batched(b) if b.uses_u16_chain())
+    }
+
     /// Whether the LOSSLESS matrix-shaper fast path fired for this transform
     /// (true only under [`OptimizationStrategy::AccurateFast`] when the RGB 8-bit
     /// matrix-shaper shape matched).
