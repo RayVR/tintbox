@@ -80,7 +80,13 @@ fn main() {
         let mut n = 0u64;
         while start.elapsed().as_secs_f64() < 3.0 {
             let x = Transform::new_simple_with_formats_strategy(
-                &pin, &pout, RenderingIntent::Perceptual, true, inf, outf, strat,
+                &pin,
+                &pout,
+                RenderingIntent::Perceptual,
+                true,
+                inf,
+                outf,
+                strat,
             )
             .expect("build");
             std::hint::black_box(&x);
