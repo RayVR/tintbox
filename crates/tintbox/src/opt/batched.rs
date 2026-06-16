@@ -272,10 +272,10 @@ struct U16RunScratch {
 }
 
 impl U16RunScratch {
-    fn new() -> Self {
+    fn with_capacity(cap_pixels: usize) -> Self {
         U16RunScratch {
-            a: vec![0u16; CHUNK * MAX_STAGE_CHANNELS],
-            b: vec![0u16; CHUNK * MAX_STAGE_CHANNELS],
+            a: vec![0u16; cap_pixels * MAX_STAGE_CHANNELS],
+            b: vec![0u16; cap_pixels * MAX_STAGE_CHANNELS],
         }
     }
 }
@@ -292,19 +292,36 @@ pub struct BatchedScratch {
     buf_a: Vec<f32>,
     buf_b: Vec<f32>,
     u16: U16RunScratch,
+    /// The eval's internal tile width in PIXELS: `min(CHUNK, cap_pixels)`. The eval
+    /// must never process more than `cap_pixels` pixels per inner tile, since the
+    /// scratch buffers only hold `cap_pixels * MAX_STAGE_CHANNELS` slots.
+    cap_pixels: usize,
 }
 
 impl BatchedScratch {
-    /// Allocate the ping-pong + u16-run scratch once (sized for one `CHUNK` tile at
-    /// the maximum stage width). Reuse the same value across all of a transform's
-    /// tiles to avoid re-zeroing megabytes per tile.
+    /// Allocate the ping-pong + u16-run scratch once, sized for one tile of
+    /// `cap_pixels` pixels at the maximum stage width. `cap_pixels` is clamped to
+    /// `CHUNK` (the eval's tile cap) and to at least 1. A SMALL `do_transform` call
+    /// (e.g. one scanline) sizes the scratch to its own pixel count, so it never
+    /// allocates+zeros a full `CHUNK`-wide (megabyte) buffer — the per-call overhead
+    /// that made the batched path catastrophic for small calls. Reuse the same value
+    /// across all of a transform's tiles to avoid re-zeroing per tile.
+    #[must_use]
+    pub fn with_capacity(cap_pixels: usize) -> Self {
+        let cap = cap_pixels.clamp(1, CHUNK);
+        BatchedScratch {
+            buf_a: vec![0.0f32; cap * MAX_STAGE_CHANNELS],
+            buf_b: vec![0.0f32; cap * MAX_STAGE_CHANNELS],
+            u16: U16RunScratch::with_capacity(cap),
+            cap_pixels: cap,
+        }
+    }
+
+    /// Allocate scratch sized for a full `CHUNK` tile (the steady-state large-buffer
+    /// case). Equivalent to `with_capacity(CHUNK)`.
     #[must_use]
     pub fn new() -> Self {
-        BatchedScratch {
-            buf_a: vec![0.0f32; CHUNK * MAX_STAGE_CHANNELS],
-            buf_b: vec![0.0f32; CHUNK * MAX_STAGE_CHANNELS],
-            u16: U16RunScratch::new(),
-        }
+        Self::with_capacity(CHUNK)
     }
 }
 
@@ -451,14 +468,18 @@ impl BatchedPipeline {
             buf_a,
             buf_b,
             u16: u16_scratch,
+            cap_pixels,
         } = scratch;
+        // Inner tile width: never exceed the scratch capacity (which may be < CHUNK
+        // for a small `do_transform` call).
+        let tile = (*cap_pixels).min(CHUNK);
         // ONE empty context for the whole eval — hoisted so a `Generic` tone-curve
         // stage's `eval_float_in` never allocs/drops a `Context` per pixel.
         let ctx = Context::new();
 
         let mut base = 0usize;
         while base < n {
-            let m = (n - base).min(CHUNK);
+            let m = (n - base).min(tile);
 
             // ---- Entry: convert this chunk's input into buf_a (pixel-major). ----
             // When the first stage is an 8-bit input-curve LUT, the entry + first
@@ -541,13 +562,20 @@ impl BatchedPipeline {
         let in_ch = self.in_ch;
         let out_ch = self.out_ch;
 
-        let BatchedScratch { buf_a, buf_b, .. } = scratch;
+        let BatchedScratch {
+            buf_a,
+            buf_b,
+            cap_pixels,
+            ..
+        } = scratch;
+        // Inner tile width: never exceed the scratch capacity (see `eval_16_buffer`).
+        let tile = (*cap_pixels).min(CHUNK);
         // ONE empty context for the whole eval (see `eval_16_buffer`).
         let ctx = Context::new();
 
         let mut base = 0usize;
         while base < n {
-            let m = (n - base).min(CHUNK);
+            let m = (n - base).min(tile);
 
             let mut cur: &mut Vec<f32> = &mut *buf_a;
             let mut nxt: &mut Vec<f32> = &mut *buf_b;

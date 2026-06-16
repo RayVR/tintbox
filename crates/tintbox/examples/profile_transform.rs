@@ -83,10 +83,22 @@ fn main() {
         xform.do_transform(&input, &mut output, N);
     }
     let secs_target: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(30.0);
+    // Process the N-pixel buffer in `chunk`-sized do_transform calls (default: one
+    // call). Small chunks model a renderer calling per scanline/tile/pixel.
+    let chunk: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(N);
     let start = Instant::now();
     let mut iters = 0u64;
     while start.elapsed().as_secs_f64() < secs_target {
-        xform.do_transform(&input, &mut output, N);
+        let mut off = 0;
+        while off < N {
+            let k = chunk.min(N - off);
+            xform.do_transform(
+                &input[off * inbpp..(off + k) * inbpp],
+                &mut output[off * outbpp..(off + k) * outbpp],
+                k,
+            );
+            off += k;
+        }
         iters += 1;
     }
     let secs = start.elapsed().as_secs_f64();

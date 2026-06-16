@@ -296,3 +296,170 @@ fn batched_is_byte_identical_to_accurate_and_lcms2_nooptimize() {
          u16-domain chain fired in {u16_chain_cells}/{nonfloat_in_cells} non-float-input cells"
     );
 }
+
+/// Run a transform over `n` pixels in `chunk`-sized `do_transform` calls (the way a
+/// real renderer drives a CMM: per scanline/tile/pixel). `in_bpp`/`out_bpp` are the
+/// packed bytes-per-pixel of the in/out formats.
+fn transform_chunked(
+    xform: &Transform,
+    input: &[u8],
+    output: &mut [u8],
+    n: usize,
+    in_bpp: usize,
+    out_bpp: usize,
+    chunk: usize,
+) {
+    let mut off = 0;
+    while off < n {
+        let k = chunk.min(n - off);
+        xform.do_transform(
+            &input[off * in_bpp..(off + k) * in_bpp],
+            &mut output[off * out_bpp..(off + k) * out_bpp],
+            k,
+        );
+        off += k;
+    }
+}
+
+/// The CHUNKED-CALL byte-identity proof: the threshold routing + right-sized scratch
+/// must not change output. Drives `AccurateFast` in SMALL chunks (1 and 64 pixels,
+/// straddling `BATCHED_THRESHOLD == 256`, so both the per-pixel fallback AND the
+/// batched path with a sub-CHUNK tile are exercised) and asserts the result is still
+/// byte-for-byte identical to Accurate (single-call) AND lcms2-NOOPTIMIZE. This is
+/// what catches any divergence introduced by the chunked/threshold path that the
+/// single-large-call sweep above cannot see.
+#[test]
+fn batched_chunked_calls_are_byte_identical_to_accurate_and_lcms2_nooptimize() {
+    // Small chunks straddling the batched threshold: 1 (per-pixel fallback),
+    // 64 (still below threshold), and 300 (above threshold => batched with a
+    // sub-CHUNK tile of 300).
+    const CHUNKS: &[usize] = &[1, 64, 300];
+
+    let mut total_cells = 0usize;
+    let mut mismatches = 0usize;
+
+    for (an, in_rgb, bn, out_rgb) in pairs() {
+        let ab = load(an);
+        let bb = load(bn);
+        let pa = Profile::open(&ab).unwrap();
+        let pb = Profile::open(&bb).unwrap();
+
+        let grid8 = if in_rgb { rgb8_sweep() } else { cmyk8_sweep() };
+        let in_ch = if in_rgb { 3 } else { 4 };
+        let n = grid8.len() / in_ch;
+        let out_ch = if out_rgb { 3 } else { 4 };
+
+        let (in8, in16, inflt) = if in_rgb {
+            (TYPE_RGB_8, TYPE_RGB_16, TYPE_RGB_FLT)
+        } else {
+            (TYPE_CMYK_8, TYPE_CMYK_16, TYPE_CMYK_FLT)
+        };
+        let (out8, out16, outflt) = if out_rgb {
+            (TYPE_RGB_8, TYPE_RGB_16, TYPE_RGB_FLT)
+        } else {
+            (TYPE_CMYK_8, TYPE_CMYK_16, TYPE_CMYK_FLT)
+        };
+        let buf16 = widen_to_16(&grid8);
+        let bufflt = widen_to_float(&grid8);
+
+        for &intent in INTENTS {
+            let intents_raw = [intent.to_raw(), intent.to_raw()];
+            let bpc = [false, false];
+            let adapt = [1.0, 1.0];
+
+            for &(in_fmt, in_buf, in_bpp) in &[
+                (in8, &grid8, in_ch),
+                (in16, &buf16, in_ch * 2),
+                (inflt, &bufflt, in_ch * 4),
+            ] {
+                for &out_fmt in &[out8, out16, outflt] {
+                    let out_bpp = if out_fmt == out8 {
+                        out_ch
+                    } else if out_fmt == out16 {
+                        out_ch * 2
+                    } else {
+                        out_ch * 4
+                    };
+
+                    let mut oracle = vec![0u8; n * out_bpp];
+                    let ok = tintbox_oracle::do_transform_packed(
+                        &[&ab, &bb],
+                        &intents_raw,
+                        &bpc,
+                        &adapt,
+                        in_fmt,
+                        out_fmt,
+                        in_buf,
+                        &mut oracle,
+                        n,
+                    );
+                    assert!(ok, "lcms2-NOOPTIMIZE failed {an}->{bn}");
+
+                    let acc = build(
+                        &pa,
+                        &pb,
+                        intent,
+                        in_fmt,
+                        out_fmt,
+                        OptimizationStrategy::Accurate,
+                    );
+                    let mut acc_out = vec![0u8; n * out_bpp];
+                    acc.do_transform(in_buf, &mut acc_out, n);
+
+                    let fast = build(
+                        &pa,
+                        &pb,
+                        intent,
+                        in_fmt,
+                        out_fmt,
+                        OptimizationStrategy::AccurateFast,
+                    );
+
+                    for &chunk in CHUNKS {
+                        let mut fast_out = vec![0u8; n * out_bpp];
+                        transform_chunked(&fast, in_buf, &mut fast_out, n, in_bpp, out_bpp, chunk);
+
+                        if fast_out != oracle {
+                            mismatches += 1;
+                            let bad = fast_out
+                                .iter()
+                                .zip(&oracle)
+                                .position(|(a, b)| a != b)
+                                .unwrap();
+                            panic!(
+                                "AccurateFast(chunk={chunk}) != lcms2-NOOPTIMIZE {an}->{bn} \
+                                 in={in_fmt:#x} out={out_fmt:#x} at byte {bad}: \
+                                 fast={} oracle={} (mismatches {mismatches})",
+                                fast_out[bad], oracle[bad],
+                            );
+                        }
+                        if fast_out != acc_out {
+                            mismatches += 1;
+                            let bad = fast_out
+                                .iter()
+                                .zip(&acc_out)
+                                .position(|(a, b)| a != b)
+                                .unwrap();
+                            panic!(
+                                "AccurateFast(chunk={chunk}) != Accurate {an}->{bn} \
+                                 in={in_fmt:#x} out={out_fmt:#x} at byte {bad}: \
+                                 fast={} accurate={} (mismatches {mismatches})",
+                                fast_out[bad], acc_out[bad],
+                            );
+                        }
+                        total_cells += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        mismatches, 0,
+        "found {mismatches} chunked mismatching cells"
+    );
+    eprintln!(
+        "[batched-chunked] AccurateFast (chunks {CHUNKS:?}) == Accurate == \
+         lcms2-NOOPTIMIZE byte-for-byte across {total_cells} chunked cells, 0 mismatches"
+    );
+}

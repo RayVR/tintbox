@@ -286,5 +286,73 @@ fn bench(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench);
+/// SMALL-CHUNK regression guard: a renderer drives a CMM per scanline/tile, not in
+/// one giant call. The batched `AccurateFast` path used to allocate+zero a full
+/// TILE-wide (~hundreds of KB) scratch on EVERY `do_transform` call regardless of
+/// `n_pixels`, so small calls were catastrophically slow (up to ~400x slower than
+/// Accurate). This bench drives RGB8->CMYK8 in 64-pixel chunks for AccurateFast vs
+/// Accurate so that regression class can't silently return: AccurateFast must stay
+/// >= Accurate here. (The 1M single-call regime is covered by `bench` above.)
+fn bench_small_chunks(c: &mut Criterion) {
+    const CHUNK: usize = 64;
+    let srgb = srgb_bytes();
+    let cmyk1 = cmyk_bytes("test1.icc");
+    let in_fmt = TYPE_RGB_8;
+    let out_fmt = TYPE_CMYK_8;
+    let in_stride = pixel_bytes(in_fmt);
+    let out_stride = pixel_bytes(out_fmt);
+
+    let mut input = vec![0u8; N_PIXELS * in_stride];
+    fill_input(&mut input, in_fmt);
+    let mut output = vec![0u8; N_PIXELS * out_stride];
+
+    let in_prof = Profile::open(&srgb).expect("open input profile");
+    let out_prof = Profile::open(&cmyk1).expect("open output profile");
+
+    let tb_accurate = build_tintbox(
+        &in_prof,
+        &out_prof,
+        in_fmt,
+        out_fmt,
+        OptimizationStrategy::Accurate,
+    );
+    let tb_accurate_fast = build_tintbox(
+        &in_prof,
+        &out_prof,
+        in_fmt,
+        out_fmt,
+        OptimizationStrategy::AccurateFast,
+    );
+
+    // Drive the full N-pixel buffer in CHUNK-sized do_transform calls.
+    let run = |xform: &Transform, input: &[u8], output: &mut [u8]| {
+        let mut off = 0;
+        while off < N_PIXELS {
+            let k = CHUNK.min(N_PIXELS - off);
+            xform.do_transform(
+                &input[off * in_stride..(off + k) * in_stride],
+                &mut output[off * out_stride..(off + k) * out_stride],
+                k,
+            );
+            off += k;
+        }
+    };
+
+    let mut group = c.benchmark_group("A_rgb8_to_cmyk8_chunk64");
+    group.throughput(Throughput::Elements(N_PIXELS as u64));
+    group.sample_size(30);
+    group.measurement_time(std::time::Duration::from_secs(8));
+    group.warm_up_time(std::time::Duration::from_secs(2));
+
+    group.bench_function(BenchmarkId::new("chunk64", "tintbox-Accurate"), |b| {
+        b.iter(|| run(&tb_accurate, black_box(&input), black_box(&mut output)));
+    });
+    group.bench_function(BenchmarkId::new("chunk64", "tintbox-AccurateFast"), |b| {
+        b.iter(|| run(&tb_accurate_fast, black_box(&input), black_box(&mut output)));
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench, bench_small_chunks);
 criterion_main!(benches);
