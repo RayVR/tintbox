@@ -97,7 +97,9 @@ pub enum Interp16 {
     Trilinear,
     /// 3D tetrahedral (`TetrahedralInterp16`).
     Tetrahedral,
-    /// n-D (4..=15 inputs) (`Eval4Inputs`..`Eval15Inputs`).
+    /// 4-input unrolled n-D (`Eval4Inputs`), the dedicated CMYK-input kernel.
+    Eval4,
+    /// n-D (5..=15 inputs) (`Eval5Inputs`..`Eval15Inputs`).
     EvalN,
 }
 
@@ -111,6 +113,7 @@ impl Interp16 {
             Interp16::Bilinear => bilinear_16(input, output, table, p),
             Interp16::Trilinear => trilinear_16(input, output, table, p),
             Interp16::Tetrahedral => tetrahedral_16(input, output, table, p),
+            Interp16::Eval4 => eval_4_inputs(input, output, table, p),
             Interp16::EvalN => eval_n_inputs(input, output, table, p),
         }
     }
@@ -130,7 +133,9 @@ pub enum InterpFloat {
     Trilinear,
     /// 3D tetrahedral (`TetrahedralInterpFloat`).
     Tetrahedral,
-    /// n-D (4..=15 inputs) (`Eval4InputsFloat`..`Eval15InputsFloat`).
+    /// 4-input unrolled n-D (`Eval4InputsFloat`), the dedicated CMYK-input kernel.
+    Eval4,
+    /// n-D (5..=15 inputs) (`Eval5InputsFloat`..`Eval15InputsFloat`).
     EvalN,
 }
 
@@ -144,6 +149,7 @@ impl InterpFloat {
             InterpFloat::Bilinear => bilinear_float(input, output, table, p),
             InterpFloat::Trilinear => trilinear_float(input, output, table, p),
             InterpFloat::Tetrahedral => tetrahedral_float(input, output, table, p),
+            InterpFloat::Eval4 => eval_4_inputs_float(input, output, table, p),
             InterpFloat::EvalN => eval_n_inputs_float(input, output, table, p),
         }
     }
@@ -275,7 +281,17 @@ pub fn interp_factory(
                 InterpFn::Lerp16(Interp16::Tetrahedral)
             }
         }
-        4..=15 => {
+        4 => {
+            // Dedicated unrolled 4-input kernel (lcms2 `Eval4Inputs`): same numbers
+            // as the generic recursion but right-sized scratch and no recursion —
+            // the CMYK-input fast path. Benefits both Accurate and AccurateFast.
+            if is_float {
+                InterpFn::LerpFloat(InterpFloat::Eval4)
+            } else {
+                InterpFn::Lerp16(Interp16::Eval4)
+            }
+        }
+        5..=15 => {
             if is_float {
                 InterpFn::LerpFloat(InterpFloat::EvalN)
             } else {
@@ -1017,6 +1033,66 @@ fn eval_n_inputs_rec(input: &[u16], output: &mut [u16], table: &[u16], p: &Inter
     }
 }
 
+/// 16-bit 4-input interpolation, bit-identical to lcms2's `Eval4Inputs`
+/// (cmsintrp.c:855) and to [`eval_n_inputs`] at `n_inputs == 4` — but unrolled.
+///
+/// This is the `n == 4` case of [`eval_n_inputs_rec`] flattened: bracket
+/// `input[0]` on `opta[3]`/`domain[0]`, evaluate the two 3-input sub-cubes at
+/// table offsets `k0_idx`/`k1_idx` with [`tetrahedral_16`] (the `n == 3`
+/// recursion base), and blend by `rk` with [`linear_interp`]. The scratch is
+/// sized to `p.n_outputs` (not `MAX_STAGE_CHANNELS`), avoiding the per-pixel
+/// 128-wide zeroing the generic recursion pays twice.
+///
+/// # Panics
+/// Panics if `p.n_inputs != 4`.
+pub fn eval_4_inputs(input: &[u16], output: &mut [u16], table: &[u16], p: &InterpParams) {
+    debug_assert_eq!(p.n_inputs, 4, "eval_4_inputs requires exactly 4 inputs");
+
+    // n == 4, nm == 3: fix input[0] on opta[3]/Domain[0], exactly as
+    // eval_n_inputs_rec does at this level.
+    let fk = to_fixed_domain(input[0] as i32 * p.domain[0] as i32);
+    let k0 = fixed_to_int(fk);
+    let rk = fixed_rest_to_int(fk);
+
+    let opta_nm = p.opta[3] as i32;
+    let k0_idx = opta_nm * k0;
+    let k1_idx = opta_nm * (k0 + if input[0] != 0xFFFF { 1 } else { 0 });
+
+    // Inner level reads input[1..] with Domain shifted left by one; opta/n_samples
+    // are untouched (matching the C memmove of only `Domain`).
+    let p1 = shift_domain(p, 3);
+
+    let n_out = p.n_outputs;
+
+    // tetrahedral_16 fully writes all `n_out` outputs (it never reads the buffer
+    // first), so the low sub-cube goes into a stack scratch holding exactly the
+    // active `n_out` prefix and the high sub-cube is written straight into
+    // `output`; we then blend in place. This drops the generic recursion's TWO
+    // per-pixel 128-wide zeroed scratch buffers to a single `n_out`-wide one with
+    // no heap allocation.
+    let mut tmp1 = SCRATCH_ZERO;
+    let tmp1 = &mut tmp1[..n_out];
+
+    tetrahedral_16(&input[1..], tmp1, &table[k0_idx as usize..], &p1);
+    tetrahedral_16(
+        &input[1..],
+        &mut output[..n_out],
+        &table[k1_idx as usize..],
+        &p1,
+    );
+
+    for i in 0..n_out {
+        output[i] = linear_interp(rk, tmp1[i] as i32, output[i] as i32);
+    }
+}
+
+/// Zero-filled backing for the unrolled-kernel scratch (one per pixel, on the
+/// stack). `tetrahedral_16` overwrites every active output before it is read, so
+/// the zero fill is never observed; it exists only to give a fixed-size,
+/// heap-free, `forbid(unsafe_code)`-clean array we can slice to the active
+/// `n_out` prefix.
+const SCRATCH_ZERO: [u16; MAX_STAGE_CHANNELS] = [0u16; MAX_STAGE_CHANNELS];
+
 /// Float n-D interpolation for 4..=15 inputs, bit-identical to lcms2's
 /// `Eval4InputsFloat`..`Eval15InputsFloat`. Same decomposition as
 /// [`eval_n_inputs`] but in floating point, bottoming out at
@@ -1078,6 +1154,55 @@ fn eval_n_inputs_float_rec(
         output[i] = y0 + (y1 - y0) * rest;
     }
 }
+
+/// Float 4-input interpolation, bit-identical to lcms2's `Eval4InputsFloat` and
+/// to [`eval_n_inputs_float`] at `n_inputs == 4` — the unrolled `n == 4` case of
+/// [`eval_n_inputs_float_rec`]: bracket `input[0]` on `opta[3]`/`domain[0]` with
+/// [`quick_floor`], evaluate the two 3-input sub-cubes with [`tetrahedral_float`]
+/// (the `n == 3` base), and blend by `rest`. Scratch right-sized to `p.n_outputs`.
+///
+/// # Panics
+/// Panics if `p.n_inputs != 4`.
+pub fn eval_4_inputs_float(input: &[f32], output: &mut [f32], table: &[f32], p: &InterpParams) {
+    debug_assert_eq!(
+        p.n_inputs, 4,
+        "eval_4_inputs_float requires exactly 4 inputs"
+    );
+
+    let pk = fclamp(input[0]) * p.domain[0] as f32;
+    let k0 = quick_floor(pk);
+    let rest = pk - k0 as f32;
+
+    let opta_nm = p.opta[3] as i32;
+    let k0_idx = opta_nm * k0;
+    let k1_idx = k0_idx + if fclamp(input[0]) >= 1.0 { 0 } else { opta_nm };
+
+    let p1 = shift_domain(p, 3);
+
+    let n_out = p.n_outputs;
+
+    // As in the u16 kernel: low sub-cube into a stack scratch holding the active
+    // `n_out` prefix, high sub-cube straight into `output`, then blend in place.
+    let mut tmp1 = SCRATCH_ZERO_F32;
+    let tmp1 = &mut tmp1[..n_out];
+
+    tetrahedral_float(&input[1..], tmp1, &table[k0_idx as usize..], &p1);
+    tetrahedral_float(
+        &input[1..],
+        &mut output[..n_out],
+        &table[k1_idx as usize..],
+        &p1,
+    );
+
+    for i in 0..n_out {
+        let y0 = tmp1[i];
+        let y1 = output[i];
+        output[i] = y0 + (y1 - y0) * rest;
+    }
+}
+
+/// Float counterpart of [`SCRATCH_ZERO`] for [`eval_4_inputs_float`].
+const SCRATCH_ZERO_F32: [f32; MAX_STAGE_CHANNELS] = [0f32; MAX_STAGE_CHANNELS];
 
 /// `_cmsQuickFloor` (lcms2_internal.h, the fast-floor path; `CMS_DONT_USE_FAST_FLOOR`
 /// is *not* defined in the pinned build): add the magic `2^36 * 1.5` to `val`,

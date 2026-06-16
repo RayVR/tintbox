@@ -11,9 +11,10 @@
 //!   same grid/output sweep with random f32 tables and inputs.
 
 use tintbox::interp::{
-    bilinear_16, bilinear_float, eval_1_input, eval_1_input_float, eval_n_inputs,
-    eval_n_inputs_float, interp_factory, tetrahedral_16, tetrahedral_float, trilinear_16,
-    trilinear_float, Interp16, InterpFloat, InterpFn, InterpParams,
+    bilinear_16, bilinear_float, eval_1_input, eval_1_input_float, eval_4_inputs,
+    eval_4_inputs_float, eval_n_inputs, eval_n_inputs_float, interp_factory, tetrahedral_16,
+    tetrahedral_float, trilinear_16, trilinear_float, Interp16, InterpFloat, InterpFn,
+    InterpParams,
 };
 use tintbox_oracle::{Rng, CMS_LERP_FLAGS_TRILINEAR};
 
@@ -714,6 +715,73 @@ fn eval4_inputs_float_matches_oracle() {
     assert!(total > 100_000, "expected many samples");
 }
 
+/// The unrolled `eval_4_inputs` is a pure flattening of the generic recursion at
+/// `n == 4`, so it MUST produce byte-for-byte identical u16 outputs over random
+/// 4-input CLUTs and random/edge inputs. (The generic path is itself proven
+/// bit-exact vs lcms2 by `eval4_inputs_16_matches_oracle`, so this transitively
+/// proves the unroll matches lcms2 `Eval4Inputs`.)
+#[test]
+fn eval4_unrolled_matches_generic_recursion_16() {
+    let mut rng = Rng::new(0xE4_0007_4017);
+    let mut total: u64 = 0;
+    for grid in grids_nd(4) {
+        for &n_out in N_OUTS {
+            let p = InterpParams::new(&grid, 4, n_out);
+            let table_len = n_nodes_nd(&grid) * n_out;
+            for _ in 0..4 {
+                let table: Vec<u16> = (0..table_len).map(|_| rng.next_u64() as u16).collect();
+                for input in u16_inputs_nd(4, &mut rng, 6000) {
+                    let mut unrolled = vec![0u16; n_out];
+                    let mut generic = vec![0u16; n_out];
+                    eval_4_inputs(&input, &mut unrolled, &table, &p);
+                    eval_n_inputs(&input, &mut generic, &table, &p);
+                    assert_eq!(
+                        unrolled, generic,
+                        "eval_4_inputs != eval_n_inputs grid={grid:?} n_out={n_out} in={input:?}"
+                    );
+                    total += n_out as u64;
+                }
+            }
+        }
+    }
+    println!("eval4_unrolled_matches_generic_16: {total} output samples compared bit-exact");
+    assert!(total > 500_000, "expected many samples");
+}
+
+/// Float counterpart: `eval_4_inputs_float` == `eval_n_inputs_float` (n=4),
+/// bit-for-bit by `f32::to_bits`.
+#[test]
+fn eval4_unrolled_matches_generic_recursion_float() {
+    let mut rng = Rng::new(0xE4_F10A_4017);
+    let mut total: u64 = 0;
+    for grid in grids_nd(4) {
+        for &n_out in N_OUTS {
+            let p = InterpParams::new(&grid, 4, n_out);
+            let table_len = n_nodes_nd(&grid) * n_out;
+            for _ in 0..4 {
+                let table: Vec<f32> = (0..table_len).map(|_| rng.next_f64_unit() as f32).collect();
+                for input in f32_inputs_nd(4, &mut rng, 5000) {
+                    let mut unrolled = vec![0f32; n_out];
+                    let mut generic = vec![0f32; n_out];
+                    eval_4_inputs_float(&input, &mut unrolled, &table, &p);
+                    eval_n_inputs_float(&input, &mut generic, &table, &p);
+                    for k in 0..n_out {
+                        assert_eq!(
+                            unrolled[k].to_bits(),
+                            generic[k].to_bits(),
+                            "eval_4_inputs_float != eval_n_inputs_float grid={grid:?} \
+                             n_out={n_out} in={input:?} ch={k}"
+                        );
+                    }
+                    total += n_out as u64;
+                }
+            }
+        }
+    }
+    println!("eval4_unrolled_matches_generic_float: {total} output samples compared bit-exact");
+    assert!(total > 100_000, "expected many samples");
+}
+
 #[test]
 fn eval5_inputs_16_matches_oracle() {
     let total = eval_n_16_check(5, 0xE5_0007_5000);
@@ -874,8 +942,17 @@ fn factory_selects_expected_routine() {
         interp_factory(3, 3, true, true),
         InterpFn::LerpFloat(InterpFloat::Trilinear)
     );
-    // 4..=15 -> EvalN (trilinear flag irrelevant).
-    for n in 4..=15 {
+    // 4 -> dedicated unrolled Eval4 kernel (trilinear flag irrelevant).
+    assert_eq!(
+        interp_factory(4, 4, false, false),
+        InterpFn::Lerp16(Interp16::Eval4),
+    );
+    assert_eq!(
+        interp_factory(4, 4, true, true),
+        InterpFn::LerpFloat(InterpFloat::Eval4),
+    );
+    // 5..=15 -> generic EvalN (trilinear flag irrelevant).
+    for n in 5..=15 {
         assert_eq!(
             interp_factory(n, 4, false, false),
             InterpFn::Lerp16(Interp16::EvalN),
