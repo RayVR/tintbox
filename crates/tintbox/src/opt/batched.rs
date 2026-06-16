@@ -53,7 +53,9 @@ use crate::context::Context;
 use crate::curve::ToneCurve;
 use crate::fixed::from_8_to_16;
 use crate::format::decode::PixelFormat;
-use crate::interp::{interp_factory, tetrahedral_16, InterpFn, InterpParams};
+#[cfg(not(feature = "simd"))]
+use crate::interp::tetrahedral_16;
+use crate::interp::{interp_factory, InterpFn, InterpParams};
 use crate::pipeline::{Clut, ClutTable, Pipeline, Stage, MAX_STAGE_CHANNELS};
 
 /// How many pixels are processed per tile. Sized so the two ping-pong scratch
@@ -120,6 +122,21 @@ impl ResolvedClut {
                     in16[i] = Lcms2Floor::quick_saturate_word(input[i] as f64 * 65535.0);
                 }
                 let mut out16 = [0u16; MAX_STAGE_CHANNELS];
+                // SIMD: the 3-input tetrahedral runs its per-output-channel interp
+                // across i32x4 lanes (bit-identical integer math); other 16-bit
+                // interpolators stay scalar.
+                #[cfg(feature = "simd")]
+                if let InterpFn::Lerp16(crate::interp::Interp16::Tetrahedral) = &self.interp {
+                    crate::simd::tetrahedral_across_outputs(
+                        &in16[..n_in],
+                        &mut out16[..n_out],
+                        table,
+                        &self.params,
+                    );
+                } else {
+                    lerp16.eval(&in16[..n_in], &mut out16[..n_out], table, &self.params);
+                }
+                #[cfg(not(feature = "simd"))]
                 lerp16.eval(&in16[..n_in], &mut out16[..n_out], table, &self.params);
                 for i in 0..n_out {
                     output[i] = out16[i] as f32 / 65535.0_f32;
@@ -356,6 +373,17 @@ fn run_u16_stage(
                 for p in 0..m {
                     let src = &cur[p * in_width..p * in_width + in_width];
                     let dst = &mut nxt[p * out_width..p * out_width + out_width];
+                    // SIMD: vectorize the per-output-channel interp across i32x4
+                    // lanes — bit-identical (integer math is exact). Scalar
+                    // otherwise.
+                    #[cfg(feature = "simd")]
+                    crate::simd::tetrahedral_across_outputs(
+                        &src[..3],
+                        &mut dst[..out_width],
+                        table,
+                        &c.params,
+                    );
+                    #[cfg(not(feature = "simd"))]
                     tetrahedral_16(&src[..3], &mut dst[..out_width], table, &c.params);
                 }
             }
@@ -654,6 +682,20 @@ fn run_stage(
                     dst[i] = curve.eval_float_in(ctx, src[i]);
                 }
             }
+        }
+        // SIMD: a 3x3 no-offset matrix is vectorized ACROSS PIXELS (f64x4) — each
+        // lane is one pixel, plain `*`/`+` in scalar order, no FMA → bit-identical
+        // to the Stage::Matrix f64 arm. Only this exact shape is specialized;
+        // everything else (offsets, other widths) falls through to Stage::eval.
+        #[cfg(feature = "simd")]
+        BatchedStage::Generic(Stage::Matrix {
+            rows: 3,
+            cols: 3,
+            m: mat,
+            offset: None,
+        }) => {
+            crate::simd::matrix3x3_across_pixels(cur, nxt, mat, m);
+            let _ = (in_width, out_width);
         }
         BatchedStage::Generic(s) => {
             for p in 0..m {

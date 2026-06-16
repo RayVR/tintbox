@@ -29,6 +29,8 @@ pub mod plugin;
 pub mod profile;
 pub mod ps;
 pub mod sig;
+#[cfg(feature = "simd")]
+pub mod simd;
 pub mod transform;
 
 pub use error::{Error, Result};

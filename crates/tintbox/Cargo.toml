@@ -18,6 +18,11 @@ default = ["std"]
 std = []
 file-io = ["std"]
 native-floor = []
+# Optional SIMD acceleration via the `wide` crate (safe API, stable, wasm-OK).
+# When OFF (the default) the scalar kernels run and behavior is byte-for-byte as
+# today. Every SIMD kernel is bit-identical to its scalar counterpart and to
+# lcms2 `cmsFLAGS_NOOPTIMIZE`, verified by unit tests + the differential oracle.
+simd = ["dep:wide"]
 
 [dev-dependencies]
 criterion = "0.8.2"
@@ -26,3 +31,6 @@ tintbox-oracle = { path = "../tintbox-oracle" }
 [[bench]]
 name = "transform"
 harness = false
+
+[dependencies]
+wide = { version = "1.5.0", optional = true }
