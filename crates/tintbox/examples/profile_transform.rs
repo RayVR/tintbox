@@ -72,6 +72,29 @@ fn main() {
     )
     .expect("build transform");
 
+    // BUILD_BENCH=1 → time transform CONSTRUCTION (profiles pre-opened, so this
+    // isolates the device-link build + the strategy's OptimizedEval build, which
+    // is the part that differs between Accurate and AccurateFast).
+    if std::env::var("BUILD_BENCH").is_ok() {
+        let start = Instant::now();
+        let mut n = 0u64;
+        while start.elapsed().as_secs_f64() < 3.0 {
+            let x = Transform::new_simple_with_formats_strategy(
+                &pin, &pout, RenderingIntent::Perceptual, true, inf, outf, strat,
+            )
+            .expect("build");
+            std::hint::black_box(&x);
+            n += 1;
+        }
+        let secs = start.elapsed().as_secs_f64();
+        eprintln!(
+            "{scenario}/{strat:?} BUILD: {n} in {secs:.2}s = {:.0} builds/s ({:.1} us/build)",
+            n as f64 / secs,
+            secs / n as f64 * 1e6
+        );
+        return;
+    }
+
     // Deterministic non-zero input (avoid trivial CLUT corners).
     let mut input = vec![0u8; N * inbpp];
     let mut s = 0x2545F491u32;
