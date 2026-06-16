@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Local mirror of CI's gates, so failures are caught here instead of on a CI
+# round-trip. Runs: rustfmt, clippy (default + simd feature), and the wasm32
+# build. The full differential test suite builds the vendored C oracle (~minutes)
+# so it is OPT-IN — include it with:  RUN_TESTS=1 git push
+# Skip all hooks with: git push --no-verify
+set -euo pipefail
+
+run() { echo "→ $*"; "$@"; }
+
+echo "pre-push: validating (mirrors CI)…"
+
+if ! cargo fmt --all --check; then
+    echo "✗ fmt — run: cargo fmt --all" >&2
+    exit 1
+fi
+
+run cargo clippy --workspace --all-targets -- -D warnings
+run cargo clippy -p tintbox --all-targets --features simd -- -D warnings
+
+if rustup target list --installed 2>/dev/null | grep -q wasm32-unknown-unknown; then
+    run cargo build -p tintbox --target wasm32-unknown-unknown
+else
+    echo "⚠ wasm32 target not installed — skipping (rustup target add wasm32-unknown-unknown)" >&2
+fi
+
+if [ "${RUN_TESTS:-0}" = "1" ]; then
+    run cargo test --workspace
+else
+    echo "ℹ skipping the differential test suite (set RUN_TESTS=1 to include it)"
+fi
+
+echo "✓ pre-push: all checks passed"

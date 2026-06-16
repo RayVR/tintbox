@@ -241,6 +241,21 @@ cargo build -p tintbox --target wasm32-unknown-unknown   # wasm builds without t
 Building the oracle requires a C compiler (the vendored lcms2 is compiled with
 `cc`). The `tintbox` crate itself has no C dependency.
 
+### Git hooks (one-time setup)
+
+Version-controlled hooks under `.githooks/` mirror CI so failures are caught
+locally. Enable them once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+- **pre-commit** — `cargo fmt --all --check` (fast).
+- **pre-push** — fmt + `clippy` (default and `--features simd`) + the wasm32
+  build. The full differential suite is opt-in: `RUN_TESTS=1 git push`.
+
+Bypass with `git commit --no-verify` / `git push --no-verify`.
+
 ## License
 
 The vendored Little CMS under `vendor/` retains its original MIT license. See

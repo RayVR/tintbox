@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fast local gate: rustfmt only (the cheap, most-frequent CI failure). The
+# heavier checks (clippy, wasm, tests) run in pre-push so committing stays quick.
+# Skip with: git commit --no-verify
+set -euo pipefail
+
+if ! cargo fmt --all --check; then
+    echo "" >&2
+    echo "✗ pre-commit: code is not rustfmt-clean (diff above). Fix with:  cargo fmt --all" >&2
+    exit 1
+fi
