@@ -716,6 +716,12 @@ impl Transform {
         let in_stride = pixel_bytes(fmts.in_fmt);
         let out_stride = pixel_bytes(fmts.out_fmt);
 
+        // The batched eval's ping-pong scratch, allocated ONCE here and reused
+        // across every tile (the eval re-tiles internally at CHUNK == TILE). This
+        // removes the per-tile `vec![0; CHUNK*MAX_STAGE_CHANNELS]` zeroing that
+        // otherwise dominates the profile as `__bzero`.
+        let mut eval_scratch = crate::opt::batched::BatchedScratch::new();
+
         if fmts.is_float {
             let from_input = fmts.from_input_float.as_ref().unwrap();
             let to_output = fmts.to_output_float.as_ref().unwrap();
@@ -735,8 +741,13 @@ impl Transform {
                     from_input(in_pixel, &mut fin);
                     chan_in[p * in_ch..p * in_ch + in_ch].copy_from_slice(&fin[..in_ch]);
                 }
-                // Batched eval (identical to per-pixel eval_float).
-                batched.eval_float_buffer(&chan_in[..m * in_ch], &mut chan_out[..m * out_ch], m);
+                // Batched eval (identical to per-pixel eval_float), reusing scratch.
+                batched.eval_float_buffer_with(
+                    &chan_in[..m * in_ch],
+                    &mut chan_out[..m * out_ch],
+                    m,
+                    &mut eval_scratch,
+                );
                 // Pack the tile back out (padding the packer's MAX_CHANNELS input).
                 let mut fout = [0f32; MAX_CHANNELS];
                 for p in 0..m {
@@ -770,7 +781,12 @@ impl Transform {
                     from_input(in_pixel, &mut win);
                     chan_in[p * in_ch..p * in_ch + in_ch].copy_from_slice(&win[..in_ch]);
                 }
-                batched.eval_16_buffer(&chan_in[..m * in_ch], &mut chan_out[..m * out_ch], m);
+                batched.eval_16_buffer_with(
+                    &chan_in[..m * in_ch],
+                    &mut chan_out[..m * out_ch],
+                    m,
+                    &mut eval_scratch,
+                );
                 let mut wout = [0u16; MAX_CHANNELS];
                 for p in 0..m {
                     wout[..out_ch].copy_from_slice(&chan_out[p * out_ch..p * out_ch + out_ch]);

@@ -49,6 +49,7 @@
 //! from* (cached LUT/interpolator) and *the loop order* — never the arithmetic.
 
 use crate::compat::floor::{FloorStrategy, Lcms2Floor};
+use crate::context::Context;
 use crate::curve::ToneCurve;
 use crate::fixed::from_8_to_16;
 use crate::format::decode::PixelFormat;
@@ -279,6 +280,40 @@ impl U16RunScratch {
     }
 }
 
+/// Reusable scratch for a whole batched eval: the f32 ping-pong pair plus the
+/// u16-run scratch. Allocated ONCE per `do_transform` call (in
+/// [`Transform::do_transform_batched`](crate::transform)) and reused across every
+/// tile — the per-tile `vec![0; CHUNK*MAX_STAGE_CHANNELS]` allocation+zeroing
+/// (`__bzero`) is the hot waste this removes. Every slot a stage reads is written
+/// by the prior stage (or the entry conversion) before being read, so the buffers
+/// carrying stale data across tiles is harmless: the eval never reads an
+/// un-rewritten slot.
+pub struct BatchedScratch {
+    buf_a: Vec<f32>,
+    buf_b: Vec<f32>,
+    u16: U16RunScratch,
+}
+
+impl BatchedScratch {
+    /// Allocate the ping-pong + u16-run scratch once (sized for one `CHUNK` tile at
+    /// the maximum stage width). Reuse the same value across all of a transform's
+    /// tiles to avoid re-zeroing megabytes per tile.
+    #[must_use]
+    pub fn new() -> Self {
+        BatchedScratch {
+            buf_a: vec![0.0f32; CHUNK * MAX_STAGE_CHANNELS],
+            buf_b: vec![0.0f32; CHUNK * MAX_STAGE_CHANNELS],
+            u16: U16RunScratch::new(),
+        }
+    }
+}
+
+impl Default for BatchedScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Run one u16-domain stage over `m` pixels (pixel-major layout).
 #[inline]
 fn run_u16_stage(
@@ -395,15 +430,31 @@ impl BatchedPipeline {
     /// formatter: an 8-bit byte arrives as `win = (byte<<8)|byte`, so the low byte
     /// indexes an `InputCurves8` LUT). `output` is `n * out_ch` u16.
     pub fn eval_16_buffer(&self, input: &[u16], output: &mut [u16], n: usize) {
+        let mut scratch = BatchedScratch::new();
+        self.eval_16_buffer_with(input, output, n, &mut scratch);
+    }
+
+    /// [`Self::eval_16_buffer`] reusing caller-owned [`BatchedScratch`] (allocated
+    /// ONCE per `do_transform` and shared across tiles), so no per-tile ping-pong
+    /// allocation/zeroing. Bit-identical to `eval_16_buffer`.
+    pub fn eval_16_buffer_with(
+        &self,
+        input: &[u16],
+        output: &mut [u16],
+        n: usize,
+        scratch: &mut BatchedScratch,
+    ) {
         let in_ch = self.in_ch;
         let out_ch = self.out_ch;
 
-        // Two ping-pong scratch buffers, each holding CHUNK pixels at the working
-        // width. Allocated once per call (not per pixel).
-        let mut buf_a = vec![0.0f32; CHUNK * MAX_STAGE_CHANNELS];
-        let mut buf_b = vec![0.0f32; CHUNK * MAX_STAGE_CHANNELS];
-        // u16 scratch reused by every fused U16Run (the big lossless lever).
-        let mut u16_scratch = U16RunScratch::new();
+        let BatchedScratch {
+            buf_a,
+            buf_b,
+            u16: u16_scratch,
+        } = scratch;
+        // ONE empty context for the whole eval — hoisted so a `Generic` tone-curve
+        // stage's `eval_float_in` never allocs/drops a `Context` per pixel.
+        let ctx = Context::new();
 
         let mut base = 0usize;
         while base < n {
@@ -413,8 +464,8 @@ impl BatchedPipeline {
             // When the first stage is an 8-bit input-curve LUT, the entry + first
             // stage are fused: index the LUT by the input byte directly. Otherwise
             // From16ToFloat (u16 as f32 / 65535.0), exactly as eval_16.
-            let mut cur = &mut buf_a;
-            let mut nxt = &mut buf_b;
+            let mut cur: &mut Vec<f32> = &mut *buf_a;
+            let mut nxt: &mut Vec<f32> = &mut *buf_b;
             let mut width = in_ch;
             let mut start_stage = 0usize;
 
@@ -447,8 +498,8 @@ impl BatchedPipeline {
             for stage in &self.stages_16[start_stage..] {
                 let stage_out = stage.output_width(width);
                 match stage {
-                    BatchedStage::U16Run(run) => run.eval(cur, nxt, m, &mut u16_scratch),
-                    _ => run_stage(stage, cur, nxt, m, width, stage_out),
+                    BatchedStage::U16Run(run) => run.eval(cur, nxt, m, u16_scratch),
+                    _ => run_stage(stage, cur, nxt, m, width, stage_out, &ctx),
                 }
                 core::mem::swap(&mut cur, &mut nxt);
                 width = stage_out;
@@ -473,18 +524,33 @@ impl BatchedPipeline {
     ///
     /// `input` is `n * in_ch` f32; `output` is `n * out_ch` f32.
     pub fn eval_float_buffer(&self, input: &[f32], output: &mut [f32], n: usize) {
+        let mut scratch = BatchedScratch::new();
+        self.eval_float_buffer_with(input, output, n, &mut scratch);
+    }
+
+    /// [`Self::eval_float_buffer`] reusing caller-owned [`BatchedScratch`] across
+    /// tiles (no per-tile ping-pong allocation). Bit-identical to
+    /// `eval_float_buffer`.
+    pub fn eval_float_buffer_with(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        n: usize,
+        scratch: &mut BatchedScratch,
+    ) {
         let in_ch = self.in_ch;
         let out_ch = self.out_ch;
 
-        let mut buf_a = vec![0.0f32; CHUNK * MAX_STAGE_CHANNELS];
-        let mut buf_b = vec![0.0f32; CHUNK * MAX_STAGE_CHANNELS];
+        let BatchedScratch { buf_a, buf_b, .. } = scratch;
+        // ONE empty context for the whole eval (see `eval_16_buffer`).
+        let ctx = Context::new();
 
         let mut base = 0usize;
         while base < n {
             let m = (n - base).min(CHUNK);
 
-            let mut cur = &mut buf_a;
-            let mut nxt = &mut buf_b;
+            let mut cur: &mut Vec<f32> = &mut *buf_a;
+            let mut nxt: &mut Vec<f32> = &mut *buf_b;
             let mut width = in_ch;
 
             // Entry: straight f32 copy (eval_float's memmove of input_channels).
@@ -495,7 +561,7 @@ impl BatchedPipeline {
 
             for stage in &self.stages_float {
                 let stage_out = stage.output_width(width);
-                run_stage(stage, cur, nxt, m, width, stage_out);
+                run_stage(stage, cur, nxt, m, width, stage_out, &ctx);
                 core::mem::swap(&mut cur, &mut nxt);
                 width = stage_out;
             }
@@ -524,7 +590,9 @@ impl BatchedStage {
 }
 
 /// Run one stage over `m` pixels: read `in_width` channels per pixel from `cur`,
-/// write `out_width` channels per pixel into `nxt` (pixel-major layout).
+/// write `out_width` channels per pixel into `nxt` (pixel-major layout). `ctx` is a
+/// single [`Context`] hoisted for the WHOLE eval so a `Generic` tone-curve stage
+/// never allocates one per channel-per-pixel (see [`run_curve_set`]).
 #[inline]
 fn run_stage(
     stage: &BatchedStage,
@@ -533,6 +601,7 @@ fn run_stage(
     m: usize,
     in_width: usize,
     out_width: usize,
+    ctx: &Context,
 ) {
     match stage {
         BatchedStage::Clut(c) => {
@@ -540,6 +609,21 @@ fn run_stage(
                 let src = &cur[p * in_width..p * in_width + in_width];
                 let dst = &mut nxt[p * out_width..p * out_width + out_width];
                 c.eval(src, dst);
+            }
+        }
+        // A `Generic` tone-curve set: evaluate each channel via `eval_float_in` with
+        // the HOISTED `ctx`, NOT `eval_float` (which calls `Context::new()` — an
+        // alloc+drop — per channel per pixel). With an empty context `eval_float_in`
+        // is byte-for-byte the builtin `eval_float`, so this is bit-identical; it
+        // only removes the per-call context churn. Width is preserved by a curve
+        // set, so `in_width == out_width`.
+        BatchedStage::Generic(Stage::ToneCurves(curves)) => {
+            for p in 0..m {
+                let src = &cur[p * in_width..p * in_width + in_width];
+                let dst = &mut nxt[p * out_width..p * out_width + out_width];
+                for (i, curve) in curves.iter().enumerate() {
+                    dst[i] = curve.eval_float_in(ctx, src[i]);
+                }
             }
         }
         BatchedStage::Generic(s) => {
@@ -703,6 +787,20 @@ enum U16Kind {
     Clut,
 }
 
+/// Whether a `ToneCurves` stage is wholly TABULATED (every channel curve has no
+/// float segment description, `nSegments == 0`). For such a stage the per-pixel
+/// `ToneCurve::eval_float` is `quick_saturate_word(in*65535) -> eval_16 -> /65535`
+/// — it QUANTIZES its f32 input to u16 as its first act, exactly the entry
+/// conversion a [`U16Run`] applies. So a tabulated curve may START a u16 run even
+/// from a free-f32 left boundary (e.g. the sRGB-input curve sitting AFTER a
+/// matrix/Lab stage in an RGB->CMYK link): the fold is a pure memoization of the
+/// float path. A SEGMENTED curve sees CONTINUOUS input (no leading quantization),
+/// so it must NOT start a run from a non-quant boundary — quantizing first would
+/// diverge.
+fn is_tabulated_curve_set(stage: &Stage) -> bool {
+    matches!(stage, Stage::ToneCurves(curves) if curves.iter().all(|c| c.segments().is_empty()))
+}
+
 /// Fuse maximal runs of u16-able stages bounded by 16-bit quantization points into
 /// [`BatchedStage::U16Run`] stages, returning the 16-bit stage list, whether any
 /// run was formed, and whether a run owns stage 0 (so the 8-bit input-curve LUT
@@ -735,9 +833,15 @@ fn split_u16_runs(stages: &[Stage], batched: &[BatchedStage]) -> (Vec<BatchedSta
     let mut leading_owns_first = false;
     let mut i = 0usize;
     while i < n {
-        // A run can begin at i only if i is a u16 member AND boundary i is a quant
-        // point (the run's left edge must be a quantization point).
-        if kinds[i].is_some() && is_quant_boundary(&kinds, i) && roundtrip_ok {
+        // A run can begin at i if i is a u16 member AND its left edge is a valid
+        // run start: either boundary i is a 16-bit quantization point, OR stage i is
+        // a TABULATED tone-curve set (whose `eval_float` quantizes its input itself,
+        // so the run's entry conversion reproduces the float path exactly — see
+        // `is_tabulated_curve_set`). The latter lets a tabulated input curve that is
+        // separated from the CLUT by a matrix/Lab stage join the CLUT's run.
+        let can_start = is_quant_boundary(&kinds, i)
+            || (matches!(kinds[i], Some(U16Kind::Curves)) && is_tabulated_curve_set(&stages[i]));
+        if kinds[i].is_some() && can_start && roundtrip_ok {
             // Extend while the NEXT stage is a u16 member and the boundary BETWEEN
             // them is a quant point (so the run never straddles a free-f32 value).
             let mut j = i;
@@ -991,6 +1095,170 @@ mod tests {
 
         let mut input = Vec::new();
         let vals: Vec<u16> = vec![0, 1, 7, 255, 4369, 30000, 60000, 0xFFFF];
+        for &r in &vals {
+            for &g in &vals {
+                for &b in &vals {
+                    input.extend_from_slice(&[r, g, b]);
+                }
+            }
+        }
+        let n = input.len() / 3;
+        let mut out = vec![0u16; n * 4];
+        batched.eval_16_buffer(&input, &mut out, n);
+        for i in 0..n {
+            let win = &input[i * 3..i * 3 + 3];
+            assert_eq!(&out[i * 4..i * 4 + 4], &p.eval_16(win)[..], "pixel {i}");
+        }
+    }
+
+    /// A TABULATED curve separated from the CLUT by a matrix/Lab stage (a free-f32
+    /// upstream boundary) must STILL be absorbed into the u16 run that owns the
+    /// CLUT: a tabulated curve's `eval_float` quantizes its input via
+    /// `quick_saturate_word(in*65535)` — exactly the run's entry conversion — so the
+    /// fold is a pure memoization. This is the RGB8->CMYK8 sRGB-input shape
+    /// (Curves -> Matrix -> Xyz2Lab -> Curves(tabulated) -> CLUT -> Curves), where
+    /// the post-Lab tabulated curve used to run per-pixel via `eval_float`.
+    #[test]
+    fn tabulated_curve_after_matrix_absorbed_into_u16_run() {
+        use crate::curve::build_tabulated_16;
+
+        let mut p = Pipeline::new(3, 4);
+        // A matrix with a non-trivial mix so the post-matrix domain is genuinely
+        // continuous (no per-channel structure to exploit).
+        p.insert_stage_at_end(Stage::Matrix {
+            rows: 3,
+            cols: 3,
+            m: vec![0.9, 0.05, 0.05, 0.1, 0.8, 0.1, 0.05, 0.15, 0.8],
+            offset: None,
+        })
+        .unwrap();
+        // A TABULATED curve (segments empty) right before the CLUT. Its input
+        // boundary (matrix output) is free f32 — NOT a quant point — yet it is
+        // u16-foldable because it is tabulated.
+        let mk_tab = |bias: u32| {
+            let t: Vec<u16> = (0u32..256)
+                .map(|i| (((i * 257 + bias) * 251) & 0xffff) as u16)
+                .collect();
+            build_tabulated_16(&t)
+        };
+        p.insert_stage_at_end(Stage::ToneCurves(vec![mk_tab(0), mk_tab(7), mk_tab(13)]))
+            .unwrap();
+        let n_samples = [3u32, 3, 3];
+        let params = InterpParams::new(&n_samples, 3, 4);
+        let mut table = vec![0u16; 27 * 4];
+        for (i, v) in table.iter_mut().enumerate() {
+            *v = ((i * 2417 + 991) & 0xffff) as u16;
+        }
+        p.insert_stage_at_end(Stage::Clut(Clut {
+            table: ClutTable::U16(table),
+            params,
+            is_trilinear: false,
+            implements_identity: false,
+            resolved: ResolvedInterp::default(),
+        }))
+        .unwrap();
+
+        let batched = try_optimize(&p, TYPE_RGB_8, TYPE_CMYK_16).expect("batched built");
+        assert!(
+            batched.uses_u16_chain(),
+            "tabulated curve before CLUT must form a u16 run"
+        );
+        // The tabulated curve + CLUT must be in ONE u16 run (the curve ABSORBED),
+        // so the 16-bit stage list is exactly [Matrix(Generic), U16Run{Curves,Clut}]
+        // — the curve does NOT survive as its own Generic stage.
+        assert_eq!(
+            batched.stages_16.len(),
+            2,
+            "expected [Matrix, U16Run]; the curve must be folded INTO the run"
+        );
+        match (&batched.stages_16[0], &batched.stages_16[1]) {
+            (BatchedStage::Generic(Stage::Matrix { .. }), BatchedStage::U16Run(run)) => {
+                assert_eq!(run.stages.len(), 2, "run must hold the curve + the CLUT");
+                assert!(
+                    matches!(run.stages[0], U16Stage::Curves(_)),
+                    "the absorbed tabulated curve must be the run's first u16 stage"
+                );
+                assert!(
+                    matches!(run.stages[1], U16Stage::Clut(_)),
+                    "the CLUT must follow the absorbed curve in the run"
+                );
+            }
+            _ => panic!("expected [Matrix(Generic), U16Run] with the curve absorbed"),
+        }
+
+        // Bit-identity vs eval_16 over a 16-bit sweep.
+        let mut input = Vec::new();
+        let mut vals: Vec<u16> = (0u16..=20).collect();
+        for v in (100u16..=65535).step_by(3037) {
+            vals.push(v);
+        }
+        vals.push(0xFFFF);
+        for &r in &vals {
+            for &g in &vals {
+                for &b in &vals {
+                    input.extend_from_slice(&[r, g, b]);
+                }
+            }
+        }
+        let n = input.len() / 3;
+        let mut out = vec![0u16; n * 4];
+        batched.eval_16_buffer(&input, &mut out, n);
+        for i in 0..n {
+            let win = &input[i * 3..i * 3 + 3];
+            assert_eq!(&out[i * 4..i * 4 + 4], &p.eval_16(win)[..], "pixel {i}");
+        }
+    }
+
+    /// A SEGMENTED curve separated from the CLUT by a matrix (free-f32 boundary)
+    /// must NOT be absorbed into the u16 run: a segmented curve sees CONTINUOUS
+    /// input, so quantizing it at the run entry would diverge from the float path.
+    /// It stays `Generic`; the CLUT (+ any tail) still forms its own run.
+    #[test]
+    fn segmented_curve_after_matrix_not_absorbed() {
+        use crate::curve::build_gamma;
+
+        let mut p = Pipeline::new(3, 4);
+        p.insert_stage_at_end(Stage::Matrix {
+            rows: 3,
+            cols: 3,
+            m: vec![0.9, 0.05, 0.05, 0.1, 0.8, 0.1, 0.05, 0.15, 0.8],
+            offset: None,
+        })
+        .unwrap();
+        // Segmented (parametric) curves — continuous input domain.
+        p.insert_stage_at_end(Stage::ToneCurves(vec![
+            build_gamma(2.2),
+            build_gamma(1.8),
+            build_gamma(2.4),
+        ]))
+        .unwrap();
+        let n_samples = [3u32, 3, 3];
+        let params = InterpParams::new(&n_samples, 3, 4);
+        let mut table = vec![0u16; 27 * 4];
+        for (i, v) in table.iter_mut().enumerate() {
+            *v = ((i * 2417 + 991) & 0xffff) as u16;
+        }
+        p.insert_stage_at_end(Stage::Clut(Clut {
+            table: ClutTable::U16(table),
+            params,
+            is_trilinear: false,
+            implements_identity: false,
+            resolved: ResolvedInterp::default(),
+        }))
+        .unwrap();
+
+        let batched = try_optimize(&p, TYPE_CMYK_16, TYPE_CMYK_16).expect("built");
+        // The segmented curve must remain Generic (not folded into a run). The CLUT
+        // alone forms a run. Stage list: [Matrix(Generic), Curves(Generic), U16Run].
+        match &batched.stages_16[1] {
+            BatchedStage::Generic(Stage::ToneCurves(_)) => {}
+            BatchedStage::U16Run(_) => panic!("segmented curve must not be folded into a u16 run"),
+            _ => panic!("segmented curve must stay a Generic ToneCurves stage"),
+        }
+
+        // Bit-identity vs eval_16 still holds (the segmented curve runs per-pixel).
+        let mut input = Vec::new();
+        let vals: Vec<u16> = vec![0, 1, 255, 4369, 30000, 60000, 0xFFFF];
         for &r in &vals {
             for &g in &vals {
                 for &b in &vals {
