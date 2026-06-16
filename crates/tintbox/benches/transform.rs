@@ -248,7 +248,13 @@ fn bench(c: &mut Criterion) {
 
         let mut group = c.benchmark_group(sc.name);
         group.throughput(Throughput::Elements(N_PIXELS as u64));
-        group.sample_size(20);
+        // Statistical rigor: 100 samples + a long measurement/warm-up so criterion
+        // reports tight confidence intervals (the 20-sample config could not
+        // distinguish a real gain from run-to-run noise). Run only on a QUIET
+        // machine — background CPU load dominates these medians otherwise.
+        group.sample_size(100);
+        group.measurement_time(std::time::Duration::from_secs(12));
+        group.warm_up_time(std::time::Duration::from_secs(3));
 
         group.bench_function(BenchmarkId::new(sc.name, "tintbox-Accurate"), |b| {
             b.iter(|| {
