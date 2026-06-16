@@ -317,6 +317,23 @@ impl Pipeline {
     /// constructs+drops an empty [`Context`] per channel per pixel. With an empty
     /// `ctx` this is byte-for-byte the builtin [`eval_float`](Self::eval_float).
     pub fn eval_float_in(&self, ctx: &crate::context::Context, input: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; self.output_channels];
+        self.eval_float_in_into(ctx, input, &mut out);
+        out
+    }
+
+    /// Allocation-free [`eval_float_in`](Self::eval_float_in): writes the
+    /// `output_channels` result floats into `out[..output_channels]` instead of
+    /// returning a fresh `Vec`. Byte-for-byte identical to
+    /// [`eval_float_in`](Self::eval_float_in) — the only difference is the
+    /// destination. This is the per-pixel hot-path entry; reusing one caller-owned
+    /// buffer across pixels removes the per-pixel heap `calloc`/`free`.
+    pub fn eval_float_in_into(
+        &self,
+        ctx: &crate::context::Context,
+        input: &[f32],
+        out: &mut [f32],
+    ) {
         let mut storage = [[0.0f32; MAX_STAGE_CHANNELS]; 2];
         let mut phase = 0usize;
 
@@ -336,7 +353,7 @@ impl Pipeline {
             phase = next;
         }
 
-        storage[phase][..self.output_channels].to_vec()
+        out[..self.output_channels].copy_from_slice(&storage[phase][..self.output_channels]);
     }
 
     /// Evaluate on a 16-bit basis (lcms2 `_LUTeval16`, cmslut.c:1329-1349).
@@ -354,6 +371,18 @@ impl Pipeline {
     /// threading one `ctx` from the per-pixel loop removes the per-channel
     /// per-pixel [`Context`](crate::context::Context) construct/drop.
     pub fn eval_16_in(&self, ctx: &crate::context::Context, input: &[u16]) -> Vec<u16> {
+        let mut out = vec![0u16; self.output_channels];
+        self.eval_16_in_into(ctx, input, &mut out);
+        out
+    }
+
+    /// Allocation-free [`eval_16_in`](Self::eval_16_in): writes the
+    /// `output_channels` result words into `out[..output_channels]` instead of
+    /// returning a fresh `Vec`. Byte-for-byte identical to
+    /// [`eval_16_in`](Self::eval_16_in) — the only difference is the destination.
+    /// This is the per-pixel hot-path entry; reusing one caller-owned buffer across
+    /// pixels removes the per-pixel heap `calloc`/`free`.
+    pub fn eval_16_in_into(&self, ctx: &crate::context::Context, input: &[u16], out: &mut [u16]) {
         let mut storage = [[0.0f32; MAX_STAGE_CHANNELS]; 2];
         let mut phase = 0usize;
 
@@ -377,11 +406,9 @@ impl Pipeline {
 
         // FromFloatTo16(&Storage[phase], Out, OutputChannels): In[i] is f32 and
         // 65535.0 is f64, so the multiply widens to f64 before saturation.
-        let mut out = vec![0u16; self.output_channels];
-        for (i, o) in out.iter_mut().enumerate() {
+        for (i, o) in out[..self.output_channels].iter_mut().enumerate() {
             *o = Lcms2Floor::quick_saturate_word(storage[phase][i] as f64 * 65535.0);
         }
-        out
     }
 }
 
@@ -547,5 +574,49 @@ mod pre_optimize_tests {
         let before = p.clone();
         p.pre_optimize();
         assert_eq!(p, before, "no adjacent matrices ⇒ no change");
+    }
+
+    /// The allocation-free `_into` evals must produce BYTE-FOR-BYTE the same result
+    /// as the `Vec`-returning `eval_*_in` over a non-trivial curves/matrix/curves
+    /// pipeline and a sweep of inputs. The `_into` form is the per-pixel hot path,
+    /// so any divergence here would be a transform-wide divergence from lcms2.
+    #[test]
+    fn eval_into_matches_vec_returning_bit_for_bit() {
+        let m = [0.9, 0.1, 0.0, 0.05, 0.85, 0.1, 0.0, 0.2, 0.8];
+        let mut p = Pipeline::new(3, 3);
+        p.insert_stage_at_end(curves3()).unwrap();
+        p.insert_stage_at_end(matrix(m)).unwrap();
+        p.insert_stage_at_end(curves3()).unwrap();
+
+        let ctx = crate::context::Context::new();
+        for &t in &[0u16, 1, 257, 12345, 32768, 50000, 65534, 65535] {
+            let win = [t, 65535 - t, t / 2 + 1];
+
+            let want16 = p.eval_16_in(&ctx, &win);
+            let mut got16 = [0u16; MAX_STAGE_CHANNELS];
+            p.eval_16_in_into(&ctx, &win, &mut got16);
+            assert_eq!(
+                &got16[..p.output_channels],
+                &want16[..],
+                "eval_16_in_into diverged at {t}"
+            );
+
+            let fin = [
+                t as f32 / 65535.0,
+                (65535 - t) as f32 / 65535.0,
+                (t / 2 + 1) as f32 / 65535.0,
+            ];
+            let wantf = p.eval_float_in(&ctx, &fin);
+            let mut gotf = [0f32; MAX_STAGE_CHANNELS];
+            p.eval_float_in_into(&ctx, &fin, &mut gotf);
+            assert_eq!(
+                gotf[..p.output_channels]
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>(),
+                wantf.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "eval_float_in_into diverged at {t}"
+            );
+        }
     }
 }

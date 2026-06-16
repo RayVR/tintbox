@@ -12,7 +12,7 @@
 
 use std::time::Instant;
 
-use tintbox::format::decode::{TYPE_CMYK_16, TYPE_CMYK_8, TYPE_RGB_16, TYPE_RGB_8};
+use tintbox::format::decode::{TYPE_CMYK_16, TYPE_CMYK_8, TYPE_LAB_16, TYPE_RGB_16, TYPE_RGB_8};
 use tintbox::opt::OptimizationStrategy;
 use tintbox::prelude::*;
 use tintbox::profile::{save_to_mem, virtuals::build_srgb_profile, RenderingIntent};
@@ -42,6 +42,7 @@ fn main() {
     let strat = strategy(&args.next().unwrap_or_else(|| "fast".into()));
 
     let srgb = save_to_mem(&build_srgb_profile()).expect("srgb bytes");
+    let lab4 = save_to_mem(&tintbox::profile::virtuals::build_lab4_profile()).expect("lab4 bytes");
     let test1 = testbed("test1.icc");
     let test2 = testbed("test2.icc");
 
@@ -50,6 +51,11 @@ fn main() {
         "rgb8_cmyk8" => (&srgb, &test1, TYPE_RGB_8, TYPE_CMYK_8, 3, 4),
         "rgb16_cmyk16" => (&srgb, &test1, TYPE_RGB_16, TYPE_CMYK_16, 6, 8),
         "cmyk8_cmyk8" => (&test1, &test2, TYPE_CMYK_8, TYPE_CMYK_8, 4, 4),
+        "cmyk16_cmyk16" => (&test1, &test2, TYPE_CMYK_16, TYPE_CMYK_16, 8, 8),
+        // Lab paths: sRGB -> Lab (XYZ->Lab cube-root on output) and Lab -> CMYK
+        // (the real Lab-to-ink separation; Lab->XYZ inverse cube-root on input).
+        "rgb8_lab16" => (&srgb, &lab4, TYPE_RGB_8, TYPE_LAB_16, 3, 6),
+        "lab16_cmyk8" => (&lab4, &test1, TYPE_LAB_16, TYPE_CMYK_8, 6, 4),
         other => panic!("unknown scenario {other}"),
     };
 
