@@ -636,6 +636,8 @@ impl Transform {
             "output buffer size mismatch"
         );
 
+        // One empty `Context` hoisted above the per-pixel loop (see `do_transform`).
+        let ctx = Context::new();
         for i in 0..n_pixels {
             let pix = &input[i * in_ch..i * in_ch + in_ch];
             // Gamut check (lcms2 `FloatXFORM`, cmsxform.c:288-312): all channels get
@@ -644,7 +646,7 @@ impl Transform {
                 let g_in = gamut.input_channels;
                 let mut padded = [0f32; MAX_CHANNELS];
                 padded[..in_ch].copy_from_slice(pix);
-                let out_of_gamut = gamut.eval_float(&padded[..g_in])[0];
+                let out_of_gamut = gamut.eval_float_in(&ctx, &padded[..g_in])[0];
                 if out_of_gamut > 0.0 {
                     for c in 0..out_ch {
                         output[i * out_ch + c] = self.alarm_codes[c] as f32 / 65535.0_f32;
@@ -652,7 +654,7 @@ impl Transform {
                     continue;
                 }
             }
-            let res = self.lut.eval_float(pix);
+            let res = self.lut.eval_float_in(&ctx, pix);
             output[i * out_ch..i * out_ch + out_ch].copy_from_slice(&res);
         }
     }
@@ -671,6 +673,8 @@ impl Transform {
             "output buffer size mismatch"
         );
 
+        // One empty `Context` hoisted above the per-pixel loop (see `do_transform`).
+        let ctx = Context::new();
         for i in 0..n_pixels {
             let pix = &input[i * in_ch..i * in_ch + in_ch];
             // Gamut check (lcms2 `TransformOnePixelWithGamutCheck`,
@@ -679,14 +683,14 @@ impl Transform {
                 let g_in = gamut.input_channels;
                 let mut padded = [0u16; MAX_CHANNELS];
                 padded[..in_ch].copy_from_slice(pix);
-                let marker = gamut.eval_16(&padded[..g_in])[0];
+                let marker = gamut.eval_16_in(&ctx, &padded[..g_in])[0];
                 if marker >= 1 {
                     output[i * out_ch..i * out_ch + out_ch]
                         .copy_from_slice(&self.alarm_codes[..out_ch]);
                     continue;
                 }
             }
-            let res = self.lut.eval_16(pix);
+            let res = self.lut.eval_16_in(&ctx, pix);
             output[i * out_ch..i * out_ch + out_ch].copy_from_slice(&res);
         }
     }
@@ -883,6 +887,14 @@ impl Transform {
             }
         }
 
+        // One empty `Context` hoisted ABOVE the per-pixel loop. The default
+        // `Accurate` path evaluates the linked pipeline per pixel via `eval_*_in`;
+        // threading this single context stops `Stage::eval`'s tone-curve arm from
+        // constructing+dropping an empty `Context` per channel per pixel (measured
+        // ~7-17% of a curve-heavy CMYK transform). An empty context routes every
+        // curve through the builtin path, so output is byte-for-byte unchanged.
+        let ctx = Context::new();
+
         if fmts.is_float {
             let from_input = fmts.from_input_float.as_ref().unwrap();
             let to_output = fmts.to_output_float.as_ref().unwrap();
@@ -897,18 +909,18 @@ impl Transform {
                 // scaled to float, else run the LUT normally.
                 if let Some(gamut) = &self.gamut_check {
                     let g_in = gamut.input_channels;
-                    let out_of_gamut = gamut.eval_float(&fin[..g_in])[0];
+                    let out_of_gamut = gamut.eval_float_in(&ctx, &fin[..g_in])[0];
                     if out_of_gamut > 0.0 {
                         for (slot, &code) in fout.iter_mut().zip(self.alarm_codes.iter()) {
                             *slot = code as f32 / 65535.0_f32;
                         }
                     } else {
-                        let res = self.lut.eval_float(&fin[..in_ch]);
+                        let res = self.lut.eval_float_in(&ctx, &fin[..in_ch]);
                         fout[..out_ch].copy_from_slice(&res);
                     }
                 } else {
                     // Abstract eval (no inlined optimization — see module docs).
-                    let res = self.lut.eval_float(&fin[..in_ch]);
+                    let res = self.lut.eval_float_in(&ctx, &fin[..in_ch]);
                     fout[..out_ch].copy_from_slice(&res);
                 }
                 {
@@ -937,11 +949,11 @@ impl Transform {
                 // of running the LUT.
                 if let Some(gamut) = &self.gamut_check {
                     let g_in = gamut.input_channels;
-                    let marker = gamut.eval_16(&win[..g_in])[0];
+                    let marker = gamut.eval_16_in(&ctx, &win[..g_in])[0];
                     if marker >= 1 {
                         wout[..out_ch].copy_from_slice(&self.alarm_codes[..out_ch]);
                     } else {
-                        let res = self.lut.eval_16(&win[..in_ch]);
+                        let res = self.lut.eval_16_in(&ctx, &win[..in_ch]);
                         wout[..out_ch].copy_from_slice(&res);
                     }
                 } else {
@@ -975,7 +987,7 @@ impl Transform {
                         // gamut-check pipeline, which batched declines) falls back
                         // to the bit-identical in-place eval.
                         OptimizedEval::Pipeline | OptimizedEval::Batched(_) => {
-                            let res = self.lut.eval_16(&win[..in_ch]);
+                            let res = self.lut.eval_16_in(&ctx, &win[..in_ch]);
                             wout[..out_ch].copy_from_slice(&res);
                         }
                     }

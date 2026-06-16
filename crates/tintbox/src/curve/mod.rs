@@ -19,6 +19,17 @@ pub use parametric::eval_parametric;
 use crate::compat::floor::{FloorStrategy, Lcms2Floor};
 use crate::context::Context;
 
+thread_local! {
+    /// A reusable empty [`Context`] for the no-context convenience evaluators
+    /// ([`ToneCurve::eval_float`]/[`ToneCurve::eval_segmented`]). Holding one per
+    /// thread avoids the per-call `Context::new()` construct+drop these wrappers
+    /// otherwise pay; an empty context routes every parametric segment through the
+    /// builtin path, so the result is byte-for-byte unchanged. (A plain `static`
+    /// would need `Context<'static>: Sync`, which the `&dyn Logger` field denies;
+    /// a `thread_local!` sidesteps the bound with no signature change.)
+    static EMPTY_CONTEXT: Context<'static> = Context::new();
+}
+
 /// lcms2 `MINUS_INF` (cmsgamma.c:41): the *float* literal `-1E22F`.
 const MINUS_INF: f32 = -1E22_f32;
 /// lcms2 `PLUS_INF` (cmsgamma.c:42): the *float* literal `+1E22F`.
@@ -307,7 +318,7 @@ impl ToneCurve {
     /// otherwise the parametric evaluator). An infinite result clamps to `±1E22`.
     /// Returns `MINUS_INF` when no segment matches.
     pub fn eval_segmented(&self, r: f64) -> f64 {
-        self.eval_segmented_in(&Context::new(), r)
+        EMPTY_CONTEXT.with(|ctx| self.eval_segmented_in(ctx, r))
     }
 
     /// Context-aware [`eval_segmented`](Self::eval_segmented): parametric segments
@@ -347,7 +358,7 @@ impl ToneCurve {
     /// table; otherwise the segmented description is evaluated directly (the f32
     /// input widens to f64 for [`eval_segmented`], then the result narrows to f32).
     pub fn eval_float(&self, v: f32) -> f32 {
-        self.eval_float_in(&Context::new(), v)
+        EMPTY_CONTEXT.with(|ctx| self.eval_float_in(ctx, v))
     }
 
     /// Context-aware [`eval_float`](Self::eval_float): a segmented curve carrying

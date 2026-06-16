@@ -8,6 +8,7 @@
 
 use crate::color::{CIELab, CIEXYZ};
 use crate::compat::floor::{FloorStrategy, Lcms2Floor};
+use crate::context::Context;
 use crate::curve::ToneCurve;
 use crate::pcs::{lab_to_xyz, xyz_to_lab};
 use crate::profile::tag::NamedColorList;
@@ -121,11 +122,21 @@ impl Stage {
     /// clamping is performed here (matching the C callbacks, which clamp only at
     /// the 16-bit boundary).
     pub fn eval(&self, input: &[f32], output: &mut [f32]) {
+        self.eval_in(&Context::new(), input, output);
+    }
+
+    /// Context-aware [`eval`](Self::eval): the tone-curve arm routes through
+    /// [`ToneCurve::eval_float_in`] so a custom parametric segment uses its
+    /// registered plugin (builtins still win). With an empty [`Context`] this is
+    /// byte-for-byte the builtin path. Threading one hoisted `ctx` from the
+    /// per-pixel eval loop keeps the curve arm from constructing+dropping an
+    /// empty [`Context`] per channel per pixel (the default `Accurate` path).
+    pub fn eval_in(&self, ctx: &Context, input: &[f32], output: &mut [f32]) {
         match self {
             // lcms2 EvaluateCurves (cmslut.c:167-184).
             Stage::ToneCurves(curves) => {
                 for (i, curve) in curves.iter().enumerate() {
-                    output[i] = curve.eval_float(input[i]);
+                    output[i] = curve.eval_float_in(ctx, input[i]);
                 }
             }
 

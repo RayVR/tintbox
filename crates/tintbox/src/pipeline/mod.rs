@@ -308,6 +308,15 @@ impl Pipeline {
     /// the final buffer. With no stages this is a straight `memmove` of the
     /// truncated input (matching the C, which copies `min` widths implicitly).
     pub fn eval_float(&self, input: &[f32]) -> Vec<f32> {
+        self.eval_float_in(&crate::context::Context::new(), input)
+    }
+
+    /// Context-aware [`eval_float`](Self::eval_float): the hoisted `ctx` flows into
+    /// each [`Stage::eval_in`], so a tone-curve stage carrying a custom parametric
+    /// segment uses its registered plugin and — crucially for the hot path — never
+    /// constructs+drops an empty [`Context`] per channel per pixel. With an empty
+    /// `ctx` this is byte-for-byte the builtin [`eval_float`](Self::eval_float).
+    pub fn eval_float_in(&self, ctx: &crate::context::Context, input: &[f32]) -> Vec<f32> {
         let mut storage = [[0.0f32; MAX_STAGE_CHANNELS]; 2];
         let mut phase = 0usize;
 
@@ -323,7 +332,7 @@ impl Pipeline {
                 let (a, b) = storage.split_at_mut(1);
                 (&b[0], &mut a[0])
             };
-            stage.eval(&cur[..], &mut nxt[..]);
+            stage.eval_in(ctx, &cur[..], &mut nxt[..]);
             phase = next;
         }
 
@@ -336,6 +345,15 @@ impl Pipeline {
     /// run in the float domain, and `FromFloatTo16` converts the outputs
     /// (`quick_saturate_word(x as f64 * 65535.0)`).
     pub fn eval_16(&self, input: &[u16]) -> Vec<u16> {
+        self.eval_16_in(&crate::context::Context::new(), input)
+    }
+
+    /// Context-aware [`eval_16`](Self::eval_16): the hoisted `ctx` flows into each
+    /// [`Stage::eval_in`] (see [`eval_float_in`](Self::eval_float_in)). With an
+    /// empty `ctx` this is byte-for-byte the builtin [`eval_16`](Self::eval_16);
+    /// threading one `ctx` from the per-pixel loop removes the per-channel
+    /// per-pixel [`Context`](crate::context::Context) construct/drop.
+    pub fn eval_16_in(&self, ctx: &crate::context::Context, input: &[u16]) -> Vec<u16> {
         let mut storage = [[0.0f32; MAX_STAGE_CHANNELS]; 2];
         let mut phase = 0usize;
 
@@ -353,7 +371,7 @@ impl Pipeline {
                 let (a, b) = storage.split_at_mut(1);
                 (&b[0], &mut a[0])
             };
-            stage.eval(&cur[..], &mut nxt[..]);
+            stage.eval_in(ctx, &cur[..], &mut nxt[..]);
             phase = next;
         }
 

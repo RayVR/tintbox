@@ -179,6 +179,23 @@ fn tone_curves_stage_float_and_16() {
             let exp_16 = tintbox_oracle::pipeline_curves_eval16(n_curves, tbl_len, &tables, &in16)
                 .expect("oracle curves 16");
             assert_eq!(got_16, exp_16, "curves 16 len={tbl_len} trial={trial}");
+
+            // The context-threaded eval (the default `Accurate` transform path)
+            // must be byte-for-byte the no-context wrapper with an empty context.
+            let ctx = tintbox::context::Context::new();
+            let got_f_in = pl.eval_float_in(&ctx, &inf);
+            for i in 0..n_curves {
+                assert_eq!(
+                    got_f_in[i].to_bits(),
+                    got_f[i].to_bits(),
+                    "eval_float_in vs eval_float len={tbl_len} trial={trial} out={i}"
+                );
+            }
+            assert_eq!(
+                pl.eval_16_in(&ctx, &in16),
+                got_16,
+                "eval_16_in vs eval_16 len={tbl_len} trial={trial}"
+            );
         }
     }
 }
