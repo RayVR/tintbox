@@ -154,6 +154,75 @@ carry a proprietary spot-ink or spectral tag through a profile round-trip, or
 `set_optimizer` to swap in a hand-tuned fast path while every other transform
 keeps using the verified default.
 
+## Performance
+
+Everything below is **lossless and byte-identical to lcms2** — these are ways to
+compute the same numbers faster, never to compute different (lossy) ones.
+
+The default `Accurate` strategy evaluates the full pipeline per pixel and is the
+fastest *correct* path here — faster than lcms2 run with `cmsFLAGS_NOOPTIMIZE`.
+The only thing faster is lcms2's **default** optimizer, which bakes the pipeline
+into one coarse CLUT (a single lookup per pixel) at the cost of posterizing
+shadow detail; if you knowingly want that trade, `OptimizationStrategy::Lcms2Compat`
+reproduces it bit-for-bit. Otherwise, three composable, lossless levers:
+
+### 1. Batch your calls (free, biggest single-thread win)
+`do_transform` is fastest over large buffers — convert a whole image/scanline in
+one call, not pixel-by-pixel. The internal fast path engages at ≥256 pixels per
+call; below that it transparently falls back to a per-pixel path that is never
+slower than the default. So small/odd calls are safe, but bulk calls are ~1.5–2.4×
+faster.
+
+### 2. Thread it yourself (the big multiplier, ~linear with cores)
+Color transforms are embarrassingly parallel — every pixel is independent — so
+splitting a buffer across cores is near-linear *and* bit-identical. **tintbox
+does not thread internally on purpose**: that's the consumer's call, so an app
+that already parallelizes (per page/tile/job) never gets a thread explosion. A
+`Transform` is `Send + Sync` (compile-time asserted), so share one across threads:
+
+```rust
+use rayon::prelude::*;
+out.par_chunks_mut(out_stride * ROWS)
+   .zip(input.par_chunks(in_stride * ROWS))
+   .for_each(|(o, i)| xform.do_transform(i, o, i.len() / in_stride));
+```
+
+### 3. SIMD (`simd` feature, opt-in, composes per-thread)
+```toml
+tintbox = { version = "0.1", features = ["simd"] }
+```
+Bit-identical SIMD kernels (via the safe `wide` crate) for the 3×3 matrix and the
+integer tetrahedral interpolation. The crate stays `#![forbid(unsafe_code)]` and
+the cube-root / table-gather parts stay scalar (no bit-exact vector form). It's a
+modest multiplier that stacks on top of threading.
+
+**Important — you must enable the CPU's wide SIMD at *build* time, or it stays
+narrow.** `wide` selects instructions at compile time (a safe-API crate can't do
+runtime CPU detection), and the default `x86-64` target only guarantees SSE2
+(128-bit). To get AVX2 (256-bit) lanes:
+
+```bash
+# self-hosted: build for this machine
+RUSTFLAGS="-C target-cpu=native"    cargo build --release --features simd
+# portable to modern x86 (AVX2 mandated by the v3 level)
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --features simd
+# wasm: SIMD is always 128-bit (simd128)
+RUSTFLAGS="-C target-feature=+simd128" cargo build --release --features simd \
+  --target wasm32-unknown-unknown
+```
+
+Caveats: a binary built with `+avx2`/`v3` **requires** that CPU (it will `SIGILL`
+on older ones) — use `target-cpu=native` for self-hosted, `x86-64-v3` for
+portable-to-modern, or plain `x86-64` (default, SSE2) for maximum compatibility.
+Bit-identity holds with `+avx2` (the kernels avoid FMA/`mul_add`; don't add
+fast-math). A single runtime-adaptive binary would need a multiversioning crate
+(extra `unsafe` dependency, no wasm) and usually isn't worth it.
+
+Rough scale on this machine (Apple M2 Max, NEON 128-bit): SIMD adds ~1.1–1.16× to
+the lossless paths; x86 with AVX2 (true 256-bit) should roughly double the lane
+width for the vectorized parts. So a threaded + SIMD consumer sees on the order of
+**~10×+ over single-threaded scalar, every byte still identical to lcms2.**
+
 ## Building & testing
 
 The workspace has two crates: `tintbox` (the library) and `tintbox-oracle` (test-only,
