@@ -716,24 +716,32 @@ impl Transform {
         let in_stride = pixel_bytes(fmts.in_fmt);
         let out_stride = pixel_bytes(fmts.out_fmt);
 
-        // The batched eval's ping-pong scratch, allocated ONCE here and reused
-        // across every tile (the eval re-tiles internally at CHUNK == TILE). This
-        // removes the per-tile `vec![0; CHUNK*MAX_STAGE_CHANNELS]` zeroing that
-        // otherwise dominates the profile as `__bzero`.
-        let mut eval_scratch = crate::opt::batched::BatchedScratch::new();
+        // Size the per-call tile to the ACTUAL work, not the full TILE. A small call
+        // (the batched path only fires at all for n_pixels >= BATCHED_THRESHOLD, but
+        // that threshold is well below TILE) must not allocate+zero a full
+        // TILE-wide channel buffer + scratch — that per-call overhead is exactly
+        // what made AccurateFast catastrophic for small calls. `tile` pixels of
+        // scratch are allocated; the eval re-tiles internally at `min(CHUNK, tile)`.
+        let tile = n_pixels.min(TILE);
+
+        // The batched eval's ping-pong scratch, allocated ONCE here (right-sized to
+        // `tile`) and reused across every tile. This removes the per-tile
+        // `vec![0; CHUNK*MAX_STAGE_CHANNELS]` zeroing that otherwise dominates the
+        // profile as `__bzero`.
+        let mut eval_scratch = crate::opt::batched::BatchedScratch::with_capacity(tile);
 
         if fmts.is_float {
             let from_input = fmts.from_input_float.as_ref().unwrap();
             let to_output = fmts.to_output_float.as_ref().unwrap();
             // Contiguous channel scratch for one tile (in/out widths).
-            let mut chan_in = vec![0f32; TILE * in_ch];
-            let mut chan_out = vec![0f32; TILE * out_ch];
+            let mut chan_in = vec![0f32; tile * in_ch];
+            let mut chan_out = vec![0f32; tile * out_ch];
             // Per-pixel unpack target (the formatter writes MAX_CHANNELS slots).
             let mut fin = [0f32; MAX_CHANNELS];
 
             let mut base = 0usize;
             while base < n_pixels {
-                let m = (n_pixels - base).min(TILE);
+                let m = (n_pixels - base).min(tile);
                 // Unpack the tile into the contiguous channel buffer.
                 for p in 0..m {
                     let in_pixel =
@@ -768,13 +776,13 @@ impl Transform {
         } else {
             let from_input = fmts.from_input16.as_ref().unwrap();
             let to_output = fmts.to_output16.as_ref().unwrap();
-            let mut chan_in = vec![0u16; TILE * in_ch];
-            let mut chan_out = vec![0u16; TILE * out_ch];
+            let mut chan_in = vec![0u16; tile * in_ch];
+            let mut chan_out = vec![0u16; tile * out_ch];
             let mut win = [0u16; MAX_CHANNELS];
 
             let mut base = 0usize;
             while base < n_pixels {
-                let m = (n_pixels - base).min(TILE);
+                let m = (n_pixels - base).min(tile);
                 for p in 0..m {
                     let in_pixel =
                         &input[(base + p) * in_stride..(base + p) * in_stride + in_stride];
@@ -822,6 +830,20 @@ impl Transform {
     /// # Panics
     /// Panics if the transform was not built with formatters, or if `input` /
     /// `output` are too small for `n_pixels` packed pixels of the in/out formats.
+    /// Minimum `n_pixels` for a `do_transform` call to use the batched general/CLUT
+    /// fast path ([`Transform::do_transform_batched`]).
+    ///
+    /// Below this width a call routes to the per-pixel `eval_16`/`eval_float` (the
+    /// bit-identical Accurate path), so a small call (a renderer's scanline/tile/
+    /// single pixel) never pays the batched per-call setup (right-sized scratch
+    /// alloc + unpack/pack bookkeeping). MEASURED via `examples/profile_transform`'s
+    /// chunk-size sweep: at and above this width AccurateFast (batched) is `>=`
+    /// Accurate at every chunk size while still winning big on large buffers; below
+    /// it the per-pixel fallback is at parity with Accurate (it IS the Accurate
+    /// path). 256 is the smallest power-of-two tile that clears Accurate's
+    /// throughput in the sweep with margin.
+    const BATCHED_THRESHOLD: usize = 256;
+
     pub fn do_transform(&self, input: &[u8], output: &mut [u8], n_pixels: usize) {
         let fmts = self
             .formatters
@@ -846,7 +868,15 @@ impl Transform {
         // CHUNKS so the CLUT interpolator + input curves are resolved once and the
         // intermediate buffers stay cache-resident. Only taken when there is no
         // gamut-check pipeline (batched never fires for proofing transforms).
-        if self.gamut_check.is_none() {
+        // The batched machinery (right-sized scratch alloc + unpack-into-contiguous-
+        // buffer + stage-by-stage eval + pack) only pays off once a call processes
+        // enough pixels to amortize its per-call setup. Below BATCHED_THRESHOLD a
+        // call routes to the per-pixel `eval_16`/`eval_float` (the bit-identical
+        // Accurate path, reached via the `Batched(_)` arms in the loops below), so a
+        // small call (a scanline/tile/single pixel from a renderer) never pays the
+        // batched setup. Measured so AccurateFast >= Accurate at every chunk size
+        // (see crates/tintbox/benches/transform.rs and examples/profile_transform).
+        if self.gamut_check.is_none() && n_pixels >= Self::BATCHED_THRESHOLD {
             if let OptimizedEval::Batched(batched) = &self.opt_eval {
                 self.do_transform_batched(fmts, batched, input, output, n_pixels);
                 return;
