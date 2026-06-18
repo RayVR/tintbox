@@ -1,14 +1,18 @@
-//! Stage-1 self-consistency tests for the `.cube` → RGB device-link builder
-//! (`create_devicelink_from_cube_mem`, a port of lcms2
+//! Tests for the `.cube` → RGB device-link builder
+//! (`create_devicelink_from_cube_mem`, derived from lcms2
 //! `cmsCreateDeviceLinkFromCubeFile`).
 //!
-//! These verify the feature is internally correct — tintbox parses a `.cube`,
-//! builds the device-link, materialises it in memory (`from_writable` — the
-//! evaluation path lcms2 uses; lcms2 cannot *serialise* a 3D-LUT cube
-//! device-link at all), and inspects the structure (v4.4 Link/RGB/RGB profile
-//! carrying the shaper + float CLUT in `A2B0` and the title in `desc`), plus
-//! malformed-input robustness. Byte-for-byte transform parity against lcms2 is
-//! the separate differential test.
+//! tintbox builds a v4.4 Link/RGB/RGB profile carrying the `[Shaper?, float
+//! CLUT]` pipeline in a `D2B0` `multiProcessElements` (`mpet`) tag and the title
+//! in `desc`. Unlike lcms2 — which writes the cube to `A2B0` (`mAB`) and so
+//! cannot serialise a 3D-LUT cube device-link at all — the `mpet` tag stores the
+//! float CLUT losslessly, so the device-link is savable. Coverage:
+//!
+//!  - structure (header + tags),
+//!  - malformed-input robustness (no panics),
+//!  - in-memory transform byte-for-byte vs lcms2's cube device-link,
+//!  - and the lossless save round-trip: build → serialise → reopen → transform
+//!    still byte-for-byte vs lcms2.
 
 use tintbox::cgats::create_devicelink_from_cube_mem;
 use tintbox::profile::header::{ColorSpace, ProfileClass, RenderingIntent};
@@ -69,18 +73,18 @@ fn cube_builds_a_v44_rgb_devicelink() {
         assert_eq!(h.version, 0x0440_0000, "version 4.4");
         assert_eq!(h.rendering_intent, RenderingIntent::Perceptual, "intent");
 
-        // Exactly the two tags lcms2 writes: desc then A2B0.
+        // desc then D2B0 (the float-precision mpet device-link tag).
         let tags: Vec<u32> = profile.tags().map(|s| s.to_raw()).collect();
         assert_eq!(
             tags,
-            vec![sig(b"desc").to_raw(), sig(b"A2B0").to_raw()],
+            vec![sig(b"desc").to_raw(), sig(b"D2B0").to_raw()],
             "tags + order"
         );
 
-        // The A2B0 LUT must read back as a pipeline (proves it serialised validly).
-        match profile.read_tag(sig(b"A2B0")) {
+        // The D2B0 LUT must read back as a pipeline.
+        match profile.read_tag(sig(b"D2B0")) {
             Ok(Tag::Lut(_)) => {}
-            other => panic!("A2B0 should be a LUT pipeline, got {other:?}"),
+            other => panic!("D2B0 should be a LUT pipeline, got {other:?}"),
         }
         // And the description must read back.
         assert!(
@@ -92,8 +96,8 @@ fn cube_builds_a_v44_rgb_devicelink() {
 
 #[test]
 fn cube_devicelink_drives_an_input_lut() {
-    // Reading the input LUT exercises the A2B0 pipeline build (shaper + float
-    // CLUT + identity B-curves), confirming the device-link is evaluation-ready.
+    // Reading the input LUT exercises the D2B0/mpet pipeline build (shaper +
+    // float CLUT), confirming the device-link is evaluation-ready.
     let profile = build(CUBE_SHAPER_AND_CLUT);
     let lut = tintbox::link::read_input_lut(&profile, 0);
     assert!(lut.is_ok(), "device-link input LUT should build: {lut:?}");
@@ -227,5 +231,61 @@ fn cube_transform_matches_lcms2() {
         );
         assert!(ok, "lcms2 cube transform failed to run");
         assert_eq!(tb, oracle, "cube transform diverges from lcms2");
+    }
+}
+
+/// The lossless export: build the cube device-link, SERIALISE it (as a D2B0
+/// `mpet` tag — the path lcms2 cannot take), reopen it from bytes, and confirm
+/// the reopened device-link transforms a sweep of pixels byte-for-byte the same
+/// as lcms2's in-memory cube transform. This proves the save round-trip is
+/// lossless (float CLUT preserved) and that the saved profile is usable.
+#[test]
+fn cube_saves_losslessly_and_transforms_like_lcms2() {
+    use tintbox::format::decode::TYPE_RGB_8;
+    use tintbox::profile::save_to_mem;
+    use tintbox::transform::{Flags, Transform};
+    const INTENT_PERCEPTUAL: u32 = 0;
+
+    for cube in [CUBE_NONTRIVIAL, CUBE_SHAPER_AND_CLUT, CUBE_CLUT_ONLY] {
+        let writable = create_devicelink_from_cube_mem(cube.as_bytes())
+            .expect("cube should build a device-link");
+        let bytes = save_to_mem(&writable).expect("cube device-link must serialise as mpet");
+        let profile = Profile::open(&bytes).expect("reopen the saved device-link");
+
+        let xform = Transform::new_with_formats(
+            &[&profile],
+            &[RenderingIntent::Perceptual],
+            &[false],
+            &[1.0],
+            Flags::empty(),
+            TYPE_RGB_8,
+            TYPE_RGB_8,
+        )
+        .expect("saved device-link transform should build");
+
+        let n = 256usize;
+        let mut input = Vec::with_capacity(n * 3);
+        for i in 0..n {
+            let v = i as u8;
+            input.extend_from_slice(&[v, v.wrapping_mul(2), 255u8.wrapping_sub(v)]);
+        }
+        let mut tb = vec![0u8; n * 3];
+        xform.do_transform(&input, &mut tb, n);
+
+        let mut oracle = vec![0u8; n * 3];
+        let ok = tintbox_oracle::cube_transform(
+            cube.as_bytes(),
+            TYPE_RGB_8,
+            TYPE_RGB_8,
+            INTENT_PERCEPTUAL,
+            &input,
+            &mut oracle,
+            n,
+        );
+        assert!(ok, "lcms2 cube transform failed to run");
+        assert_eq!(
+            tb, oracle,
+            "saved+reopened cube transform diverges from lcms2"
+        );
     }
 }

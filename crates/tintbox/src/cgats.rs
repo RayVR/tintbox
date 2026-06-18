@@ -1869,7 +1869,7 @@ impl Profile {
 // builder (`ParseCube` / `cmsCreateDeviceLinkFromCubeFileTHR`, cmscgats.c). The
 // shared lexer above handles tokenisation (driven by `Parser::is_cube`).
 
-use crate::curve::{build_gamma, build_tabulated_float, ToneCurve};
+use crate::curve::{build_tabulated_float, ToneCurve};
 use crate::interp::InterpParams;
 use crate::pipeline::clut::{Clut, ClutTable, ResolvedInterp};
 use crate::pipeline::{Pipeline, Stage};
@@ -2055,42 +2055,32 @@ pub fn create_devicelink_from_cube_mem(buf: &[u8]) -> Result<WritableProfile> {
     parser.is_cube = true;
     let cube = parser.parse_cube()?;
 
-    // lcms2 builds `[Shaper?, CLUT]` and — for any cube with a 3D LUT — then
-    // CANNOT serialise it: that pipeline matches none of the stage shapes lcms2's
-    // own `mAB` writer accepts (all require trailing B-curves it never appends),
-    // so `cmsSaveProfileToMem` fails. We emit the equivalent, serialisable shape:
-    //
-    //   - CLUT present  -> `[A, CLUT, B]` with A = shaper-or-identity and an
-    //     identity B. Identity curves are exact no-ops, so this evaluates
-    //     bit-identically to lcms2's in-memory `[Shaper?, CLUT]` transform, while
-    //     also being savable (the fix lcms2 lacks).
-    //   - shaper only   -> `[B = shaper]`, which is exactly what lcms2 writes for
-    //     the one case it can save, so that stays byte-identical to lcms2.
+    // lcms2 builds the pipeline `[Shaper?, CLUT]` and writes it to `A2B0` (an
+    // `mAB` tag) — which fails for any cube with a 3D LUT, because `mAB` requires
+    // trailing B-curves lcms2 never appends AND cannot store a float CLUT at all.
+    // We instead carry the very same `[Shaper?, CLUT]` pipeline in a `D2B0`
+    // `multiProcessElements` (`mpet`) tag, which stores the float CLUT losslessly
+    // and needs no synthetic curves. Float D2Bx tags take read precedence over
+    // A2B in both lcms2 and tintbox, so this device-link is used and is savable —
+    // the lossless export lcms2 cannot itself produce.
     let CubeData {
         title,
         shaper,
         clut,
     } = cube;
     let mut pipeline = Pipeline::new(3, 3);
-    match clut {
-        Some((lut_size, table)) => {
-            let a = shaper.unwrap_or_else(identity_curves);
-            pipeline.insert_stage_at_end(Stage::ToneCurves(a))?;
-            let grid = vec![lut_size; 3];
-            pipeline.insert_stage_at_end(Stage::Clut(Clut {
-                table: ClutTable::F32(table),
-                params: InterpParams::new(&grid, 3, 3),
-                is_trilinear: false,
-                implements_identity: false,
-                resolved: ResolvedInterp::default(),
-            }))?;
-            pipeline.insert_stage_at_end(Stage::ToneCurves(identity_curves()))?;
-        }
-        None => {
-            if let Some(shaper) = shaper {
-                pipeline.insert_stage_at_end(Stage::ToneCurves(shaper))?;
-            }
-        }
+    if let Some(curves) = shaper {
+        pipeline.insert_stage_at_end(Stage::ToneCurves(curves))?;
+    }
+    if let Some((lut_size, table)) = clut {
+        let grid = vec![lut_size; 3];
+        pipeline.insert_stage_at_end(Stage::Clut(Clut {
+            table: ClutTable::F32(table),
+            params: InterpParams::new(&grid, 3, 3),
+            is_trilinear: false,
+            implements_identity: false,
+            resolved: ResolvedInterp::default(),
+        }))?;
     }
 
     let mut profile = WritableProfile::new(Header {
@@ -2107,14 +2097,10 @@ pub fn create_devicelink_from_cube_mem(buf: &[u8]) -> Result<WritableProfile> {
         Signature::from_bytes(*b"desc"),
         Tag::Mlu(Mlu::from_wide([0, 0], [0, 0], &title)),
     );
-    profile.add_tag(Signature::from_bytes(*b"A2B0"), Tag::Lut(pipeline));
+    // D2B0 (DToB0) serialises as multiProcessElements (mpet) — float-precision,
+    // takes read precedence over A2B, so this is the device-link that gets used.
+    profile.add_tag(Signature::from_bytes(*b"D2B0"), Tag::Lut(pipeline));
     Ok(profile)
-}
-
-/// Three identity (gamma 1.0) tone curves — exact no-ops, used for the A/B-curve
-/// slots an `mAB` device-link requires but a `.cube` does not provide.
-fn identity_curves() -> Vec<ToneCurve> {
-    vec![build_gamma(1.0), build_gamma(1.0), build_gamma(1.0)]
 }
 
 /// `lut_size^3` — the node count of a `.cube` 3D LUT. The caller validates
