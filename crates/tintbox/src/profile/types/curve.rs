@@ -5,6 +5,16 @@
 //! (already past the 8-byte type base) and `size` = `TagSize - 8` (the byte
 //! count the C handler receives as `SizeOfTag`, unused by these readers).
 
+// Untrusted-input parser: forbid the constructs that panic on malformed bytes
+// (a panic here is a DoS). Arithmetic that mirrors lcms2's C wrapping uses
+// `wrapping_*` explicitly.
+#![deny(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
+
 use crate::curve::{build_gamma, build_parametric, build_tabulated_16};
 use crate::error::{Error, Result};
 use crate::fixed::U8Fixed8;
@@ -55,7 +65,8 @@ pub fn read_parametric_curve<R: ProfileReader>(r: &mut R, _size: u32) -> Result<
         return Err(Error::Corrupt("unknown parametric curve type"));
     }
 
-    let n = PARAMS_BY_TYPE[icc_type as usize];
+    // `icc_type <= 4` (guarded above), so the lookup is always `Some`.
+    let n = PARAMS_BY_TYPE.get(icc_type as usize).copied().unwrap_or(0);
     let mut params = [0.0f64; 10];
     for slot in params.iter_mut().take(n) {
         *slot = r.read_s15f16()?.to_f64();

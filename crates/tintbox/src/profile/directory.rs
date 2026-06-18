@@ -19,6 +19,16 @@
 //! actual byte length of the profile slice (cmsio0.c:915-919: the header size is
 //! clamped down to the IOhandler's `ReportedSize`).
 
+// Untrusted-input parser: forbid the constructs that panic on malformed bytes
+// (a panic here is a DoS). Arithmetic that mirrors lcms2's C wrapping uses
+// `wrapping_*` explicitly, so `arithmetic_side_effects` is not needed here.
+#![deny(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
+
 use crate::error::{Error, Result};
 use crate::io::ProfileReader;
 use crate::profile::descriptor::compatible_types;
@@ -93,9 +103,9 @@ pub fn parse_directory<R: ProfileReader>(
     }
 
     // §7.4 duplicate signatures reject the whole profile.
-    for i in 0..entries.len() {
-        for j in 0..entries.len() {
-            if i != j && entries[i].sig == entries[j].sig {
+    for (i, a) in entries.iter().enumerate() {
+        for (j, b) in entries.iter().enumerate() {
+            if i != j && a.sig == b.sig {
                 return Err(Error::Corrupt("duplicate tag"));
             }
         }
@@ -105,6 +115,7 @@ pub fn parse_directory<R: ProfileReader>(
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::io::MemReader;

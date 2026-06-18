@@ -5,6 +5,16 @@
 //! the 8-byte type base) and `size` = `TagSize - 8` (the byte count lcms2's
 //! handler receives as `SizeOfTag`).
 
+// Untrusted-input parser: forbid the constructs that panic on malformed bytes
+// (a panic here is a DoS). Arithmetic that mirrors lcms2's C wrapping uses
+// `wrapping_*` explicitly.
+#![deny(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
+
 use crate::error::{Error, Result};
 use crate::io::ProfileReader;
 use crate::profile::tag::{Mlu, MluEntry, Tag};
@@ -23,9 +33,12 @@ const TAG_BASE: u32 = 8;
 /// (lcms2: `Entries[i].Len` is `Len` bytes, and `cmsMLUgetASCII`/`getWide`
 /// iterate `Len / sizeof(wchar_t)` units — a trailing odd byte is dropped).
 fn decode_utf16be(bytes: &[u8]) -> String {
-    let units = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]));
+    // `chunks_exact(2)` always yields 2-byte slices, so the slice pattern is
+    // exhaustive in practice; the `_` arm is unreachable (panic-free decode).
+    let units = bytes.chunks_exact(2).map(|c| match c {
+        [hi, lo] => u16::from_be_bytes([*hi, *lo]),
+        _ => 0,
+    });
     char::decode_utf16(units)
         .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
         .collect()
@@ -212,7 +225,7 @@ pub fn read_text_description_value<R: ProfileReader>(r: &mut R, size: u32) -> Re
             entries.push(MluEntry {
                 language: [0xff, 0xff],
                 country: [0xff, 0xff],
-                text: decode_utf16be(&buf[..nul]),
+                text: decode_utf16be(buf.get(..nul).unwrap_or_default()),
             });
             // The remaining ScriptCode block is skipped by the C; we never store
             // it, so there is no need to consume it here.
@@ -223,6 +236,7 @@ pub fn read_text_description_value<R: ProfileReader>(r: &mut R, size: u32) -> Re
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::io::cursor::MemReader;

@@ -10,6 +10,16 @@
 //! - `Type_ProfileSequenceId_Read`     (`cmstypes.c:3687`) -> [`Tag::ProfileSequenceId`]
 //! - `Type_Dictionary_Read`            (`cmstypes.c:5436`) -> [`Tag::Dict`]
 
+// Untrusted-input parser: forbid the constructs that panic on malformed bytes
+// (a panic here is a DoS). Arithmetic that mirrors lcms2's C wrapping uses
+// `wrapping_*` explicitly.
+#![deny(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
+
 use crate::error::{Error, Result};
 use crate::io::ProfileReader;
 use crate::profile::tag::{
@@ -358,15 +368,23 @@ pub fn read_dictionary<R: ProfileReader>(r: &mut R, size: u32) -> Result<Tag> {
 
     // ---- Seek to each element and read it (cmstypes.c:5481). ----
     let mut entries = Vec::with_capacity(count.min(0x1_0000) as usize);
-    for i in 0..count as usize {
-        let name = read_one_wchar(r, &names[i])?;
-        let value = read_one_wchar(r, &values[i])?;
+    // All four cell vectors are pushed once per `0..count` iteration above, so
+    // they have equal length `count`; zipping is panic-free and identical to the
+    // former parallel indexing by `i`.
+    for (((name_c, value_c), dn_c), dv_c) in names
+        .iter()
+        .zip(values.iter())
+        .zip(display_names.iter())
+        .zip(display_values.iter())
+    {
+        let name = read_one_wchar(r, name_c)?;
+        let value = read_one_wchar(r, value_c)?;
 
-        let display_name = match &display_names[i] {
+        let display_name = match dn_c {
             Some(c) => read_one_mluc(r, c)?,
             None => None,
         };
-        let display_value = match &display_values[i] {
+        let display_value = match dv_c {
             Some(c) => read_one_mluc(r, c)?,
             None => None,
         };
@@ -430,16 +448,24 @@ fn read_one_mluc<R: ProfileReader>(r: &mut R, cell: &DictCell) -> Result<Option<
 /// surrogate pairs, and treat a lone/mismatched surrogate as corruption.
 fn decode_wchar_array(bytes: &[u8]) -> Result<String> {
     let mut out = String::new();
+    // `chunks_exact(2)` yields 2-byte slices; the slice pattern reads them
+    // panic-free (the `_` arm is unreachable).
+    let be16 = |c: &[u8]| -> u16 {
+        match c {
+            [hi, lo] => u16::from_be_bytes([*hi, *lo]),
+            _ => 0,
+        }
+    };
     let mut it = bytes.chunks_exact(2);
     while let Some(c) = it.next() {
-        let uc = u16::from_be_bytes([c[0], c[1]]);
+        let uc = be16(c);
         // is_surrogate(uc): (uc - 0xd800) < 2048.
         if (uc.wrapping_sub(0xd800)) < 2048 {
             // High surrogate must pair with an immediately-following low surrogate.
             let low = it
                 .next()
                 .ok_or(Error::Corrupt("dict: truncated surrogate pair"))?;
-            let low = u16::from_be_bytes([low[0], low[1]]);
+            let low = be16(low);
             let is_high = (uc & 0xfc00) == 0xd800;
             let is_low = (low & 0xfc00) == 0xdc00;
             if is_high && is_low {
@@ -454,14 +480,16 @@ fn decode_wchar_array(bytes: &[u8]) -> Result<String> {
                 return Err(Error::Corrupt("dict: mismatched surrogate"));
             }
         } else {
-            // BMP scalar: a non-surrogate u16 is always a valid char.
-            out.push(char::from_u32(uc as u32).expect("non-surrogate u16 is a valid scalar"));
+            // BMP scalar: a non-surrogate u16 is always a valid char, so the
+            // `unwrap_or` fallback is unreachable (panic-free).
+            out.push(char::from_u32(uc as u32).unwrap_or(char::REPLACEMENT_CHARACTER));
         }
     }
     Ok(out)
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::io::cursor::MemReader;

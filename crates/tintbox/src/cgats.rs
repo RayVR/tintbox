@@ -13,6 +13,16 @@
 //! The `.cube` device-link path of `cmscgats.c` (which builds ICC profiles) is
 //! out of scope for this module.
 
+// Untrusted-input parser: forbid the constructs that panic on malformed bytes
+// (a panic here is a DoS). Arithmetic that mirrors lcms2's C wrapping uses
+// `wrapping_*` explicitly.
+#![deny(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
+
 use crate::error::{Error, Result};
 
 const MAXSTR: usize = 1024; // Max length of string
@@ -174,11 +184,13 @@ pub fn format_g(x: f64, precision: usize) -> String {
     // Rust's `{:.*e}` rounds to `p-1` fractional digits (i.e. `p` significant
     // digits) using round-half-to-even, matching the C library.
     let sci = format!("{:.*e}", p - 1, x);
-    let epos = sci.find('e').expect("scientific format always has 'e'");
-    let mant = &sci[..epos];
-    let exp: i32 = sci[epos + 1..]
-        .parse()
-        .expect("scientific exponent is an integer");
+    // `{:e}` on the finite, non-zero `x` (zero/NaN/inf handled above) always
+    // yields `<mantissa>e<exponent>`, so the `None`/parse-failure arms below are
+    // unreachable — this is panic-free without changing any real output.
+    let (mant, exp): (&str, i32) = match sci.split_once('e') {
+        Some((m, e)) => (m, e.parse::<i32>().unwrap_or(0)),
+        None => return sci,
+    };
 
     if exp < -4 || exp >= p as i32 {
         // Scientific: strip trailing zeros from the mantissa fraction.
@@ -339,8 +351,11 @@ impl Profile {
         for k in PREDEFINED_SAMPLE_ID {
             add_to_list(&mut p.valid_sample_id, k, None, None, WriteMode::Uncooked);
         }
-        // lcms2 sets the default sheet type to "CGATS.17".
-        p.tables[0].sheet_type = "CGATS.17".to_owned();
+        // lcms2 sets the default sheet type to "CGATS.17". `alloc_table` above
+        // pushed table 0, so `first_mut` is always `Some` here.
+        if let Some(t) = p.tables.first_mut() {
+            t.sheet_type = "CGATS.17".to_owned();
+        }
         p
     }
 
@@ -352,12 +367,18 @@ impl Profile {
         true
     }
 
+    // `n_table` is an internal invariant: it is only ever set to an existing
+    // table index (`set_table` validates the range, `alloc_table` guarantees >= 1
+    // table), so this index is never out of bounds. It is not attacker-controlled
+    // input, hence the targeted allow rather than a fallible accessor.
     #[inline]
+    #[allow(clippy::indexing_slicing)]
     fn table(&self) -> &Table {
         &self.tables[self.n_table]
     }
 
     #[inline]
+    #[allow(clippy::indexing_slicing)]
     fn table_mut(&mut self) -> &mut Table {
         let i = self.n_table;
         &mut self.tables[i]
@@ -430,9 +451,11 @@ fn add_to_list(
         if strcasecmp_eq(key, "NUMBER_OF_FIELDS") || strcasecmp_eq(key, "NUMBER_OF_SETS") {
             return false;
         }
-        let i = anchor.expect("present implies an anchor index");
-        list[i].write_as = write_as;
-        list[i].value = value.map(|v| v.to_owned());
+        // `present` implies `anchor` is `Some` and indexes an existing node.
+        if let Some(kv) = anchor.and_then(|i| list.get_mut(i)) {
+            kv.write_as = write_as;
+            kv.value = value.map(|v| v.to_owned());
+        }
         return true;
     }
 
@@ -455,45 +478,49 @@ fn add_to_list(
 /// accessors (CGATS always uses '.' as the decimal separator).
 pub fn parse_float_number(buffer: &str) -> f64 {
     let bytes = buffer.as_bytes();
+    // Every `bytes[i]` below is guarded by `i < bytes.len()`; reading through
+    // `at` keeps that exact behaviour while being panic-free (the `0` fallback is
+    // unreachable behind the guards).
+    let at = |i: usize| -> u8 { bytes.get(i).copied().unwrap_or(0) };
     let mut i = 0;
     let mut dnum = 0.0f64;
     let mut sign = 1.0f64;
 
-    if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
-        sign = if bytes[i] == b'-' { -1.0 } else { 1.0 };
+    if i < bytes.len() && (at(i) == b'-' || at(i) == b'+') {
+        sign = if at(i) == b'-' { -1.0 } else { 1.0 };
         i += 1;
     }
 
-    while i < bytes.len() && is_digit(bytes[i]) {
-        dnum = dnum * 10.0 + (bytes[i] - b'0') as f64;
+    while i < bytes.len() && is_digit(at(i)) {
+        dnum = dnum * 10.0 + (at(i) - b'0') as f64;
         i += 1;
     }
 
-    if i < bytes.len() && bytes[i] == b'.' {
+    if i < bytes.len() && at(i) == b'.' {
         let mut frac = 0.0f64;
         let mut prec = 0i32;
         i += 1;
-        while i < bytes.len() && is_digit(bytes[i]) {
-            frac = frac * 10.0 + (bytes[i] - b'0') as f64;
+        while i < bytes.len() && is_digit(at(i)) {
+            frac = frac * 10.0 + (at(i) - b'0') as f64;
             prec += 1;
             i += 1;
         }
         dnum += frac / xpow10(prec);
     }
 
-    if i < bytes.len() && to_upper(bytes[i]) == b'E' {
+    if i < bytes.len() && to_upper(at(i)) == b'E' {
         i += 1;
         let mut sgn = 1i32;
-        if i < bytes.len() && bytes[i] == b'-' {
+        if i < bytes.len() && at(i) == b'-' {
             sgn = -1;
             i += 1;
-        } else if i < bytes.len() && bytes[i] == b'+' {
+        } else if i < bytes.len() && at(i) == b'+' {
             sgn = 1;
             i += 1;
         }
         let mut e = 0i32;
-        while i < bytes.len() && is_digit(bytes[i]) {
-            let digit = (bytes[i] - b'0') as i32;
+        while i < bytes.len() && is_digit(at(i)) {
+            let digit = (at(i) - b'0') as i32;
             if (e as f64) * 10.0 + (digit as f64) < 2147483647.0 {
                 e = e * 10 + digit;
             }
@@ -533,20 +560,22 @@ fn satoi(b: Option<&str>) -> i32 {
 /// junk, saturating to i32 on overflow.
 fn c_atoi(s: &str) -> i32 {
     let bytes = s.as_bytes();
+    // Guarded indexing as in `parse_float_number`; `at` keeps it panic-free.
+    let at = |i: usize| -> u8 { bytes.get(i).copied().unwrap_or(0) };
     let mut i = 0;
-    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+    while i < bytes.len() && (at(i) == b' ' || at(i) == b'\t') {
         i += 1;
     }
     let mut sign = 1i64;
-    if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
-        if bytes[i] == b'-' {
+    if i < bytes.len() && (at(i) == b'-' || at(i) == b'+') {
+        if at(i) == b'-' {
             sign = -1;
         }
         i += 1;
     }
     let mut n: i64 = 0;
-    while i < bytes.len() && is_digit(bytes[i]) {
-        n = n * 10 + (bytes[i] - b'0') as i64;
+    while i < bytes.len() && is_digit(at(i)) {
+        n = n * 10 + (at(i) - b'0') as i64;
         if n > i64::from(i32::MAX) + 1 {
             n = i64::from(i32::MAX) + 1;
         }
@@ -580,7 +609,9 @@ fn satob(v: Option<&str>) -> String {
         x /= 2;
     }
     buf.reverse();
-    String::from_utf8(buf).expect("binary digits are ASCII")
+    // `buf` holds only b'0'/b'1', so it is always valid UTF-8; the fallback is
+    // unreachable.
+    String::from_utf8(buf).unwrap_or_default()
 }
 
 // ----------------------------------------------------------- lexer
@@ -604,7 +635,7 @@ impl<'a> Parser<'a> {
     /// non-NUL (matching lcms2, which stops advancing at the terminating 0).
     fn next_ch(&mut self) {
         if self.pos < self.src.len() {
-            self.ch = self.src[self.pos];
+            self.ch = self.src.get(self.pos).copied().unwrap_or(0);
             if self.ch != 0 {
                 self.pos += 1;
             }
@@ -982,8 +1013,13 @@ impl Profile {
             return false;
         }
         let idx = n as usize;
-        if let Some(df) = self.table_mut().data_format.as_mut() {
-            df[idx] = Some(label.to_owned());
+        if let Some(slot) = self
+            .table_mut()
+            .data_format
+            .as_mut()
+            .and_then(|df| df.get_mut(idx))
+        {
+            *slot = Some(label.to_owned());
         }
         true
     }
@@ -993,7 +1029,7 @@ impl Profile {
         if n < 0 || n as usize >= df.len() {
             return None;
         }
-        df[n as usize].as_deref()
+        df.get(n as usize).and_then(|s| s.as_deref())
     }
 
     fn allocate_data_set(&mut self) -> bool {
@@ -1020,7 +1056,8 @@ impl Profile {
             return None;
         }
         let data = t.data.as_ref()?;
-        data[(n_set * ns + n_field) as usize].as_deref()
+        data.get((n_set * ns + n_field) as usize)
+            .and_then(|s| s.as_deref())
     }
 
     fn set_data(&mut self, n_set: i32, n_field: i32, val: &str) -> bool {
@@ -1039,8 +1076,8 @@ impl Profile {
             return false;
         }
         let idx = (n_set * ns + n_field) as usize;
-        if let Some(data) = self.table_mut().data.as_mut() {
-            data[idx] = Some(val.to_owned());
+        if let Some(slot) = self.table_mut().data.as_mut().and_then(|d| d.get_mut(idx)) {
+            *slot = Some(val.to_owned());
         }
         true
     }
@@ -1179,7 +1216,11 @@ impl Profile {
                         );
                     }
                     let key_write_as = if present {
-                        self.valid_keywords[anchor.expect("present implies anchor")].write_as
+                        // `present` implies `anchor` is `Some` and indexes the list.
+                        anchor
+                            .and_then(|i| self.valid_keywords.get(i))
+                            .map(|kv| kv.write_as)
+                            .unwrap_or(WriteMode::Uncooked)
                     } else {
                         WriteMode::Uncooked
                     };
@@ -1196,9 +1237,8 @@ impl Profile {
                         } else {
                             WriteMode::Uncooked
                         };
-                        let i = self.n_table;
                         if !add_to_list(
-                            &mut self.tables[i].header_list,
+                            &mut self.table_mut().header_list,
                             &var_name,
                             None,
                             Some(&buffer),
@@ -1239,14 +1279,15 @@ impl Profile {
                 Some(c) => c,
                 None => return false,
             };
-            let subkey = chunk[..comma].trim_matches(' ');
-            let value = chunk[comma + 1..].trim_matches(' ');
+            // `comma` is a byte index returned by `rfind`, so both slices are in
+            // bounds and on char boundaries (',' is ASCII).
+            let subkey = chunk.get(..comma).unwrap_or("").trim_matches(' ');
+            let value = chunk.get(comma + 1..).unwrap_or("").trim_matches(' ');
             if subkey.is_empty() || value.is_empty() {
                 return false;
             }
-            let i = self.n_table;
             add_to_list(
-                &mut self.tables[i].header_list,
+                &mut self.table_mut().header_list,
                 var_name,
                 Some(subkey),
                 Some(value),
@@ -1258,7 +1299,11 @@ impl Profile {
 
     fn parse_it8(&mut self, p: &mut Parser, nosheet: bool) -> bool {
         if !nosheet {
-            self.tables[0].sheet_type = p.read_type();
+            // Sheet type always belongs to table 0, which always exists.
+            let ty = p.read_type();
+            if let Some(t) = self.tables.first_mut() {
+                t.sheet_type = ty;
+            }
         }
         p.in_symbol();
         p.skip_eoln();
@@ -1315,6 +1360,13 @@ impl Profile {
     }
 
     /// `CookPointers` — resolve the SAMPLE_ID column and LABEL/`$` table refs.
+    // Every index here is a loop variable bounded by the collection's own length
+    // (`j`/`k` over `self.tables`, `i` over `n_patches`) or an `anchor` returned by
+    // `is_available_on_list` under a `present` guard, so none can be out of bounds.
+    // The function's interleaved borrows of `self.tables[j]`, `self.tables[k]`, and
+    // `self.get_data` make a fallible-accessor rewrite impractical without changing
+    // behaviour, so the invariant is asserted with a targeted allow instead.
+    #[allow(clippy::indexing_slicing, clippy::expect_used)]
     fn cook_pointers(&mut self) {
         let n_old_table = self.n_table;
         let tables_count = self.tables.len();
@@ -1438,9 +1490,10 @@ impl Profile {
     pub fn get_property(&self, key: &str) -> Option<&str> {
         let (present, anchor) = is_available_on_list(&self.table().header_list, key, None);
         if present {
-            self.table().header_list[anchor.expect("present implies anchor")]
-                .value
-                .as_deref()
+            // `present` implies `anchor` is `Some` and indexes the header list.
+            anchor
+                .and_then(|i| self.table().header_list.get(i))
+                .and_then(|kv| kv.value.as_deref())
         } else {
             None
         }
@@ -1458,9 +1511,10 @@ impl Profile {
     pub fn get_property_multi(&self, key: &str, subkey: &str) -> Option<&str> {
         let (present, anchor) = is_available_on_list(&self.table().header_list, key, Some(subkey));
         if present {
-            self.table().header_list[anchor.expect("present implies anchor")]
-                .value
-                .as_deref()
+            // `present` implies `anchor` is `Some` and indexes the header list.
+            anchor
+                .and_then(|i| self.table().header_list.get(i))
+                .and_then(|kv| kv.value.as_deref())
         } else {
             None
         }
@@ -1471,9 +1525,8 @@ impl Profile {
         if val.is_empty() {
             return false;
         }
-        let i = self.n_table;
         add_to_list(
-            &mut self.tables[i].header_list,
+            &mut self.table_mut().header_list,
             key,
             None,
             Some(val),
@@ -1484,9 +1537,8 @@ impl Profile {
     /// `cmsIT8SetPropertyDbl`.
     pub fn set_property_dbl(&mut self, key: &str, val: f64) -> bool {
         let buffer = fmt_dbl(val);
-        let i = self.n_table;
         add_to_list(
-            &mut self.tables[i].header_list,
+            &mut self.table_mut().header_list,
             key,
             None,
             Some(&buffer),
@@ -1497,9 +1549,8 @@ impl Profile {
     /// `cmsIT8SetPropertyHex`.
     pub fn set_property_hex(&mut self, key: &str, val: u32) -> bool {
         let buffer = val.to_string();
-        let i = self.n_table;
         add_to_list(
-            &mut self.tables[i].header_list,
+            &mut self.table_mut().header_list,
             key,
             None,
             Some(&buffer),
@@ -1509,9 +1560,8 @@ impl Profile {
 
     /// `cmsIT8SetPropertyUncooked`.
     pub fn set_property_uncooked(&mut self, key: &str, buffer: &str) -> bool {
-        let i = self.n_table;
         add_to_list(
-            &mut self.tables[i].header_list,
+            &mut self.table_mut().header_list,
             key,
             None,
             Some(buffer),

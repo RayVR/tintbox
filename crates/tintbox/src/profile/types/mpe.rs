@@ -13,10 +13,20 @@
 //!   - `bACS`/`eACS` (begin/end abstract colour space) → accepted, no stage,
 //!   - anything else → an unknown-extension error.
 
+// Untrusted-input parser: forbid the constructs that panic on malformed bytes
+// (a panic here is a DoS). Size arithmetic that mirrors lcms2's C wrapping uses
+// `wrapping_*`/`checked_*` explicitly.
+#![deny(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
+
 use crate::curve::{build_mpe_segmented, CurveSegment, ToneCurve};
 use crate::error::{Error, Result};
 use crate::interp::InterpParams;
-use crate::io::ProfileReader;
+use crate::io::{ProfileReader, READ_RESERVE_CAP};
 use crate::pipeline::clut::{Clut, ClutTable};
 use crate::pipeline::{Pipeline, Stage};
 use crate::profile::tag::Tag;
@@ -122,8 +132,12 @@ fn read_segmented_curve<R: ProfileReader>(r: &mut R) -> Result<ToneCurve> {
         seg.x1 = r.read_f32()?;
         prev_break = seg.x1;
     }
-    segments[n_segments - 1].x0 = prev_break;
-    segments[n_segments - 1].x1 = PLUS_INF;
+    // The last segment closes at +inf. `segments` has exactly `n_segments >= 1`
+    // elements, so `last_mut` is always `Some` here.
+    if let Some(last) = segments.last_mut() {
+        last.x0 = prev_break;
+        last.x1 = PLUS_INF;
+    }
 
     // Read each segment body.
     for seg in segments.iter_mut() {
@@ -141,8 +155,11 @@ fn read_segmented_curve<R: ProfileReader>(r: &mut R) -> Result<ToneCurve> {
                 }
                 // lcms2 stores Segments[i].Type = Type + 6 (parametric 6/7/8).
                 seg.seg_type = ty as i32 + 6;
-                for j in 0..PARAMS_BY_TYPE[ty as usize] {
-                    seg.params[j] = r.read_f32()? as f64;
+                // `ty <= 2` (guarded above) so the lookup is always `Some`; the
+                // param count (<= 5) fits the fixed `params: [f64; 10]`.
+                let n_params = PARAMS_BY_TYPE.get(ty as usize).copied().unwrap_or(0);
+                for p in seg.params.iter_mut().take(n_params) {
+                    *p = r.read_f32()? as f64;
                 }
             }
             SIG_SAMPLED_CURVE_SEG => {
@@ -258,9 +275,12 @@ fn read_mpe_clut<R: ProfileReader>(r: &mut R, lut: &mut Pipeline) -> Result<()> 
     let n_entries = granular_clut_entries(output_chans, &grid)
         .ok_or(Error::Corrupt("MPE CLUT: table size invalid"))?;
 
-    let mut table = vec![0.0f32; n_entries as usize];
-    for slot in table.iter_mut() {
-        *slot = r.read_f32()?;
+    // Reserve a bounded hint (n_entries is attacker-controlled); the push loop
+    // grows to the true size and fails fast on truncation, so a malformed huge
+    // table can't force a giant up-front allocation. Byte-identical on valid input.
+    let mut table = Vec::with_capacity((n_entries as usize).min(READ_RESERVE_CAP));
+    for _ in 0..n_entries {
+        table.push(r.read_f32()?);
     }
 
     let params = InterpParams::new(&grid, input_chans as usize, output_chans as usize);

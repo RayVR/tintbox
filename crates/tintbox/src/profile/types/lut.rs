@@ -8,10 +8,20 @@
 //! its header has no entry counts; LUT16 reads `InputEntries`/`OutputEntries`
 //! u16 counts after `CLUTpoints` and stores 16-bit tables/CLUT verbatim.
 
+// Untrusted-input parser: forbid the constructs that panic on malformed bytes
+// (a panic here is a DoS). Size arithmetic that mirrors lcms2's C wrapping uses
+// `wrapping_*`/`checked_*` explicitly.
+#![deny(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
+
 use crate::curve::{build_tabulated_16, ToneCurve};
 use crate::error::{Error, Result};
 use crate::interp::InterpParams;
-use crate::io::ProfileReader;
+use crate::io::{ProfileReader, READ_RESERVE_CAP};
 use crate::pipeline::clut::{Clut, ClutTable};
 use crate::pipeline::{Pipeline, Stage};
 use crate::profile::tag::Tag;
@@ -196,9 +206,12 @@ fn read_clut<R: ProfileReader>(
         return Ok(());
     }
 
-    let mut table = vec![0u16; n_tab_size as usize];
-    for slot in table.iter_mut() {
-        *slot = read_value(r)?;
+    // Bounded reservation hint (n_tab_size is attacker-controlled via the grid);
+    // the push loop grows to the true size, so a malformed huge table can't force
+    // a giant up-front allocation. Byte-identical on valid input.
+    let mut table = Vec::with_capacity((n_tab_size as usize).min(READ_RESERVE_CAP));
+    for _ in 0..n_tab_size {
+        table.push(read_value(r)?);
     }
 
     // grid = CLUTpoints per input dimension (cmsStageAllocCLut16bit uniforms).
@@ -402,8 +415,11 @@ fn read_clut_at<R: ProfileReader>(
     let _pad2 = r.read_u8()?;
 
     // The grid uses the first `input_channels` of the 16 declared dimensions.
-    let grid: Vec<u32> = grid_points8[..input_channels as usize]
+    // `take` (vs slicing) is panic-free; `input_channels <= 15 < 16` on valid
+    // input, so the collected grid is identical.
+    let grid: Vec<u32> = grid_points8
         .iter()
+        .take(input_channels as usize)
         .map(|&g| g as u32)
         .collect();
 
@@ -413,16 +429,19 @@ fn read_clut_at<R: ProfileReader>(
     let n_entries = granular_clut_entries(output_channels, &grid)
         .ok_or(Error::Corrupt("AtoB/BtoA CLUT table size invalid"))?;
 
-    let mut table = vec![0u16; n_entries as usize];
+    // Bounded reservation hint (n_entries is attacker-controlled via the grid);
+    // each branch pushes the true count, so a malformed huge table can't force a
+    // giant up-front allocation. Byte-identical on valid input.
+    let mut table = Vec::with_capacity((n_entries as usize).min(READ_RESERVE_CAP));
     match precision {
         1 => {
-            for slot in table.iter_mut() {
-                *slot = from_8_to_16(r.read_u8()?);
+            for _ in 0..n_entries {
+                table.push(from_8_to_16(r.read_u8()?));
             }
         }
         2 => {
-            for slot in table.iter_mut() {
-                *slot = r.read_u16()?;
+            for _ in 0..n_entries {
+                table.push(r.read_u16()?);
             }
         }
         _ => return Err(Error::Corrupt("AtoB/BtoA CLUT unknown precision")),

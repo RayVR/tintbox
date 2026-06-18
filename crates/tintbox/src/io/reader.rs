@@ -10,6 +10,22 @@ use crate::error::{Error, Result};
 use crate::fixed::S15Fixed16;
 use crate::sig::Signature;
 
+/// Upper bound on the capacity we pre-reserve when reading an array whose
+/// element count comes from the (untrusted) profile.
+///
+/// The count is read straight off the wire, so a malformed profile can claim a
+/// huge one — e.g. a granular CLUT declaring grid `[255, 255, 255]` × 16 outputs
+/// passes lcms2's `UINT_MAX/15` overflow guard at ~265 M entries, which a naive
+/// `Vec::with_capacity(count)` would try to allocate (~1 GB) *before* the
+/// truncated read fails. That is a denial-of-service (and an immediate
+/// OOM-abort on wasm's 32-bit linear memory) reachable from a ~200-byte file.
+///
+/// Reserving `count.min(READ_RESERVE_CAP)` and letting the push loop grow keeps
+/// the up-front allocation bounded while staying byte-identical on valid input:
+/// the loop still reads exactly `count` elements and fails fast on truncation,
+/// so the final `Vec` is unchanged — only the eager over-allocation is removed.
+pub(crate) const READ_RESERVE_CAP: usize = 0x1_0000;
+
 pub trait ProfileReader {
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()>;
     fn seek(&mut self, pos: u64) -> Result<()>;
@@ -69,7 +85,7 @@ pub trait ProfileReader {
 
     /// Read `n` big-endian u16 (lcms2 `_cmsReadUInt16Array`: loop the scalar read).
     fn read_u16_array(&mut self, n: usize) -> Result<Vec<u16>> {
-        let mut v = Vec::with_capacity(n);
+        let mut v = Vec::with_capacity(n.min(READ_RESERVE_CAP));
         for _ in 0..n {
             v.push(self.read_u16()?);
         }
@@ -77,7 +93,7 @@ pub trait ProfileReader {
     }
     /// Read `n` big-endian u32 (no lcms2 array primitive; loop the scalar read).
     fn read_u32_array(&mut self, n: usize) -> Result<Vec<u32>> {
-        let mut v = Vec::with_capacity(n);
+        let mut v = Vec::with_capacity(n.min(READ_RESERVE_CAP));
         for _ in 0..n {
             v.push(self.read_u32()?);
         }
