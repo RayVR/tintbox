@@ -168,3 +168,64 @@ fn mutated_cube_does_not_panic() {
         assert!(r.is_ok(), "PANIC on mutated cube at iter {i}");
     }
 }
+
+/// A 2×2×2 cube with distinct corner outputs, so non-corner inputs interpolate
+/// to non-trivial values — exercising the CLUT interpolation under the
+/// differential test (an identity cube would pass trivially).
+const CUBE_NONTRIVIAL: &str = "TITLE \"nontrivial\"\n\
+LUT_3D_SIZE 2\n\
+0.05 0.10 0.15\n\
+0.80 0.20 0.10\n\
+0.10 0.75 0.20\n\
+0.90 0.85 0.05\n\
+0.15 0.20 0.70\n\
+0.85 0.10 0.80\n\
+0.20 0.90 0.75\n\
+0.95 0.90 0.85\n";
+
+/// The differential cross-check: tintbox's in-memory `.cube` device-link must
+/// transform pixels byte-for-byte the same as lcms2's, over a sweep of inputs.
+/// Both use the lossless (NOOPTIMIZE) path — tintbox's default AccurateFast is
+/// byte-identical to it.
+#[test]
+fn cube_transform_matches_lcms2() {
+    use tintbox::format::decode::TYPE_RGB_8;
+    use tintbox::transform::{Flags, Transform};
+    const INTENT_PERCEPTUAL: u32 = 0;
+
+    for cube in [CUBE_NONTRIVIAL, CUBE_SHAPER_AND_CLUT, CUBE_CLUT_ONLY] {
+        let profile = build(cube);
+        let xform = Transform::new_with_formats(
+            &[&profile],
+            &[RenderingIntent::Perceptual],
+            &[false],
+            &[1.0],
+            Flags::empty(),
+            TYPE_RGB_8,
+            TYPE_RGB_8,
+        )
+        .expect("device-link transform should build");
+
+        let n = 256usize;
+        let mut input = Vec::with_capacity(n * 3);
+        for i in 0..n {
+            let v = i as u8;
+            input.extend_from_slice(&[v, v.wrapping_mul(2), 255u8.wrapping_sub(v)]);
+        }
+        let mut tb = vec![0u8; n * 3];
+        xform.do_transform(&input, &mut tb, n);
+
+        let mut oracle = vec![0u8; n * 3];
+        let ok = tintbox_oracle::cube_transform(
+            cube.as_bytes(),
+            TYPE_RGB_8,
+            TYPE_RGB_8,
+            INTENT_PERCEPTUAL,
+            &input,
+            &mut oracle,
+            n,
+        );
+        assert!(ok, "lcms2 cube transform failed to run");
+        assert_eq!(tb, oracle, "cube transform diverges from lcms2");
+    }
+}

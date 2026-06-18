@@ -4008,3 +4008,49 @@ impl Drop for OracleTransform {
     }
 }
 // ==== end perf-bench ====
+
+// ==== .cube differential transform ====
+unsafe extern "C" {
+    fn tintbox_oracle_cube_transform(
+        text: *const u8,
+        text_len: u32,
+        in_fmt: u32,
+        out_fmt: u32,
+        intent: u32,
+        input: *const u8,
+        output: *mut u8,
+        n_pixels: u32,
+    ) -> i32;
+}
+
+/// Build lcms2's in-memory `.cube` RGB device-link and transform `input` through
+/// it (NOOPTIMIZE, so the reference is lcms2's lossless single-code-path eval).
+/// lcms2 cannot serialise a 3D-LUT cube device-link, so this drives the
+/// in-memory transform path. Returns false on failure. `output` must hold
+/// `n_pixels * out_bytes_per_pixel` bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn cube_transform(
+    cube: &[u8],
+    in_fmt: u32,
+    out_fmt: u32,
+    intent: u32,
+    input: &[u8],
+    output: &mut [u8],
+    n_pixels: usize,
+) -> bool {
+    // SAFETY: the C side reads `cube.len()` text bytes and `n_pixels` packed
+    // pixels from `input`, and writes `n_pixels` packed pixels to `output`; the
+    // caller sizes both buffers to the chosen formats.
+    unsafe {
+        tintbox_oracle_cube_transform(
+            cube.as_ptr(),
+            cube.len() as u32,
+            in_fmt,
+            out_fmt,
+            intent,
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            n_pixels as u32,
+        ) != 0
+    }
+}

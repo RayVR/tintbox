@@ -2821,3 +2821,29 @@ void tintbox_oracle_xform_free(uintptr_t handle) {
     if (handle) cmsDeleteTransform((cmsHTRANSFORM) handle);
 }
 // ==== end perf-bench ====
+
+// ==== .cube differential transform ====
+#include <unistd.h>
+/* Build lcms2's in-memory .cube device-link (lcms2 cannot SERIALISE a 3D-LUT
+   cube device-link, so this drives the in-memory transform path) and run a
+   packed transform through it, with NOOPTIMIZE so the reference is the
+   lossless single-code-path eval tintbox's Accurate/AccurateFast matches.
+   Returns 1 on success (output filled), 0 on failure. */
+int tintbox_oracle_cube_transform(const uint8_t* text, uint32_t text_len,
+                                  uint32_t in_fmt, uint32_t out_fmt, uint32_t intent,
+                                  const uint8_t* input, uint8_t* output, uint32_t n_pixels) {
+    char path[] = "/tmp/tintbox_cube_XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return 0;
+    if (write(fd, text, (size_t) text_len) != (ssize_t) text_len) { close(fd); unlink(path); return 0; }
+    close(fd);
+    cmsHPROFILE h = cmsCreateDeviceLinkFromCubeFile(path);
+    unlink(path);
+    if (!h) return 0;
+    cmsHTRANSFORM t = cmsCreateTransform(h, in_fmt, NULL, out_fmt, intent, cmsFLAGS_NOOPTIMIZE);
+    if (!t) { cmsCloseProfile(h); return 0; }
+    cmsDoTransform(t, input, output, n_pixels);
+    cmsDeleteTransform(t);
+    cmsCloseProfile(h);
+    return 1;
+}
