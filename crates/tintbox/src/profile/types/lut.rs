@@ -31,6 +31,11 @@ use crate::profile::types::curve::{read_curve, read_parametric_curve};
 /// readers reject above.
 const CMS_MAXCHANNELS: u32 = 16;
 
+/// lcms2 `MAX_INPUT_DIMENSIONS` (lcms2_internal.h): the most input channels a
+/// CLUT interpolator handles. `_cmsComputeInterpParamsEx` (cmsintrp.c:120)
+/// rejects more with `cmsERROR_RANGE`.
+const MAX_INPUT_DIMENSIONS: u32 = 15;
+
 /// lcms2 `FROM_8_TO_16(rgb)` (lcms2_internal.h:125): replicate the 8-bit value
 /// into both bytes of a 16-bit word (`(v << 8) | v`), so `0xFF -> 0xFFFF`.
 fn from_8_to_16(v: u8) -> u16 {
@@ -200,6 +205,15 @@ fn read_clut<R: ProfileReader>(
     output_channels: u32,
     read_value: impl Fn(&mut R) -> Result<u16>,
 ) -> Result<()> {
+    // The mft1/mft2 channel check admits `input_channels == 16` (it bounds by
+    // cmsMAXCHANNELS), but a CLUT with > MAX_INPUT_DIMENSIONS (15) inputs is
+    // rejected by lcms2's `_cmsComputeInterpParamsEx` (cmsintrp.c:120). Without
+    // this guard such a profile would reach `interp_factory`'s 1..=15 selector
+    // and panic at eval. Reject here to keep accept/reject parity with lcms2 and
+    // make that panic unreachable.
+    if input_channels > MAX_INPUT_DIMENSIONS {
+        return Err(Error::Range);
+    }
     let n_tab_size = uipow(output_channels, clut_points, input_channels)
         .ok_or(Error::Corrupt("LUT CLUT table size overflow"))?;
     if n_tab_size == 0 {
@@ -616,4 +630,32 @@ mod kani_proofs {
     // nonlinear symbolic multiply chains blow up CBMC. The function that *does*
     // need proving is `cube_size`, whose manual `u64` guards (not `checked_mul`)
     // are where an overflow bug could actually hide — and that proof is above.
+}
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use crate::io::MemReader;
+
+    /// A 16-input mft1 LUT passes the cmsMAXCHANNELS (16) channel-count check but
+    /// exceeds the CLUT interpolation limit (MAX_INPUT_DIMENSIONS = 15). lcms2
+    /// rejects it (`cmsERROR_RANGE`, cmsintrp.c:120); tintbox must reject it too,
+    /// rather than accept it and then panic in `interp_factory` at eval — which
+    /// was both a denial-of-service and a bit-identity divergence.
+    #[test]
+    fn mft1_with_16_input_channels_is_rejected_not_paniced() {
+        // input=16, output=1, clut_points=2; the rest (pad + 36-byte matrix +
+        // 16*256 input-table bytes) is zero. The CLUT build is reached and
+        // rejected before any CLUT data is read.
+        let mut body = vec![0u8; 4200];
+        body[0] = 16; // input channels
+        body[1] = 1; // output channels
+        body[2] = 2; // CLUT grid points
+        let mut r = MemReader::new(&body);
+        assert!(
+            matches!(read_lut8(&mut r, body.len() as u32), Err(Error::Range)),
+            "16-input mft1 must be rejected with Error::Range"
+        );
+    }
 }
