@@ -961,6 +961,12 @@ pub fn tetrahedral_float(input: &[f32], output: &mut [f32], table: &[f32], p: &I
 /// temporaries used by [`eval_n_inputs`].
 pub const MAX_STAGE_CHANNELS: usize = 128;
 
+/// lcms2 `MAX_INPUT_DIMENSIONS` (lcms2_internal.h): the most CLUT input channels
+/// the interpolators handle (`interp_factory`'s `1..=15` selector,
+/// `_cmsComputeInterpParamsEx`'s `InputChan > MAX_INPUT_DIMENSIONS` rejection at
+/// cmsintrp.c:120). A CLUT stage with more inputs cannot be evaluated.
+pub(crate) const MAX_INPUT_DIMENSIONS: usize = 15;
+
 /// 16-bit n-D interpolation for 4..=15 inputs, bit-identical to lcms2's
 /// `Eval4Inputs`..`Eval15Inputs` (cmsintrp.c, the `EVAL_FNS` macro chain).
 ///

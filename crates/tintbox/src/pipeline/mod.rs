@@ -49,6 +49,18 @@ impl Pipeline {
         if s.input_channels() > MAX_STAGE_CHANNELS || s.output_channels() > MAX_STAGE_CHANNELS {
             return Err(Error::Unsupported("stage exceeds MAX_STAGE_CHANNELS"));
         }
+        // A CLUT with more than MAX_INPUT_DIMENSIONS (15) inputs cannot be
+        // interpolated (interp_factory's 1..=15 selector would panic at eval).
+        // The CLUT tag readers already enforce this; rejecting here too makes an
+        // over-wide CLUT impossible to place in any pipeline. No behaviour change
+        // for valid profiles, which never exceed 15 CLUT inputs.
+        if let Stage::Clut(c) = &s {
+            if c.input_channels() > crate::interp::MAX_INPUT_DIMENSIONS {
+                return Err(Error::Unsupported(
+                    "CLUT input dimensions exceed MAX_INPUT_DIMENSIONS",
+                ));
+            }
+        }
         let expected_in = match self.stages.last() {
             Some(last) => last.output_channels(),
             None => self.input_channels,
@@ -74,6 +86,18 @@ impl Pipeline {
     pub fn prepend_stage(&mut self, s: Stage) -> Result<()> {
         if s.input_channels() > MAX_STAGE_CHANNELS || s.output_channels() > MAX_STAGE_CHANNELS {
             return Err(Error::Unsupported("stage exceeds MAX_STAGE_CHANNELS"));
+        }
+        // A CLUT with more than MAX_INPUT_DIMENSIONS (15) inputs cannot be
+        // interpolated (interp_factory's 1..=15 selector would panic at eval).
+        // The CLUT tag readers already enforce this; rejecting here too makes an
+        // over-wide CLUT impossible to place in any pipeline. No behaviour change
+        // for valid profiles, which never exceed 15 CLUT inputs.
+        if let Stage::Clut(c) = &s {
+            if c.input_channels() > crate::interp::MAX_INPUT_DIMENSIONS {
+                return Err(Error::Unsupported(
+                    "CLUT input dimensions exceed MAX_INPUT_DIMENSIONS",
+                ));
+            }
         }
         // BlessLUT's chain check at the junction with the (old) first stage:
         // next->InputChannels (old first) must equal prev->OutputChannels (new).
@@ -471,6 +495,32 @@ fn is_float_matrix_identity(m: &[f64; 9]) -> bool {
 #[cfg(test)]
 mod pre_optimize_tests {
     use super::*;
+    use crate::interp::InterpParams;
+    use crate::pipeline::clut::{Clut, ClutTable, ResolvedInterp};
+
+    /// A CLUT with 16 input dimensions exceeds MAX_INPUT_DIMENSIONS (15); at eval
+    /// it would reach `interp_factory`'s 1..=15 selector and panic. The pipeline
+    /// must refuse to hold it, so no such pipeline can ever be constructed (the
+    /// backstop that makes the panic unreachable even if a tag reader's own check
+    /// were removed). Without this guard the insertion would succeed.
+    #[test]
+    fn pipeline_rejects_over_wide_clut() {
+        let clut = Clut {
+            table: ClutTable::F32(Vec::new()),
+            params: InterpParams::new(&[2u32; 16], 16, 1),
+            is_trilinear: false,
+            implements_identity: false,
+            resolved: ResolvedInterp::default(),
+        };
+        let mut p = Pipeline::new(16, 1);
+        assert!(
+            matches!(
+                p.insert_stage_at_end(Stage::Clut(clut)),
+                Err(Error::Unsupported(_))
+            ),
+            "a 16-input CLUT must be rejected at pipeline insertion"
+        );
+    }
 
     fn matrix(m: [f64; 9]) -> Stage {
         Stage::Matrix {

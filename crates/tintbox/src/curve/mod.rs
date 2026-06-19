@@ -379,6 +379,12 @@ impl ToneCurve {
     /// lcms2 `cmsEvalToneCurve16` (cmsgamma.c:1437-1445): always interpolate over
     /// the 16-bit table (`domain == nEntries - 1`).
     pub fn eval_16(&self, v: u16) -> u16 {
+        // An empty 16-bit table (a 0-entry `vcgt`/`UcrBg` curve — which lcms2 also
+        // builds, and which the transform pipeline never evaluates) has no
+        // mapping; treat it as identity rather than underflowing `len() - 1`.
+        if self.table16.is_empty() {
+            return v;
+        }
         let domain = (self.table16.len() - 1) as u32;
         lin_lerp_16(v, &self.table16, domain)
     }
@@ -398,7 +404,11 @@ impl ToneCurve {
 
     /// lcms2 `cmsIsToneCurveDescending` (cmsgamma.c:1393-1398).
     pub fn is_descending(&self) -> bool {
-        self.table16[0] > self.table16[self.table16.len() - 1]
+        // `first`/`last` avoid indexing an empty table (0-entry vcgt/UcrBg curve).
+        match (self.table16.first(), self.table16.last()) {
+            (Some(first), Some(last)) => first > last,
+            _ => false,
+        }
     }
 
     /// lcms2 `IsDegenerated` (cmsopt.c:1022-1039): curves with wide empty areas
@@ -585,6 +595,11 @@ pub fn reverse_tone_curve_ex_in(
 
     let src = &curve.table16;
     let n_entries = src.len();
+    // An empty source table (0-entry vcgt/UcrBg curve) has no mapping to invert;
+    // return the (zero) result rather than indexing `src[0]` / `src[n_entries-1]`.
+    if n_entries == 0 {
+        return build_tabulated_16(&out);
+    }
     // Domain[0] of the SOURCE curve = nEntries - 1.
     let domain = n_entries.saturating_sub(1);
 
