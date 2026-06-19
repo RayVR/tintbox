@@ -3,11 +3,21 @@
 //! positioned reader `r` (already past the 8-byte type base) and `size` =
 //! `TagSize - 8` (the byte count the C handler receives as `SizeOfTag`), and
 //! returns the cooked [`Tag`].
+//!
+//! On the untrusted-parse path, so it carries the no-panic deny set (no
+//! indexing, unwrap, expect, or panic): under `#![forbid(unsafe_code)]` every
+//! one of those is a DoS, not a memory-safety bug.
+#![deny(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 
 use crate::color::{CIExyY, CIExyYTriple};
 use crate::error::{Error, Result};
 use crate::fixed::U16Fixed16;
-use crate::io::ProfileReader;
+use crate::io::{ProfileReader, READ_RESERVE_CAP};
 use crate::profile::header::DateTime;
 use crate::profile::tag::Tag;
 use crate::sig::Signature;
@@ -25,7 +35,12 @@ pub fn read_xyz<R: ProfileReader>(r: &mut R, _size: u32) -> Result<Tag> {
 /// values, which is a lossless superset (the f64 is `S15Fixed16::to_f64`).
 pub fn read_s15fixed16_array<R: ProfileReader>(r: &mut R, size: u32) -> Result<Tag> {
     let n = size / 4;
-    let mut v = Vec::with_capacity(n as usize);
+    // Reserve under a cap and let the push loop grow: `size` is directory-clamped
+    // to the file length, but a ~4 GB tag would still eagerly reserve before the
+    // first short read fails. Capping the reservation is byte-identity-neutral —
+    // the loop still reads exactly `n` elements and fails identically on
+    // truncation (mirrors `read_u16_array`/`read_u32_array`).
+    let mut v = Vec::with_capacity((n as usize).min(READ_RESERVE_CAP));
     for _ in 0..n {
         v.push(r.read_s15f16()?);
     }
@@ -37,7 +52,12 @@ pub fn read_s15fixed16_array<R: ProfileReader>(r: &mut R, size: u32) -> Result<T
 /// raw u32.
 pub fn read_u16fixed16_array<R: ProfileReader>(r: &mut R, size: u32) -> Result<Tag> {
     let n = size / 4;
-    let mut v = Vec::with_capacity(n as usize);
+    // Reserve under a cap and let the push loop grow: `size` is directory-clamped
+    // to the file length, but a ~4 GB tag would still eagerly reserve before the
+    // first short read fails. Capping the reservation is byte-identity-neutral —
+    // the loop still reads exactly `n` elements and fails identically on
+    // truncation (mirrors `read_u16_array`/`read_u32_array`).
+    let mut v = Vec::with_capacity((n as usize).min(READ_RESERVE_CAP));
     for _ in 0..n {
         v.push(U16Fixed16::from_raw(r.read_u32()?));
     }
@@ -169,6 +189,7 @@ pub fn read_colorant_order<R: ProfileReader>(r: &mut R, _size: u32) -> Result<Ta
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::fixed::U16Fixed16;

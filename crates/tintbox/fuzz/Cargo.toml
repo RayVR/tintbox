@@ -83,7 +83,7 @@ bench = false
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
 libfuzzer-sys = "0.4.13"
-tintbox = { version = "0.2.0", path = ".." }
+tintbox = { version = "0.3.0", path = ".." }
 tintbox-oracle = { version = "0.0.0", path = "../../tintbox-oracle" }
 
 [[bin]]

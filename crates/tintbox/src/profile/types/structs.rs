@@ -3,6 +3,16 @@
 //! records) with no MLU/curve nesting. Every reader takes the positioned reader
 //! `r` (already past the 8-byte type base) and `size` = `TagSize - 8` (the byte
 //! count the C handler receives as `SizeOfTag`), and returns the cooked [`Tag`].
+//!
+//! On the untrusted-parse path, so it carries the no-panic deny set (no
+//! indexing, unwrap, expect, or panic): under `#![forbid(unsafe_code)]` every
+//! one of those is a DoS, not a memory-safety bug.
+#![deny(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 
 use crate::error::{Error, Result};
 use crate::io::ProfileReader;
@@ -223,7 +233,9 @@ pub fn read_colorant_table<R: ProfileReader>(r: &mut R, _size: u32) -> Result<Ta
         let mut name_buf = [0u8; 32];
         r.read_exact(&mut name_buf)?;
         let end = name_buf.iter().position(|&b| b == 0).unwrap_or(32);
-        let name: String = name_buf[..end].iter().map(|&b| b as char).collect();
+        // `end <= 32 == name_buf.len()`; `take` is the panic-free equivalent of
+        // the `[..end]` slice and yields the same bytes.
+        let name: String = name_buf.iter().take(end).map(|&b| b as char).collect();
         let pcs = [r.read_u16()?, r.read_u16()?, r.read_u16()?];
         entries.push(ColorantTableEntry { name, pcs });
     }
@@ -231,6 +243,7 @@ pub fn read_colorant_table<R: ProfileReader>(r: &mut R, _size: u32) -> Result<Ta
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::io::MemReader;

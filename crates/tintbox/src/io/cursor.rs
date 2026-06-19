@@ -1,4 +1,14 @@
 //! In-memory reader over a byte slice — the wasm-friendly default source.
+//!
+//! The lowest untrusted-input primitive: every byte an attacker supplies flows
+//! through here first. It carries the no-panic deny set (no indexing, unwrap,
+//! expect, or panic) — under `#![forbid(unsafe_code)]` each is a DoS.
+#![deny(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 
 use crate::error::{Error, Result};
 use crate::io::reader::ProfileReader;
@@ -21,7 +31,10 @@ impl ProfileReader for MemReader<'_> {
                 got: (self.buf.len() - self.pos) as u32,
             });
         }
-        out.copy_from_slice(&self.buf[self.pos..end]);
+        // `end <= buf.len()` (checked above) and `pos <= end`, so this range is
+        // always valid; `get` keeps the access panic-free regardless.
+        let src = self.buf.get(self.pos..end).ok_or(Error::Range)?;
+        out.copy_from_slice(src);
         self.pos = end;
         Ok(())
     }
@@ -39,6 +52,7 @@ impl ProfileReader for MemReader<'_> {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     #[test]

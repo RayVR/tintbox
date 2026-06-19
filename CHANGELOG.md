@@ -12,6 +12,50 @@ bytes faster — they never change a result.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-19
+
+Feature + security-hardening release. Pixel output is **unchanged** — every
+existing path stays byte-for-byte identical to lcms2; the new `.cube` support is
+additive and the hardening is provably accept-path-neutral (the differential
+sweeps are unchanged). The headline addition is `.cube` (Iridas/Adobe 3D-LUT)
+support, including a **lossless** save path that lcms2 itself cannot produce.
+
+### Added
+- **`.cube` 3D-LUT import** — parse an Iridas/Adobe `.cube` file into an in-memory
+  RGB→RGB device-link transform, transforming byte-for-byte identically to lcms2's
+  own in-memory device-link over the same nodes (differential-verified).
+- **Lossless `.cube` device-link save** — serialize an imported `.cube` to an ICC
+  device-link via a float `D2B0`/`mpet` (multiProcessElements) pipeline, preserving
+  the float CLUT exactly. lcms2 cannot round-trip a 3D-LUT device-link this way (its
+  `mAB` writer rejects float CLUTs), so this is a lossless superset of lcms2's
+  serializer, not a divergence from it.
+
+### Fixed
+- Reject 16-input-channel `mft1`/`mft2` CLUTs with `Error::Range`. Such a LUT passes
+  the `cmsMAXCHANNELS` (16) check but exceeds the CLUT interpolation limit
+  (`MAX_INPUT_DIMENSIONS` = 15); lcms2 rejects it (`cmsERROR_RANGE`, cmsintrp.c:120).
+  Previously tintbox accepted it and then panicked in `interp_factory` at eval — both
+  a denial-of-service **and** a bit-identity divergence. Now rejected at parse, in
+  parity with lcms2.
+
+### Security
+- **Hardened the parsers against malformed-input DoS** (the `unsafe`-free threat
+  model is panic / OOM / hang, not RCE). Capacity hints driven by attacker-controlled
+  counts are bounded before allocation; size arithmetic uses checked/`wrapping` ops
+  matching lcms2's accept/reject decisions; the tag-link chase is loop-bounded against
+  cycles.
+- **Compiler-enforced no-panic discipline** (`deny(indexing_slicing, unwrap_used,
+  expect_used, panic)`) now covers the full ICC parse spine — byte primitives, header,
+  tag directory, and every tag-type reader (ICC + CGATS) — locking the property
+  against regression.
+- **Kani proofs** that the CLUT and `.cube` size-arithmetic (lcms2's historic
+  integer-overflow CVE class) is total — no overflow, truncation, or panic — over the
+  whole validated input range, and upholds the headroom bound the granular-CLUT
+  readers depend on.
+- **Coverage-guided fuzzing** (cargo-fuzz) for the ICC profile, ICC differential,
+  CGATS/IT8, packed-transform, profile-transform, curve-eval, `.cube`-file, and
+  LUT-count surfaces, with always-on stable malformed-input tests as the complement.
+
 ## [0.2.0] - 2026-06-16
 
 Performance release. Pixel output is **unchanged and still lossless** — the new
@@ -88,6 +132,7 @@ wasm-ready, and verified bit-identical to the C library by differential testing.
   curves, tag types, rendering intents, optimizers, interpolators), consulted
   builtins-first so they cannot perturb the bit-identical defaults.
 
-[Unreleased]: https://github.com/RayVR/tintbox/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/RayVR/tintbox/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/RayVR/tintbox/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/RayVR/tintbox/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/RayVR/tintbox/releases/tag/v0.1.0

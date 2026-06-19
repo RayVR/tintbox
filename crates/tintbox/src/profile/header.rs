@@ -6,6 +6,16 @@
 //! same values. We keep exactly the fields lcms2 keeps, validate the magic
 //! number, clamp the version through `_validatedVersion`, and reject versions
 //! `> 0x5000000` — matching lcms2's accept/reject decision.
+//!
+//! On the untrusted-parse path, so it carries the no-panic deny set (no
+//! indexing, unwrap, expect, or panic): under `#![forbid(unsafe_code)]` every
+//! one of those is a DoS, not a memory-safety bug.
+#![deny(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 
 use crate::color::CIEXYZ;
 use crate::error::{Error, Result};
@@ -405,6 +415,7 @@ impl Header {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::io::MemReader;

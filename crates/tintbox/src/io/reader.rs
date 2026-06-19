@@ -4,6 +4,16 @@
 //! `file-io` feature. ICC is big-endian on the wire. `read_at` (positioned) is a
 //! deliberate improvement over lcms2's seek-then-read-only IOHANDLER. seek/tell
 //! are u64 (lcms2 uses u32) — intentional widening; do not narrow back.
+//!
+//! On the untrusted-parse path, so it carries the no-panic deny set (no
+//! indexing, unwrap, expect, or panic): under `#![forbid(unsafe_code)]` every
+//! one of those is a DoS, not a memory-safety bug.
+#![deny(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 
 use crate::color::CIEXYZ;
 use crate::error::{Error, Result};
@@ -110,7 +120,9 @@ pub trait ProfileReader {
         let mut buf = vec![0u8; n];
         self.read_exact(&mut buf)?;
         let end = buf.iter().position(|&b| b == 0).unwrap_or(n);
-        Ok(buf[..end].iter().map(|&b| b as char).collect())
+        // `end <= n == buf.len()`; `take` yields the same prefix bytes the
+        // `[..end]` slice would, without a panicking range.
+        Ok(buf.iter().take(end).map(|&b| b as char).collect())
     }
 
     fn read_s15f16(&mut self) -> Result<S15Fixed16> {
@@ -149,6 +161,9 @@ pub trait ProfileReader {
             return Err(Error::Corrupt("alignment > 4"));
         }
         let mut buf = [0u8; 4];
-        self.read_exact(&mut buf[..pad as usize])
+        // `pad` is in `1..=4` here (0 returned early, `>4` rejected above), so
+        // the slice is always valid; `get_mut` keeps it panic-free.
+        let slot = buf.get_mut(..pad as usize).ok_or(Error::Range)?;
+        self.read_exact(slot)
     }
 }
