@@ -153,6 +153,28 @@ void tintbox_oracle_lch2lab(const double lch[3], double lab[3]) {
     cmsLCh2Lab(&Lab, &LCh);
     lab[0] = Lab.L; lab[1] = Lab.a; lab[2] = Lab.b;
 }
+/* ΔE colour-difference metrics (cmspcs.c). */
+static void load_lab2(const double a[3], const double b[3], cmsCIELab* L1, cmsCIELab* L2) {
+    L1->L = a[0]; L1->a = a[1]; L1->b = a[2];
+    L2->L = b[0]; L2->a = b[1]; L2->b = b[2];
+}
+double tintbox_oracle_cie94_delta_e(const double lab1[3], const double lab2[3]) {
+    cmsCIELab L1, L2; load_lab2(lab1, lab2, &L1, &L2);
+    return cmsCIE94DeltaE(&L1, &L2);
+}
+double tintbox_oracle_bfd_delta_e(const double lab1[3], const double lab2[3]) {
+    cmsCIELab L1, L2; load_lab2(lab1, lab2, &L1, &L2);
+    return cmsBFDdeltaE(&L1, &L2);
+}
+double tintbox_oracle_cmc_delta_e(const double lab1[3], const double lab2[3], double l, double c) {
+    cmsCIELab L1, L2; load_lab2(lab1, lab2, &L1, &L2);
+    return cmsCMCdeltaE(&L1, &L2, l, c);
+}
+double tintbox_oracle_cie2000_delta_e(const double lab1[3], const double lab2[3],
+                                      double kl, double kc, double kh) {
+    cmsCIELab L1, L2; load_lab2(lab1, lab2, &L1, &L2);
+    return cmsCIE2000DeltaE(&L1, &L2, kl, kc, kh);
+}
 /* Lab v4 / v2 encodings (16-bit). */
 void tintbox_oracle_lab_enc2float_v4(const uint16_t wlab[3], double lab[3]) {
     cmsCIELab Lab; cmsUInt16Number w[3] = { wlab[0], wlab[1], wlab[2] };

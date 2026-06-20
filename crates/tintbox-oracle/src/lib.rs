@@ -37,6 +37,16 @@ unsafe extern "C" {
     fn tintbox_oracle_xyy2xyz(xyy: *const f64, xyz: *mut f64);
     fn tintbox_oracle_lab2lch(lab: *const f64, lch: *mut f64);
     fn tintbox_oracle_lch2lab(lch: *const f64, lab: *mut f64);
+    fn tintbox_oracle_cie94_delta_e(lab1: *const f64, lab2: *const f64) -> f64;
+    fn tintbox_oracle_bfd_delta_e(lab1: *const f64, lab2: *const f64) -> f64;
+    fn tintbox_oracle_cmc_delta_e(lab1: *const f64, lab2: *const f64, l: f64, c: f64) -> f64;
+    fn tintbox_oracle_cie2000_delta_e(
+        lab1: *const f64,
+        lab2: *const f64,
+        kl: f64,
+        kc: f64,
+        kh: f64,
+    ) -> f64;
     fn tintbox_oracle_lab_enc2float_v4(wlab: *const u16, lab: *mut f64);
     fn tintbox_oracle_float2lab_enc_v4(lab: *const f64, wlab: *mut u16);
     fn tintbox_oracle_lab_enc2float_v2(wlab: *const u16, lab: *mut f64);
@@ -1826,6 +1836,26 @@ pub fn lab2lch(lab: &[f64; 3]) -> [f64; 3] {
     // SAFETY: lab/out are valid 3-double arrays C reads/writes.
     unsafe { tintbox_oracle_lab2lch(lab.as_ptr(), out.as_mut_ptr()) };
     out
+}
+/// lcms2 `cmsCIE94DeltaE`.
+pub fn cie94_delta_e(lab1: &[f64; 3], lab2: &[f64; 3]) -> f64 {
+    // SAFETY: lab1/lab2 are valid 3-double arrays C reads.
+    unsafe { tintbox_oracle_cie94_delta_e(lab1.as_ptr(), lab2.as_ptr()) }
+}
+/// lcms2 `cmsBFDdeltaE`.
+pub fn bfd_delta_e(lab1: &[f64; 3], lab2: &[f64; 3]) -> f64 {
+    // SAFETY: lab1/lab2 are valid 3-double arrays C reads.
+    unsafe { tintbox_oracle_bfd_delta_e(lab1.as_ptr(), lab2.as_ptr()) }
+}
+/// lcms2 `cmsCMCdeltaE`.
+pub fn cmc_delta_e(lab1: &[f64; 3], lab2: &[f64; 3], l: f64, c: f64) -> f64 {
+    // SAFETY: lab1/lab2 are valid 3-double arrays C reads.
+    unsafe { tintbox_oracle_cmc_delta_e(lab1.as_ptr(), lab2.as_ptr(), l, c) }
+}
+/// lcms2 `cmsCIE2000DeltaE`.
+pub fn cie2000_delta_e(lab1: &[f64; 3], lab2: &[f64; 3], kl: f64, kc: f64, kh: f64) -> f64 {
+    // SAFETY: lab1/lab2 are valid 3-double arrays C reads.
+    unsafe { tintbox_oracle_cie2000_delta_e(lab1.as_ptr(), lab2.as_ptr(), kl, kc, kh) }
 }
 /// lcms2 `cmsLCh2Lab`. Returns `[L, a, b]`.
 pub fn lch2lab(lch: &[f64; 3]) -> [f64; 3] {
