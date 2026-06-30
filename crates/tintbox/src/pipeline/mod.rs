@@ -42,6 +42,16 @@ impl Pipeline {
         &self.stages
     }
 
+    /// Number of input channels the pipeline expects.
+    pub fn input_channels(&self) -> usize {
+        self.input_channels
+    }
+
+    /// Number of output channels the pipeline produces.
+    pub fn output_channels(&self) -> usize {
+        self.output_channels
+    }
+
     /// Append a stage at the end (lcms2 `cmsPipelineInsertStage` with
     /// `cmsAT_END`). Rejects stages whose width exceeds [`MAX_STAGE_CHANNELS`]
     /// or that do not chain with the preceding stage's output width.

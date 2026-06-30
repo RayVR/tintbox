@@ -1629,6 +1629,14 @@ impl Profile {
         self.table().n_samples
     }
 
+    /// Number of data rows (patches) actually present in the active table. This
+    /// is the parser-validated count (`np*ns <= 200000`, and the data section
+    /// must match it), unlike the raw `NUMBER_OF_SETS` property which is attacker
+    /// controlled — iterate rows against this, not the property.
+    pub fn num_patches(&self) -> i32 {
+        self.table().n_patches
+    }
+
     /// DATA_FORMAT label for column `col`, `None` if out of range.
     pub fn data_format(&self, col: i32) -> Option<&str> {
         self.get_data_format(col)
