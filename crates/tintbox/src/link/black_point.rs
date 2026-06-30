@@ -342,11 +342,19 @@ fn black_point_as_darker_colorant(
 
     // Lab2 will be used as the output space (lab2 avoids recursion). Build it as
     // an IN-MEMORY profile (not serialize→reparse) so its identity CLUT links
-    // bit-identically to lcms2's freshly-built cmsCreateLab2Profile.
-    let lab2 = Profile::from_writable(&build_lab2_profile())?;
+    // bit-identically to lcms2's freshly-built cmsCreateLab2Profile. lcms2
+    // (cmssamp.c:43-45) maps a NULL Lab2 profile to a {0,0,0} black point.
+    let lab2 = match Profile::from_writable(&build_lab2_profile()) {
+        Ok(p) => p,
+        Err(_) => return Ok(BlackPoint::Zero),
+    };
 
     // device(16-bit) → Lab2 (TYPE_Lab_DBL out), rel/intent, NOOPTIMIZE|NOCACHE.
-    let xform = Transform::new_with_formats(
+    // lcms2 (cmssamp.c:53-57) maps an un-buildable transform to {0,0,0}, not a
+    // hard failure. The up-front `is_intent_supported(.., Input)` guard already
+    // ensures the forward direction exists, so this rarely fires — but mirroring
+    // lcms2's NULL→zero keeps the error path bit-identical.
+    let xform = match Transform::new_with_formats(
         &[profile, &lab2],
         &[intent, intent],
         &[false, false],
@@ -354,7 +362,10 @@ fn black_point_as_darker_colorant(
         Flags::NOOPTIMIZE,
         dev_format,
         TYPE_LAB_DBL,
-    )?;
+    ) {
+        Ok(x) => x,
+        Err(_) => return Ok(BlackPoint::Zero),
+    };
 
     // Pack the darker colorant into a 16-bit native buffer and push it through.
     let mut in_buf = vec![0u8; nchan * 2];
@@ -392,7 +403,16 @@ fn black_point_using_perceptual_black(profile: &Profile) -> Result<BlackPoint> {
         return Ok(BlackPoint::Zero);
     }
 
-    let xform = create_roundtrip_xform(profile, RenderingIntent::Perceptual)?;
+    // lcms2 `BlackPointUsingPerceptualBlack` (cmssamp.c:165-168): if the
+    // round-trip transform can't be built (e.g. an Output-class profile with an
+    // `A2B0` but no `B2A0`, so the Lab→device leg has no tag), lcms2 sets the
+    // black point to {0,0,0} and returns — it does NOT fail the parent transform.
+    // tintbox previously propagated this error, aborting a build lcms2 completes;
+    // map the un-buildable round-trip to a zero black point to stay bit-identical.
+    let xform = match create_roundtrip_xform(profile, RenderingIntent::Perceptual) {
+        Ok(x) => x,
+        Err(_) => return Ok(BlackPoint::Zero),
+    };
 
     // LabIn = (0,0,0).
     let lab_out = roundtrip_lab(
