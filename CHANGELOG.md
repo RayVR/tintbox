@@ -12,6 +12,36 @@ bytes faster — they never change a result.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-30
+
+Adds the standalone ΔE colour-difference metrics and fixes a black-point-detection
+parity bug. Output is **unchanged** on every input that already worked — the ΔE
+functions are additive, and the BPC fix only changes a path that previously
+*errored* (it now completes, byte-identically to lcms2).
+
+### Added
+- **`cmsCIE2000DeltaE` / CIEDE2000** plus `cmsCIE94DeltaE`, `cmsCMCdeltaE`, and
+  `cmsBFDdeltaE` (`pcs::{cie2000_delta_e, cie94_delta_e, cmc_delta_e,
+  bfd_delta_e}`) — standalone public ΔE utilities lcms2 exposes that tintbox had
+  not yet ported. Transcribed verbatim and verified bit-identical to lcms2 over a
+  200k-pair differential sweep (NaN/inf payloads included) plus directed
+  branch-coverage cases.
+- `Pipeline::input_channels` / `Pipeline::output_channels` and
+  `cgats::Profile::num_patches` — generic public accessors.
+
+### Fixed
+- **BPC black-point detection on profiles lacking the reverse direction.**
+  Building a Black-Point-Compensation transform from an `Output`-class CMYK
+  profile that has an `A2B0` but no `B2A0` failed with `Error::Range` (the
+  black-point round-trip needs the missing `B2A` leg, and the error aborted the
+  whole transform). lcms2 maps an un-buildable black-point round-trip to a
+  `{0,0,0}` black point and proceeds (`cmssamp.c:165-168`); tintbox now mirrors
+  that NULL→zero contract in both `BlackPointUsingPerceptualBlack` and
+  `BlackPointAsDarkerColorant`, so the transform builds **byte-identically to
+  lcms2**. Verified by a TDD differential test (`tests/bpc_no_b2a_roundtrip.rs`,
+  red against the oracle, then green). Surfaced downstream in pdf_oxide's
+  OutputIntent rendering on `A2B0`-only CMYK profiles.
+
 ## [0.3.0] - 2026-06-19
 
 Feature + security-hardening release. Pixel output is **unchanged** — every
@@ -132,7 +162,8 @@ wasm-ready, and verified bit-identical to the C library by differential testing.
   curves, tag types, rendering intents, optimizers, interpolators), consulted
   builtins-first so they cannot perturb the bit-identical defaults.
 
-[Unreleased]: https://github.com/RayVR/tintbox/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/RayVR/tintbox/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/RayVR/tintbox/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/RayVR/tintbox/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/RayVR/tintbox/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/RayVR/tintbox/releases/tag/v0.1.0
