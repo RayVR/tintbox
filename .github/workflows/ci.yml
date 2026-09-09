@@ -24,8 +24,10 @@ jobs:
           # The tintbox-oracle crate cc-builds the vendored C lcms2 submodule.
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.97.0
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -46,8 +48,10 @@ jobs:
       - uses: actions/checkout@v4
         # No submodules: the wasm build excludes the test-only oracle.
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.97.0
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
