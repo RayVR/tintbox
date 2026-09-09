@@ -12,6 +12,32 @@ bytes faster — they never change a result.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-09
+
+Performance improvements to the lossless batched transform path. The default
+remains `AccurateFast`; SIMD remains opt-in, and no public API is removed.
+
+### Changed
+- Reuse the caller's context in generic batched stages, removing a per-pixel
+  context construction and drop.
+- Collapse consecutive identical packed input pixels within each tile, evaluate
+  each run once, and reuse its color result for flat-area artwork and labels.
+- Preserve existing destination extra-channel bytes while reusing color results.
+  Formats with extra channels are repacked per pixel; the new optimization never
+  copies a previous pixel's untouched alpha into the next pixel.
+
+### Added
+- Flat-run benchmarks beside the existing random-input workloads.
+- Regression tests for context construction counts, repeated-pixel evaluation
+  counts, tile-boundary behavior, and exact output/extra-channel parity across
+  8-bit, 16-bit, and float formats.
+- Contribution guidance, a draft contributor agreement, and BPC bug documentation.
+
+### Upgrade notes
+- Includes the important 0.4.0 BPC fix for Output-class CMYK profiles with `A2B0`
+  but no reverse `B2A0` direction, plus the Delta E metrics and public getters.
+  These were already published in 0.4.0 and remain included in 0.5.0.
+
 ## [0.4.0] - 2026-06-30
 
 Adds the standalone ΔE colour-difference metrics and fixes a black-point-detection
@@ -162,7 +188,8 @@ wasm-ready, and verified bit-identical to the C library by differential testing.
   curves, tag types, rendering intents, optimizers, interpolators), consulted
   builtins-first so they cannot perturb the bit-identical defaults.
 
-[Unreleased]: https://github.com/RayVR/tintbox/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/RayVR/tintbox/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/RayVR/tintbox/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/RayVR/tintbox/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/RayVR/tintbox/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/RayVR/tintbox/compare/v0.1.0...v0.2.0

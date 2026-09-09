@@ -35,6 +35,8 @@ pub struct Context<'a> {
 
 impl<'a> Context<'a> {
     pub fn new() -> Self {
+        #[cfg(test)]
+        test_probe::note_new();
         Context::default()
     }
     pub fn with_logger(logger: &'a dyn Logger) -> Self {
@@ -127,5 +129,27 @@ mod tests {
         let cap = Cap(Cell::new(0));
         Context::with_logger(&cap).log(42, format_args!("x={}", 7));
         assert_eq!(cap.0.get(), 42);
+    }
+}
+
+/// Test-only probe counting `Context::new()` constructions, so unit tests can
+/// pin that per-pixel eval loops thread ONE hoisted context instead of
+/// constructing (and dropping) a context per pixel — a measured hotspot
+/// (`drop_glue<Context>` + registry walk) on curve/matrix-heavy pipelines.
+#[cfg(test)]
+pub(crate) mod test_probe {
+    // Thread-local so parallel lib tests never see each other's counts —
+    // every eval under test runs on the calling test's own thread.
+    thread_local! {
+        static NEWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(crate) fn note_new() {
+        NEWS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Constructions observed on THIS thread; measure deltas.
+    pub(crate) fn new_count() -> usize {
+        NEWS.with(|c| c.get())
     }
 }

@@ -731,6 +731,9 @@ impl Transform {
         let out_ch = self.lut.output_channels;
         let in_stride = pixel_bytes(fmts.in_fmt);
         let out_stride = pixel_bytes(fmts.out_fmt);
+        // Whole-pixel reuse is safe only when every destination byte is written.
+        // Extra channels may retain per-pixel values already in the output buffer.
+        let copy_whole_pixel = crate::format::decode::PixelFormat(fmts.out_fmt).extra() == 0;
 
         // Size the per-call tile to the ACTUAL work, not the full TILE. A small call
         // (the batched path only fires at all for n_pixels >= BATCHED_THRESHOLD, but
@@ -745,6 +748,16 @@ impl Transform {
         // `vec![0; CHUNK*MAX_STAGE_CHANNELS]` zeroing that otherwise dominates the
         // profile as `__bzero`.
         let mut eval_scratch = crate::opt::batched::BatchedScratch::with_capacity(tile);
+        // Consecutive-duplicate collapse (lcms2's 1-pixel cache — §8.8, noted
+        // there as value-neutral — generalised to runs): within a tile, a run of
+        // IDENTICAL packed input pixels is unpacked and evaluated once and its
+        // packed output replicated. Pure memoization of a pixel-independent
+        // function of the packed bytes: the batched path never runs with a gamut
+        // check, and the alpha-copy plan reads only the packed input bytes the
+        // equality already covers — so output is byte-for-byte unchanged, while
+        // flat-area rasters (labels, spot artwork) evaluate a fraction of their
+        // pixels. `uniq_of[p]` maps each tile pixel to its unique slot.
+        let mut uniq_of = vec![0u32; tile];
         // ONE empty context for the whole call — threaded into the per-tile batched
         // eval so it never constructs/drops a `Context`'s plugin registries per tile.
         let eval_ctx = Context::new();
@@ -761,33 +774,53 @@ impl Transform {
             let mut base = 0usize;
             while base < n_pixels {
                 let m = (n_pixels - base).min(tile);
-                // Unpack the tile into the contiguous channel buffer.
+                // Unpack the tile's UNIQUE pixels into the contiguous channel
+                // buffer, collapsing runs of identical packed pixels (see the
+                // `uniq_of` note above).
+                let mut m_u = 0usize;
                 for p in 0..m {
                     let in_pixel =
                         &input[(base + p) * in_stride..(base + p) * in_stride + in_stride];
+                    if p > 0
+                        && in_pixel
+                            == &input
+                                [(base + p - 1) * in_stride..(base + p - 1) * in_stride + in_stride]
+                    {
+                        uniq_of[p] = (m_u - 1) as u32;
+                        continue;
+                    }
                     from_input(in_pixel, &mut fin);
-                    chan_in[p * in_ch..p * in_ch + in_ch].copy_from_slice(&fin[..in_ch]);
+                    chan_in[m_u * in_ch..m_u * in_ch + in_ch].copy_from_slice(&fin[..in_ch]);
+                    uniq_of[p] = m_u as u32;
+                    m_u += 1;
                 }
                 // Batched eval (identical to per-pixel eval_float), reusing scratch.
                 batched.eval_float_buffer_with(
-                    &chan_in[..m * in_ch],
-                    &mut chan_out[..m * out_ch],
-                    m,
+                    &chan_in[..m_u * in_ch],
+                    &mut chan_out[..m_u * out_ch],
+                    m_u,
                     &mut eval_scratch,
                     &eval_ctx,
                 );
                 // Pack the tile back out (padding the packer's MAX_CHANNELS input).
+                // A run member after the first replicates the previous pixel's
+                // packed output bytes (identical packed input ⇒ identical packed
+                // output, alpha included).
                 let mut fout = [0f32; MAX_CHANNELS];
                 for p in 0..m {
-                    fout[..out_ch].copy_from_slice(&chan_out[p * out_ch..p * out_ch + out_ch]);
-                    let out_pixel =
-                        &mut output[(base + p) * out_stride..(base + p) * out_stride + out_stride];
+                    let out_start = (base + p) * out_stride;
+                    if copy_whole_pixel && p > 0 && uniq_of[p - 1] == uniq_of[p] {
+                        output.copy_within(out_start - out_stride..out_start, out_start);
+                        continue;
+                    }
+                    let u = uniq_of[p] as usize;
+                    fout[..out_ch].copy_from_slice(&chan_out[u * out_ch..u * out_ch + out_ch]);
+                    let out_pixel = &mut output[out_start..out_start + out_stride];
                     to_output(&fout, out_pixel);
                     if let Some(plan) = &fmts.alpha_copy {
                         let in_pixel =
                             &input[(base + p) * in_stride..(base + p) * in_stride + in_stride];
-                        let out_pixel = &mut output
-                            [(base + p) * out_stride..(base + p) * out_stride + out_stride];
+                        let out_pixel = &mut output[out_start..out_start + out_stride];
                         plan.copy_pixel(in_pixel, out_pixel);
                     }
                 }
@@ -803,30 +836,46 @@ impl Transform {
             let mut base = 0usize;
             while base < n_pixels {
                 let m = (n_pixels - base).min(tile);
+                // Unique-run unpack — see the float branch; identical logic.
+                let mut m_u = 0usize;
                 for p in 0..m {
                     let in_pixel =
                         &input[(base + p) * in_stride..(base + p) * in_stride + in_stride];
+                    if p > 0
+                        && in_pixel
+                            == &input
+                                [(base + p - 1) * in_stride..(base + p - 1) * in_stride + in_stride]
+                    {
+                        uniq_of[p] = (m_u - 1) as u32;
+                        continue;
+                    }
                     from_input(in_pixel, &mut win);
-                    chan_in[p * in_ch..p * in_ch + in_ch].copy_from_slice(&win[..in_ch]);
+                    chan_in[m_u * in_ch..m_u * in_ch + in_ch].copy_from_slice(&win[..in_ch]);
+                    uniq_of[p] = m_u as u32;
+                    m_u += 1;
                 }
                 batched.eval_16_buffer_with(
-                    &chan_in[..m * in_ch],
-                    &mut chan_out[..m * out_ch],
-                    m,
+                    &chan_in[..m_u * in_ch],
+                    &mut chan_out[..m_u * out_ch],
+                    m_u,
                     &mut eval_scratch,
                     &eval_ctx,
                 );
                 let mut wout = [0u16; MAX_CHANNELS];
                 for p in 0..m {
-                    wout[..out_ch].copy_from_slice(&chan_out[p * out_ch..p * out_ch + out_ch]);
-                    let out_pixel =
-                        &mut output[(base + p) * out_stride..(base + p) * out_stride + out_stride];
+                    let out_start = (base + p) * out_stride;
+                    if copy_whole_pixel && p > 0 && uniq_of[p - 1] == uniq_of[p] {
+                        output.copy_within(out_start - out_stride..out_start, out_start);
+                        continue;
+                    }
+                    let u = uniq_of[p] as usize;
+                    wout[..out_ch].copy_from_slice(&chan_out[u * out_ch..u * out_ch + out_ch]);
+                    let out_pixel = &mut output[out_start..out_start + out_stride];
                     to_output(&wout, out_pixel);
                     if let Some(plan) = &fmts.alpha_copy {
                         let in_pixel =
                             &input[(base + p) * in_stride..(base + p) * in_stride + in_stride];
-                        let out_pixel = &mut output
-                            [(base + p) * out_stride..(base + p) * out_stride + out_stride];
+                        let out_pixel = &mut output[out_start..out_start + out_stride];
                         plan.copy_pixel(in_pixel, out_pixel);
                     }
                 }
@@ -1239,5 +1288,158 @@ impl Transform {
             out_fmt,
             strategy,
         )
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+    use crate::format::decode::TYPE_RGB_8;
+    use crate::profile::header::RenderingIntent;
+    use crate::profile::Profile;
+
+    /// A CLUT device-link whose transform takes the batched general path.
+    fn clut_devicelink() -> Profile<'static> {
+        const CUBE: &str = "TITLE \"clut only\"\n\
+            DOMAIN_MIN 0.0 0.0 0.0\n\
+            DOMAIN_MAX 1.0 1.0 1.0\n\
+            LUT_3D_SIZE 2\n\
+            0.0 0.0 0.0\n\
+            1.0 0.0 0.0\n\
+            0.0 1.0 0.0\n\
+            1.0 1.0 0.0\n\
+            0.0 0.0 1.0\n\
+            1.0 0.0 1.0\n\
+            0.0 1.0 1.0\n\
+            1.0 1.0 1.0\n";
+        let writable = crate::cgats::create_devicelink_from_cube_mem(CUBE.as_bytes())
+            .expect("cube builds a device-link");
+        Profile::from_writable(&writable).expect("device-link materialises")
+    }
+
+    fn build_xform(profile: &Profile) -> Transform {
+        Transform::new_with_formats(
+            &[profile],
+            &[RenderingIntent::Perceptual],
+            &[false],
+            &[1.0],
+            Flags::empty(),
+            TYPE_RGB_8,
+            TYPE_RGB_8,
+        )
+        .expect("transform builds")
+    }
+
+    /// Runs of identical packed input pixels must be unpacked and EVALUATED
+    /// once (the packed output replicated): lcms2's 1-pixel cache (§8.8,
+    /// value-neutral) generalised to runs. Rasters with flat areas — labels,
+    /// vignette-free artwork — are dominated by such runs.
+    #[test]
+    fn identical_pixel_runs_evaluate_once() {
+        let profile = clut_devicelink();
+        let xform = build_xform(&profile);
+        assert!(xform.batched_fired(), "fixture must take the batched path");
+
+        // 8192 pixels in 4 flat runs of 2048.
+        let mut input = Vec::with_capacity(8192 * 3);
+        for run in 0..4u8 {
+            for _ in 0..2048 {
+                input.extend_from_slice(&[run * 60, 255 - run * 40, run * 17]);
+            }
+        }
+        let n = input.len() / 3;
+        let mut out = vec![0u8; n * 3];
+
+        let before = crate::opt::batched::test_probe::eval_pixel_count();
+        xform.do_transform(&input, &mut out, n);
+        let evaluated = crate::opt::batched::test_probe::eval_pixel_count() - before;
+        assert!(
+            evaluated <= 16,
+            "4 flat runs of 2048 identical pixels evaluated {evaluated} pixels — \
+             identical packed inputs must be collapsed and evaluated once per run"
+        );
+    }
+
+    /// The collapse must be invisible in the bytes: a buffer mixing flat runs,
+    /// alternating duplicates, and unique pixels produces byte-for-byte the
+    /// same output as the per-pixel `Accurate` reference strategy.
+    #[test]
+    fn duplicate_runs_preserve_uncopied_extra_channels() {
+        use crate::format::decode::{TYPE_ARGB_8, TYPE_RGBA_16, TYPE_RGBA_8, TYPE_RGBA_FLT};
+        let profile = clut_devicelink();
+        for output_format in [TYPE_RGBA_8, TYPE_ARGB_8, TYPE_RGBA_16, TYPE_RGBA_FLT] {
+            let make = |strategy| {
+                Transform::new_with_formats_strategy(
+                    &[&profile],
+                    &[RenderingIntent::Perceptual],
+                    &[false],
+                    &[1.0],
+                    Flags::empty(),
+                    TYPE_RGB_8,
+                    output_format,
+                    strategy,
+                )
+                .expect("transform builds")
+            };
+            let fast = make(crate::opt::OptimizationStrategy::AccurateFast);
+            let accurate = make(crate::opt::OptimizationStrategy::Accurate);
+            assert!(fast.batched_fired());
+            let n = 8193;
+            let input = [10, 200, 30].repeat(n);
+            let stride = pixel_bytes(output_format);
+            let mut expected: Vec<u8> = (0..n * stride).map(|i| (i % 251) as u8).collect();
+            let mut actual = expected.clone();
+            accurate.do_transform(&input, &mut expected, n);
+            fast.do_transform(&input, &mut actual, n);
+            let mismatch = actual.iter().zip(&expected).position(|(a, b)| a != b);
+            assert!(
+                mismatch.is_none(),
+                "format {output_format:#x}: mismatch at {mismatch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_output_is_byte_identical_to_accurate() {
+        let profile = clut_devicelink();
+        let fast = build_xform(&profile);
+        let accurate = Transform::new_with_formats_strategy(
+            &[&profile],
+            &[RenderingIntent::Perceptual],
+            &[false],
+            &[1.0],
+            Flags::empty(),
+            TYPE_RGB_8,
+            TYPE_RGB_8,
+            crate::opt::OptimizationStrategy::Accurate,
+        )
+        .expect("accurate transform builds");
+        assert!(fast.batched_fired());
+
+        let mut input = Vec::new();
+        // Flat run, then unique ramp, then A/B alternation, then a short tail —
+        // crossing the batched tile boundary (8192) so cross-tile edges are hit.
+        for _ in 0..5000 {
+            input.extend_from_slice(&[10, 200, 30]);
+        }
+        for i in 0..5000u32 {
+            input.extend_from_slice(&[(i % 251) as u8, (i % 249) as u8, (i % 247) as u8]);
+        }
+        for i in 0..2000u32 {
+            let px = if i % 2 == 0 {
+                [1, 2, 3]
+            } else {
+                [200, 100, 50]
+            };
+            input.extend_from_slice(&px);
+        }
+        input.extend_from_slice(&[7, 7, 7]);
+        let n = input.len() / 3;
+
+        let mut out_fast = vec![0u8; n * 3];
+        let mut out_acc = vec![0u8; n * 3];
+        fast.do_transform(&input, &mut out_fast, n);
+        accurate.do_transform(&input, &mut out_acc, n);
+        assert_eq!(out_fast, out_acc, "dedup changed output bytes");
     }
 }

@@ -200,7 +200,7 @@ mod tests {
         assert_eq!(r.read_ascii(7).unwrap(), "Hi");
         assert_eq!(r.tell(), 7, "consumes the full field even past the NUL");
         // No NUL -> whole field.
-        let data = [b'A', b'B', b'C'];
+        let data = *b"ABC";
         let mut r = MemReader::new(&data);
         assert_eq!(r.read_ascii(3).unwrap(), "ABC");
     }

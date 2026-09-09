@@ -282,6 +282,44 @@ fn bench(c: &mut Criterion) {
             })
         });
 
+        // FLAT-RUNS variant: the same transform over run-structured input
+        // (64-pixel runs of identical pixels — the shape of flat-area artwork
+        // and label rasters). Exercises the batched path's consecutive-
+        // duplicate collapse; the fully-random buffer above is its worst case
+        // (zero duplicates, pure comparison overhead).
+        let mut input_runs = input.clone();
+        for (i, chunk) in input_runs.chunks_mut(in_stride * 64).enumerate() {
+            let mut first = vec![0u8; in_stride];
+            first.copy_from_slice(&input[(i * 64) * in_stride..(i * 64) * in_stride + in_stride]);
+            for px in chunk.chunks_mut(in_stride) {
+                px.copy_from_slice(&first);
+            }
+        }
+        group.bench_function(
+            BenchmarkId::new(sc.name, "tintbox-AccurateFast-flatruns"),
+            |b| {
+                b.iter(|| {
+                    tb_accurate_fast.do_transform(
+                        black_box(&input_runs),
+                        black_box(&mut output),
+                        N_PIXELS,
+                    );
+                })
+            },
+        );
+        group.bench_function(
+            BenchmarkId::new(sc.name, "lcms2-NOOPTIMIZE-flatruns"),
+            |b| {
+                b.iter(|| {
+                    lcms_noopt.do_transform(
+                        black_box(&input_runs),
+                        black_box(&mut output),
+                        N_PIXELS,
+                    );
+                })
+            },
+        );
+
         group.finish();
     }
 }

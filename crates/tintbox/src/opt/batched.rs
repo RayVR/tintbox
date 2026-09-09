@@ -490,6 +490,8 @@ impl BatchedPipeline {
         scratch: &mut BatchedScratch,
         ctx: &Context,
     ) {
+        #[cfg(test)]
+        test_probe::note_eval_pixels(n);
         let in_ch = self.in_ch;
         let out_ch = self.out_ch;
 
@@ -589,6 +591,8 @@ impl BatchedPipeline {
         scratch: &mut BatchedScratch,
         ctx: &Context,
     ) {
+        #[cfg(test)]
+        test_probe::note_eval_pixels(n);
         let in_ch = self.in_ch;
         let out_ch = self.out_ch;
 
@@ -697,11 +701,17 @@ fn run_stage(
             crate::simd::matrix3x3_across_pixels(cur, nxt, mat, m);
             let _ = (in_width, out_width);
         }
+        // Any other Generic stage (matrices included): same hoisted-context
+        // treatment as the ToneCurves arm above. `Stage::eval` is literally
+        // `eval_in(&Context::new(), ..)`, so threading the caller's empty
+        // context is byte-for-byte identical — it only removes a per-pixel
+        // `Context` construct+drop (the measured `drop_glue<Context>` hotspot
+        // on matrix/curve-heavy pipelines).
         BatchedStage::Generic(s) => {
             for p in 0..m {
                 let src = &cur[p * in_width..p * in_width + in_width];
                 let dst = &mut nxt[p * out_width..p * out_width + out_width];
-                s.eval(src, dst);
+                s.eval_in(ctx, src, dst);
             }
         }
         // U16Run stages only appear in the 16-bit eval's stage list, which
@@ -1442,5 +1452,112 @@ mod tests {
             let expect = p.eval_16(win);
             assert_eq!(&batched_out[i * 4..i * 4 + 4], &expect[..], "pixel {i}");
         }
+    }
+}
+
+/// Test-only probe counting pixels actually evaluated by the batched
+/// pipeline, so unit tests can pin that the packed transform layer collapses
+/// runs of identical input pixels into ONE evaluation (pure memoization —
+/// see `Transform::do_transform_batched`).
+#[cfg(test)]
+pub(crate) mod test_probe {
+    // Thread-local so parallel lib tests never see each other's counts —
+    // every eval under test runs on the calling test's own thread.
+    thread_local! {
+        static EVAL_PIXELS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(crate) fn note_eval_pixels(n: usize) {
+        EVAL_PIXELS.with(|c| c.set(c.get() + n));
+    }
+
+    /// Pixels evaluated on THIS thread; measure deltas.
+    pub(crate) fn eval_pixel_count() -> usize {
+        EVAL_PIXELS.with(|c| c.get())
+    }
+}
+
+#[cfg(test)]
+mod perf_probes {
+    use super::tests_support::matrix_curve_clut_pipeline;
+    use super::*;
+
+    /// A pipeline with `Generic` stages (a matrix, and segmented curves after
+    /// it) must NOT construct a `Context` per pixel: `run_stage` threads the
+    /// caller's hoisted context into every arm. Before the fix the generic
+    /// fallback arm called `Stage::eval`, which builds and drops a `Context`
+    /// per pixel — the measured `drop_glue<Context>` hotspot on curve/matrix
+    /// pipelines.
+    #[test]
+    fn generic_stages_do_not_construct_contexts_per_pixel() {
+        let p = matrix_curve_clut_pipeline();
+        let batched = try_optimize(
+            &p,
+            crate::format::decode::TYPE_CMYK_16,
+            crate::format::decode::TYPE_CMYK_16,
+        )
+        .expect("batched built");
+
+        let n = 1024usize;
+        let mut input = vec![0u16; n * 3];
+        for (i, v) in input.iter_mut().enumerate() {
+            *v = ((i * 2654435761usize) & 0xffff) as u16;
+        }
+        let mut out = vec![0u16; n * 4];
+
+        // Warm-up (thread-local empty-context lazies etc.).
+        batched.eval_16_buffer(&input, &mut out, n);
+        let before = crate::context::test_probe::new_count();
+        batched.eval_16_buffer(&input, &mut out, n);
+        let delta = crate::context::test_probe::new_count() - before;
+        assert!(
+            delta <= 4,
+            "evaluating {n} pixels constructed {delta} Contexts — the generic \
+             stage arms must thread the hoisted context, not build one per pixel"
+        );
+    }
+}
+
+/// Shared fixture builders for the unit tests above and the transform-layer
+/// tests (which need the same shapes through the packed API).
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+    use crate::curve::build_gamma;
+    use crate::pipeline::ResolvedInterp;
+
+    /// Matrix -> segmented curves -> U16 CLUT: the matrix and the curves stay
+    /// `Generic` (continuous f32 boundary), the CLUT forms a u16 run — the
+    /// exact shape of a press-CMYK -> display transform's tail.
+    pub(crate) fn matrix_curve_clut_pipeline() -> Pipeline {
+        let mut p = Pipeline::new(3, 4);
+        p.insert_stage_at_end(Stage::Matrix {
+            rows: 3,
+            cols: 3,
+            m: vec![0.9, 0.05, 0.05, 0.1, 0.8, 0.1, 0.05, 0.15, 0.8],
+            offset: None,
+        })
+        .unwrap();
+        p.insert_stage_at_end(Stage::ToneCurves(vec![
+            build_gamma(2.2),
+            build_gamma(1.8),
+            build_gamma(2.4),
+        ]))
+        .unwrap();
+        let n_samples = [3u32, 3, 3];
+        let params = InterpParams::new(&n_samples, 3, 4);
+        let mut table = vec![0u16; 27 * 4];
+        for (i, v) in table.iter_mut().enumerate() {
+            *v = ((i * 2417 + 991) & 0xffff) as u16;
+        }
+        p.insert_stage_at_end(Stage::Clut(Clut {
+            table: ClutTable::U16(table),
+            params,
+            is_trilinear: false,
+            implements_identity: false,
+            resolved: ResolvedInterp::default(),
+        }))
+        .unwrap();
+        p
     }
 }
