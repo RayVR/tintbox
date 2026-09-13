@@ -157,6 +157,75 @@ pub struct Transform {
     opt_eval: OptimizedEval,
 }
 
+/// Caller-owned working storage for repeated packed color transforms.
+///
+/// A workspace is independent of any one [`Transform`]. Callers may reuse it
+/// across transforms, formats, and pixel counts. It contains scratch data only;
+/// it never caches converted colors or transform-specific pipeline state.
+pub struct TransformWorkspace {
+    eval_scratch: crate::opt::batched::BatchedScratch,
+    unique_pixels: Vec<u32>,
+    float_input: Vec<f32>,
+    float_output: Vec<f32>,
+    word_input: Vec<u16>,
+    word_output: Vec<u16>,
+}
+
+impl TransformWorkspace {
+    /// Creates an empty transform workspace.
+    pub fn new() -> Self {
+        TransformWorkspace {
+            eval_scratch: crate::opt::batched::BatchedScratch::empty(),
+            unique_pixels: Vec::new(),
+            float_input: Vec::new(),
+            float_output: Vec::new(),
+            word_input: Vec::new(),
+            word_output: Vec::new(),
+        }
+    }
+
+    fn prepare_batched(
+        &mut self,
+        tile: usize,
+        input_channels: usize,
+        output_channels: usize,
+        max_stage_channels: usize,
+        is_float: bool,
+    ) {
+        self.eval_scratch
+            .prepare(tile, max_stage_channels, !is_float);
+        resize_workspace_buffer(&mut self.unique_pixels, tile, 0u32);
+        let input_len = tile
+            .checked_mul(input_channels)
+            .expect("transform workspace input size overflow");
+        let output_len = tile
+            .checked_mul(output_channels)
+            .expect("transform workspace output size overflow");
+        if is_float {
+            resize_workspace_buffer(&mut self.float_input, input_len, 0.0f32);
+            resize_workspace_buffer(&mut self.float_output, output_len, 0.0f32);
+        } else {
+            resize_workspace_buffer(&mut self.word_input, input_len, 0u16);
+            resize_workspace_buffer(&mut self.word_output, output_len, 0u16);
+        }
+    }
+}
+
+impl Default for TransformWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn resize_workspace_buffer<T: Clone>(buffer: &mut Vec<T>, required: usize, value: T) {
+    if buffer.capacity() < required {
+        buffer
+            .try_reserve_exact(required - buffer.len())
+            .expect("transform workspace allocation failed");
+    }
+    buffer.resize(required, value);
+}
+
 /// lcms2 `NormalizeXYZ` (`cmsxform.c:1090-1101`): some profiles store the media
 /// white × 100; divide by 10 until all components fall below 2.
 fn normalize_xyz(mut wp: CIEXYZ) -> CIEXYZ {
@@ -722,6 +791,7 @@ impl Transform {
         input: &[u8],
         output: &mut [u8],
         n_pixels: usize,
+        workspace: &mut TransformWorkspace,
     ) {
         // Pixels per unpack/eval/pack tile. Matches the eval's internal CHUNK so
         // the whole pipeline stays in cache; the eval itself re-tiles internally.
@@ -735,19 +805,19 @@ impl Transform {
         // Extra channels may retain per-pixel values already in the output buffer.
         let copy_whole_pixel = crate::format::decode::PixelFormat(fmts.out_fmt).extra() == 0;
 
-        // Size the per-call tile to the ACTUAL work, not the full TILE. A small call
-        // (the batched path only fires at all for n_pixels >= BATCHED_THRESHOLD, but
-        // that threshold is well below TILE) must not allocate+zero a full
-        // TILE-wide channel buffer + scratch — that per-call overhead is exactly
-        // what made AccurateFast catastrophic for small calls. `tile` pixels of
-        // scratch are allocated; the eval re-tiles internally at `min(CHUNK, tile)`.
+        // Size the logical tile to the actual work. The workspace retains prior
+        // capacity, while evaluation uses exactly this call's initialized slices.
         let tile = n_pixels.min(TILE);
 
-        // The batched eval's ping-pong scratch, allocated ONCE here (right-sized to
-        // `tile`) and reused across every tile. This removes the per-tile
-        // `vec![0; CHUNK*MAX_STAGE_CHANNELS]` zeroing that otherwise dominates the
-        // profile as `__bzero`.
-        let mut eval_scratch = crate::opt::batched::BatchedScratch::with_capacity(tile);
+        // Prepare to the widest original stage before u16 fusion. This avoids the
+        // old full-128-channel allocation and covers expanding intermediates.
+        workspace.prepare_batched(
+            tile,
+            in_ch,
+            out_ch,
+            batched.max_stage_channels(),
+            fmts.is_float,
+        );
         // Consecutive-duplicate collapse (lcms2's 1-pixel cache — §8.8, noted
         // there as value-neutral — generalised to runs): within a tile, a run of
         // IDENTICAL packed input pixels is unpacked and evaluated once and its
@@ -757,7 +827,7 @@ impl Transform {
         // equality already covers — so output is byte-for-byte unchanged, while
         // flat-area rasters (labels, spot artwork) evaluate a fraction of their
         // pixels. `uniq_of[p]` maps each tile pixel to its unique slot.
-        let mut uniq_of = vec![0u32; tile];
+        let uniq_of = &mut workspace.unique_pixels;
         // ONE empty context for the whole call — threaded into the per-tile batched
         // eval so it never constructs/drops a `Context`'s plugin registries per tile.
         let eval_ctx = Context::new();
@@ -766,8 +836,8 @@ impl Transform {
             let from_input = fmts.from_input_float.as_ref().unwrap();
             let to_output = fmts.to_output_float.as_ref().unwrap();
             // Contiguous channel scratch for one tile (in/out widths).
-            let mut chan_in = vec![0f32; tile * in_ch];
-            let mut chan_out = vec![0f32; tile * out_ch];
+            let chan_in = &mut workspace.float_input;
+            let chan_out = &mut workspace.float_output;
             // Per-pixel unpack target (the formatter writes MAX_CHANNELS slots).
             let mut fin = [0f32; MAX_CHANNELS];
 
@@ -799,7 +869,7 @@ impl Transform {
                     &chan_in[..m_u * in_ch],
                     &mut chan_out[..m_u * out_ch],
                     m_u,
-                    &mut eval_scratch,
+                    &mut workspace.eval_scratch,
                     &eval_ctx,
                 );
                 // Pack the tile back out (padding the packer's MAX_CHANNELS input).
@@ -829,8 +899,8 @@ impl Transform {
         } else {
             let from_input = fmts.from_input16.as_ref().unwrap();
             let to_output = fmts.to_output16.as_ref().unwrap();
-            let mut chan_in = vec![0u16; tile * in_ch];
-            let mut chan_out = vec![0u16; tile * out_ch];
+            let chan_in = &mut workspace.word_input;
+            let chan_out = &mut workspace.word_output;
             let mut win = [0u16; MAX_CHANNELS];
 
             let mut base = 0usize;
@@ -858,7 +928,7 @@ impl Transform {
                     &chan_in[..m_u * in_ch],
                     &mut chan_out[..m_u * out_ch],
                     m_u,
-                    &mut eval_scratch,
+                    &mut workspace.eval_scratch,
                     &eval_ctx,
                 );
                 let mut wout = [0u16; MAX_CHANNELS];
@@ -915,6 +985,23 @@ impl Transform {
     const BATCHED_THRESHOLD: usize = 256;
 
     pub fn do_transform(&self, input: &[u8], output: &mut [u8], n_pixels: usize) {
+        let mut workspace = TransformWorkspace::new();
+        self.do_transform_with_workspace(input, output, n_pixels, &mut workspace);
+    }
+
+    /// Format-aware transform using caller-owned reusable working storage.
+    ///
+    /// The output is identical to [`Transform::do_transform`]. Reusing one
+    /// workspace across calls allows the batched path to retain its scratch
+    /// allocations. The workspace must be mutably borrowed for the duration of
+    /// the call and may be reused with a different transform afterward.
+    pub fn do_transform_with_workspace(
+        &self,
+        input: &[u8],
+        output: &mut [u8],
+        n_pixels: usize,
+        workspace: &mut TransformWorkspace,
+    ) {
         let fmts = self
             .formatters
             .as_ref()
@@ -924,14 +1011,14 @@ impl Transform {
         let out_ch = self.lut.output_channels;
         let in_stride = pixel_bytes(fmts.in_fmt);
         let out_stride = pixel_bytes(fmts.out_fmt);
-        assert!(
-            input.len() >= n_pixels * in_stride,
-            "input buffer too small"
-        );
-        assert!(
-            output.len() >= n_pixels * out_stride,
-            "output buffer too small"
-        );
+        let input_required = n_pixels
+            .checked_mul(in_stride)
+            .expect("input buffer size overflow");
+        let output_required = n_pixels
+            .checked_mul(out_stride)
+            .expect("output buffer size overflow");
+        assert!(input.len() >= input_required, "input buffer too small");
+        assert!(output.len() >= output_required, "output buffer too small");
 
         // LOSSLESS BATCHED general/CLUT fast path (AccurateFast). Byte-for-byte
         // identical to the per-pixel Pipeline eval, but unpacks/evaluates/packs in
@@ -948,7 +1035,7 @@ impl Transform {
         // (see crates/tintbox/benches/transform.rs and examples/profile_transform).
         if self.gamut_check.is_none() && n_pixels >= Self::BATCHED_THRESHOLD {
             if let OptimizedEval::Batched(batched) = &self.opt_eval {
-                self.do_transform_batched(fmts, batched, input, output, n_pixels);
+                self.do_transform_batched(fmts, batched, input, output, n_pixels, workspace);
                 return;
             }
         }
@@ -1367,6 +1454,7 @@ mod dedup_tests {
     fn duplicate_runs_preserve_uncopied_extra_channels() {
         use crate::format::decode::{TYPE_ARGB_8, TYPE_RGBA_16, TYPE_RGBA_8, TYPE_RGBA_FLT};
         let profile = clut_devicelink();
+        let mut workspace = TransformWorkspace::new();
         for output_format in [TYPE_RGBA_8, TYPE_ARGB_8, TYPE_RGBA_16, TYPE_RGBA_FLT] {
             let make = |strategy| {
                 Transform::new_with_formats_strategy(
@@ -1390,7 +1478,7 @@ mod dedup_tests {
             let mut expected: Vec<u8> = (0..n * stride).map(|i| (i % 251) as u8).collect();
             let mut actual = expected.clone();
             accurate.do_transform(&input, &mut expected, n);
-            fast.do_transform(&input, &mut actual, n);
+            fast.do_transform_with_workspace(&input, &mut actual, n, &mut workspace);
             let mismatch = actual.iter().zip(&expected).position(|(a, b)| a != b);
             assert!(
                 mismatch.is_none(),
@@ -1441,5 +1529,108 @@ mod dedup_tests {
         fast.do_transform(&input, &mut out_fast, n);
         accurate.do_transform(&input, &mut out_acc, n);
         assert_eq!(out_fast, out_acc, "dedup changed output bytes");
+    }
+
+    #[test]
+    fn immutable_transform_supports_separate_workspaces_on_simultaneous_threads() {
+        let profile = clut_devicelink();
+        let fast = build_xform(&profile);
+        let accurate = Transform::new_with_formats_strategy(
+            &[&profile],
+            &[RenderingIntent::Perceptual],
+            &[false],
+            &[1.0],
+            Flags::empty(),
+            TYPE_RGB_8,
+            TYPE_RGB_8,
+            crate::opt::OptimizationStrategy::Accurate,
+        )
+        .expect("accurate transform builds");
+        let input: Vec<u8> = (0..513usize)
+            .flat_map(|pixel| {
+                [
+                    ((pixel * 17) & 0xff) as u8,
+                    ((pixel * 31) & 0xff) as u8,
+                    ((pixel * 47) & 0xff) as u8,
+                ]
+            })
+            .collect();
+        let mut expected = vec![0u8; input.len()];
+        accurate.do_transform(&input, &mut expected, 513);
+
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut workspace = TransformWorkspace::new();
+                        let mut actual = vec![0u8; input.len()];
+                        fast.do_transform_with_workspace(&input, &mut actual, 513, &mut workspace);
+                        actual
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().expect("worker completes"), expected);
+            }
+        });
+    }
+
+    #[test]
+    fn zero_pixel_workspace_call_leaves_output_and_workspace_empty() {
+        let profile = clut_devicelink();
+        let transform = build_xform(&profile);
+        let mut workspace = TransformWorkspace::new();
+        let mut output = [0x27, 0x91, 0xe4];
+        transform.do_transform_with_workspace(&[], &mut output, 0, &mut workspace);
+        assert_eq!(output, [0x27, 0x91, 0xe4]);
+        assert!(workspace.unique_pixels.is_empty());
+        assert!(workspace.float_input.is_empty());
+        assert!(workspace.float_output.is_empty());
+        assert!(workspace.word_input.is_empty());
+        assert!(workspace.word_output.is_empty());
+    }
+
+    #[test]
+    fn workspace_logical_lengths_follow_actual_growth_and_shrink_calls() {
+        let profile = clut_devicelink();
+        let fast = build_xform(&profile);
+        let accurate = Transform::new_with_formats_strategy(
+            &[&profile],
+            &[RenderingIntent::Perceptual],
+            &[false],
+            &[1.0],
+            Flags::empty(),
+            TYPE_RGB_8,
+            TYPE_RGB_8,
+            crate::opt::OptimizationStrategy::Accurate,
+        )
+        .expect("accurate transform builds");
+        let max_pixels = 769usize;
+        let input: Vec<u8> = (0..max_pixels)
+            .flat_map(|pixel| {
+                [
+                    ((pixel * 17) & 0xff) as u8,
+                    ((pixel * 31) & 0xff) as u8,
+                    ((pixel * 47) & 0xff) as u8,
+                ]
+            })
+            .collect();
+        let mut expected = vec![0u8; input.len()];
+        accurate.do_transform(&input, &mut expected, max_pixels);
+
+        let mut workspace = TransformWorkspace::new();
+        for pixels in [257usize, max_pixels, 513usize] {
+            let mut actual = vec![0u8; pixels * 3];
+            fast.do_transform_with_workspace(
+                &input[..pixels * 3],
+                &mut actual,
+                pixels,
+                &mut workspace,
+            );
+            assert_eq!(actual, expected[..pixels * 3]);
+            assert_eq!(workspace.unique_pixels.len(), pixels);
+            assert_eq!(workspace.word_input.len(), pixels * 3);
+            assert_eq!(workspace.word_output.len(), pixels * 3);
+        }
     }
 }

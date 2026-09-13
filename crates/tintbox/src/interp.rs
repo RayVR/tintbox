@@ -345,12 +345,22 @@ pub fn interp_factory_in(
 /// Panics (via slice indexing) if `table`, `input`, or `output` are sized
 /// inconsistently with `p`.
 pub fn tetrahedral_16(input: &[u16], output: &mut [u16], table: &[u16], p: &InterpParams) {
+    tetrahedral_16_domain(input, output, table, p, &p.domain);
+}
+
+fn tetrahedral_16_domain(
+    input: &[u16],
+    output: &mut [u16],
+    table: &[u16],
+    p: &InterpParams,
+    domain: &[u32],
+) {
     // const cmsUInt16Number* LutTable = (cmsUInt16Number*) p -> Table;
     // We track a base index `lut` into `table` instead of advancing a pointer.
 
-    let fx: i32 = to_fixed_domain(input[0] as i32 * p.domain[0] as i32);
-    let fy: i32 = to_fixed_domain(input[1] as i32 * p.domain[1] as i32);
-    let fz: i32 = to_fixed_domain(input[2] as i32 * p.domain[2] as i32);
+    let fx: i32 = to_fixed_domain(input[0] as i32 * domain[0] as i32);
+    let fy: i32 = to_fixed_domain(input[1] as i32 * domain[1] as i32);
+    let fz: i32 = to_fixed_domain(input[2] as i32 * domain[2] as i32);
 
     let x0 = fixed_to_int(fx);
     let y0 = fixed_to_int(fy);
@@ -870,6 +880,16 @@ pub fn trilinear_float(input: &[f32], output: &mut [f32], table: &[f32], p: &Int
 /// `input` is 3 f32 channels, `output` receives `p.n_outputs` f32 channels, and
 /// `table` is the flattened CLUT grid (`n_outputs` f32 per node).
 pub fn tetrahedral_float(input: &[f32], output: &mut [f32], table: &[f32], p: &InterpParams) {
+    tetrahedral_float_domain(input, output, table, p, &p.domain);
+}
+
+fn tetrahedral_float_domain(
+    input: &[f32],
+    output: &mut [f32],
+    table: &[f32],
+    p: &InterpParams,
+    domain: &[u32],
+) {
     // #define DENS(i,j,k) (LutTable[(i)+(j)+(k)+OutChan])
     let dens =
         |x: i32, y: i32, z: i32, out_chan: i32| -> f32 { table[(x + y + z + out_chan) as usize] };
@@ -877,9 +897,9 @@ pub fn tetrahedral_float(input: &[f32], output: &mut [f32], table: &[f32], p: &I
     let total_out = p.n_outputs as i32;
 
     // We need some clipping here
-    let px = fclamp(input[0]) * p.domain[0] as f32;
-    let py = fclamp(input[1]) * p.domain[1] as f32;
-    let pz = fclamp(input[2]) * p.domain[2] as f32;
+    let px = fclamp(input[0]) * domain[0] as f32;
+    let py = fclamp(input[1]) * domain[1] as f32;
+    let pz = fclamp(input[2]) * domain[2] as f32;
 
     let x0 = px.floor() as i32;
     let rx = px - x0 as f32;
@@ -986,22 +1006,29 @@ pub(crate) const MAX_INPUT_DIMENSIONS: usize = 15;
 /// Panics if `p.n_inputs < 4` (use [`tetrahedral_16`] for 3 inputs).
 pub fn eval_n_inputs(input: &[u16], output: &mut [u16], table: &[u16], p: &InterpParams) {
     assert!(p.n_inputs >= 4, "eval_n_inputs requires >= 4 inputs");
-    eval_n_inputs_rec(input, output, table, p, p.n_inputs);
+    eval_n_inputs_rec(input, output, table, p, &p.domain, p.n_inputs);
 }
 
 /// Recursive worker for [`eval_n_inputs`]. `n` is the number of *remaining*
 /// inputs at this level (counts down to 3, where the tetrahedral kernel runs).
-fn eval_n_inputs_rec(input: &[u16], output: &mut [u16], table: &[u16], p: &InterpParams, n: usize) {
+fn eval_n_inputs_rec(
+    input: &[u16],
+    output: &mut [u16],
+    table: &[u16],
+    p: &InterpParams,
+    domain: &[u32],
+    n: usize,
+) {
     if n == 3 {
         // lcms2 inlines TetrahedralInterp16 here; tetrahedral_16 is bit-identical.
-        tetrahedral_16(input, output, table, p);
+        tetrahedral_16_domain(input, output, table, p, domain);
         return;
     }
 
     // NM = N - 1 in the C macro; the first input is fixed on opta[NM]/Domain[0].
     let nm = n - 1;
 
-    let fk = to_fixed_domain(input[0] as i32 * p.domain[0] as i32);
+    let fk = to_fixed_domain(input[0] as i32 * domain[0] as i32);
     let k0 = fixed_to_int(fk);
     let rk = fixed_rest_to_int(fk);
 
@@ -1010,10 +1037,9 @@ fn eval_n_inputs_rec(input: &[u16], output: &mut [u16], table: &[u16], p: &Inter
     let k0_idx = opta_nm * k0;
     let k1_idx = opta_nm * (k0 + if input[0] != 0xFFFF { 1 } else { 0 });
 
-    // p1 is *p with Domain shifted left by one (Domain[0..NM] <- Domain[1..N]).
-    // opta/n_samples are untouched by the C memmove, so the inner level reads the
-    // same opta entries.
-    let p1 = shift_domain(p, nm);
+    // Advancing the domain slice is equivalent to the C Domain memmove.
+    // Strides and output count remain shared without cloning the parameters.
+    let inner_domain = &domain[1..];
 
     let n_out = p.n_outputs;
     let mut tmp1 = [0u16; MAX_STAGE_CHANNELS];
@@ -1023,14 +1049,16 @@ fn eval_n_inputs_rec(input: &[u16], output: &mut [u16], table: &[u16], p: &Inter
         &input[1..],
         &mut tmp1[..n_out],
         &table[k0_idx as usize..],
-        &p1,
+        p,
+        inner_domain,
         nm,
     );
     eval_n_inputs_rec(
         &input[1..],
         &mut tmp2[..n_out],
         &table[k1_idx as usize..],
-        &p1,
+        p,
+        inner_domain,
         nm,
     );
 
@@ -1066,7 +1094,7 @@ pub fn eval_4_inputs(input: &[u16], output: &mut [u16], table: &[u16], p: &Inter
 
     // Inner level reads input[1..] with Domain shifted left by one; opta/n_samples
     // are untouched (matching the C memmove of only `Domain`).
-    let p1 = shift_domain(p, 3);
+    let inner_domain = &p.domain[1..];
 
     let n_out = p.n_outputs;
 
@@ -1079,12 +1107,19 @@ pub fn eval_4_inputs(input: &[u16], output: &mut [u16], table: &[u16], p: &Inter
     let mut tmp1 = SCRATCH_ZERO;
     let tmp1 = &mut tmp1[..n_out];
 
-    tetrahedral_16(&input[1..], tmp1, &table[k0_idx as usize..], &p1);
-    tetrahedral_16(
+    tetrahedral_16_domain(
+        &input[1..],
+        tmp1,
+        &table[k0_idx as usize..],
+        p,
+        inner_domain,
+    );
+    tetrahedral_16_domain(
         &input[1..],
         &mut output[..n_out],
         &table[k1_idx as usize..],
-        &p1,
+        p,
+        inner_domain,
     );
 
     for i in 0..n_out {
@@ -1108,7 +1143,7 @@ const SCRATCH_ZERO: [u16; MAX_STAGE_CHANNELS] = [0u16; MAX_STAGE_CHANNELS];
 /// Panics if `p.n_inputs < 4`.
 pub fn eval_n_inputs_float(input: &[f32], output: &mut [f32], table: &[f32], p: &InterpParams) {
     assert!(p.n_inputs >= 4, "eval_n_inputs_float requires >= 4 inputs");
-    eval_n_inputs_float_rec(input, output, table, p, p.n_inputs);
+    eval_n_inputs_float_rec(input, output, table, p, &p.domain, p.n_inputs);
 }
 
 fn eval_n_inputs_float_rec(
@@ -1116,16 +1151,17 @@ fn eval_n_inputs_float_rec(
     output: &mut [f32],
     table: &[f32],
     p: &InterpParams,
+    domain: &[u32],
     n: usize,
 ) {
     if n == 3 {
-        tetrahedral_float(input, output, table, p);
+        tetrahedral_float_domain(input, output, table, p, domain);
         return;
     }
 
     let nm = n - 1;
 
-    let pk = fclamp(input[0]) * p.domain[0] as f32;
+    let pk = fclamp(input[0]) * domain[0] as f32;
     let k0 = quick_floor(pk);
     let rest = pk - k0 as f32;
 
@@ -1133,7 +1169,7 @@ fn eval_n_inputs_float_rec(
     let k0_idx = opta_nm * k0;
     let k1_idx = k0_idx + if fclamp(input[0]) >= 1.0 { 0 } else { opta_nm };
 
-    let p1 = shift_domain(p, nm);
+    let inner_domain = &domain[1..];
 
     let n_out = p.n_outputs;
     let mut tmp1 = [0f32; MAX_STAGE_CHANNELS];
@@ -1143,14 +1179,16 @@ fn eval_n_inputs_float_rec(
         &input[1..],
         &mut tmp1[..n_out],
         &table[k0_idx as usize..],
-        &p1,
+        p,
+        inner_domain,
         nm,
     );
     eval_n_inputs_float_rec(
         &input[1..],
         &mut tmp2[..n_out],
         &table[k1_idx as usize..],
-        &p1,
+        p,
+        inner_domain,
         nm,
     );
 
@@ -1183,7 +1221,7 @@ pub fn eval_4_inputs_float(input: &[f32], output: &mut [f32], table: &[f32], p: 
     let k0_idx = opta_nm * k0;
     let k1_idx = k0_idx + if fclamp(input[0]) >= 1.0 { 0 } else { opta_nm };
 
-    let p1 = shift_domain(p, 3);
+    let inner_domain = &p.domain[1..];
 
     let n_out = p.n_outputs;
 
@@ -1192,12 +1230,19 @@ pub fn eval_4_inputs_float(input: &[f32], output: &mut [f32], table: &[f32], p: 
     let mut tmp1 = SCRATCH_ZERO_F32;
     let tmp1 = &mut tmp1[..n_out];
 
-    tetrahedral_float(&input[1..], tmp1, &table[k0_idx as usize..], &p1);
-    tetrahedral_float(
+    tetrahedral_float_domain(
+        &input[1..],
+        tmp1,
+        &table[k0_idx as usize..],
+        p,
+        inner_domain,
+    );
+    tetrahedral_float_domain(
         &input[1..],
         &mut output[..n_out],
         &table[k1_idx as usize..],
-        &p1,
+        p,
+        inner_domain,
     );
 
     for i in 0..n_out {
@@ -1224,20 +1269,4 @@ fn quick_floor(val: f32) -> i32 {
     // halves[0] = low 32 bits of the f64 on little-endian; `>> 16` is arithmetic
     // (signed int shift in C).
     (temp.to_bits() as u32 as i32) >> 16
-}
-
-/// Build the inner-level [`InterpParams`] for the n-D recursion: a copy of `p`
-/// with `domain` shifted left by one (`domain[0..keep] = p.domain[1..=keep]`) and
-/// `n_inputs` reduced. lcms2 only `memmove`s `Domain` (and offsets `Table`); it
-/// leaves `opta`/`nSamples`/`nOutputs` untouched, and so does this.
-fn shift_domain(p: &InterpParams, keep: usize) -> InterpParams {
-    let mut domain = p.domain.clone();
-    domain[..keep].copy_from_slice(&p.domain[1..=keep]);
-    InterpParams {
-        n_inputs: keep,
-        n_outputs: p.n_outputs,
-        n_samples: p.n_samples.clone(),
-        domain,
-        opta: p.opta.clone(),
-    }
 }

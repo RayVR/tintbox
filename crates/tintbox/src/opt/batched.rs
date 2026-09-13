@@ -281,8 +281,8 @@ impl U16Run {
     }
 }
 
-/// Reusable u16 ping-pong scratch for [`U16Run::eval`] (allocated once per call to
-/// the 16-bit batched eval, reused across runs and chunks).
+/// Reusable u16 ping-pong scratch for [`U16Run::eval`], retained across calls by
+/// the caller-owned transform workspace and reused across runs and chunks.
 struct U16RunScratch {
     a: Vec<u16>,
     b: Vec<u16>,
@@ -295,24 +295,30 @@ impl U16RunScratch {
             b: vec![0u16; cap_pixels * MAX_STAGE_CHANNELS],
         }
     }
+
+    fn empty() -> Self {
+        U16RunScratch {
+            a: Vec::new(),
+            b: Vec::new(),
+        }
+    }
 }
 
 /// Reusable scratch for a whole batched eval: the f32 ping-pong pair plus the
-/// u16-run scratch. Allocated ONCE per `do_transform` call (in
-/// [`Transform::do_transform_batched`](crate::transform)) and reused across every
-/// tile — the per-tile `vec![0; CHUNK*MAX_STAGE_CHANNELS]` allocation+zeroing
-/// (`__bzero`) is the hot waste this removes. Every slot a stage reads is written
-/// by the prior stage (or the entry conversion) before being read, so the buffers
-/// carrying stale data across tiles is harmless: the eval never reads an
-/// un-rewritten slot.
+/// u16-run scratch. A caller-owned transform workspace retains it across calls;
+/// the standalone evaluator constructors retain their existing one-call behavior.
+/// Every slot a stage reads is written by the prior stage (or entry conversion)
+/// before being read, so stale data across calls or tiles is never observed.
 pub struct BatchedScratch {
     buf_a: Vec<f32>,
     buf_b: Vec<f32>,
     u16: U16RunScratch,
     /// The eval's internal tile width in PIXELS: `min(CHUNK, cap_pixels)`. The eval
     /// must never process more than `cap_pixels` pixels per inner tile, since the
-    /// scratch buffers only hold `cap_pixels * MAX_STAGE_CHANNELS` slots.
+    /// scratch buffers only hold `cap_pixels * cap_channels` logical slots.
     cap_pixels: usize,
+    /// Maximum original pipeline width represented by the logical buffer lengths.
+    cap_channels: usize,
 }
 
 impl BatchedScratch {
@@ -331,7 +337,34 @@ impl BatchedScratch {
             buf_b: vec![0.0f32; cap * MAX_STAGE_CHANNELS],
             u16: U16RunScratch::with_capacity(cap),
             cap_pixels: cap,
+            cap_channels: MAX_STAGE_CHANNELS,
         }
+    }
+
+    pub(crate) fn empty() -> Self {
+        BatchedScratch {
+            buf_a: Vec::new(),
+            buf_b: Vec::new(),
+            u16: U16RunScratch::empty(),
+            cap_pixels: 0,
+            cap_channels: 0,
+        }
+    }
+
+    pub(crate) fn prepare(&mut self, cap_pixels: usize, cap_channels: usize, needs_u16: bool) {
+        debug_assert!(cap_pixels <= CHUNK);
+        debug_assert!(cap_channels <= MAX_STAGE_CHANNELS);
+        let required = cap_pixels
+            .checked_mul(cap_channels)
+            .expect("batched scratch size overflow");
+        resize_exact(&mut self.buf_a, required, 0.0f32);
+        resize_exact(&mut self.buf_b, required, 0.0f32);
+        if needs_u16 {
+            resize_exact(&mut self.u16.a, required, 0u16);
+            resize_exact(&mut self.u16.b, required, 0u16);
+        }
+        self.cap_pixels = cap_pixels;
+        self.cap_channels = cap_channels;
     }
 
     /// Allocate scratch sized for a full `CHUNK` tile (the steady-state large-buffer
@@ -340,6 +373,15 @@ impl BatchedScratch {
     pub fn new() -> Self {
         Self::with_capacity(CHUNK)
     }
+}
+
+fn resize_exact<T: Clone>(buffer: &mut Vec<T>, required: usize, value: T) {
+    if buffer.capacity() < required {
+        buffer
+            .try_reserve_exact(required - buffer.len())
+            .expect("batched scratch allocation failed");
+    }
+    buffer.resize(required, value);
 }
 
 impl Default for BatchedScratch {
@@ -433,6 +475,8 @@ pub struct BatchedPipeline {
     stages_float: Vec<BatchedStage>,
     in_ch: usize,
     out_ch: usize,
+    /// Largest input/output width across the original unfused pipeline.
+    max_stage_channels: usize,
     /// When the input is 8-bit AND the first stage is `ToneCurves`, the per-channel
     /// 256-entry LUTs memoizing that stage's output for each input byte:
     /// `in_lut[ch][byte] = curve[ch].eval_float(from_8_to_16(byte) as f32 /
@@ -458,6 +502,10 @@ impl BatchedPipeline {
     #[must_use]
     pub fn output_channels(&self) -> usize {
         self.out_ch
+    }
+
+    pub(crate) fn max_stage_channels(&self) -> usize {
+        self.max_stage_channels
     }
 
     /// Whether the 16-bit eval contains at least one fused u16-domain run (the big
@@ -500,7 +548,9 @@ impl BatchedPipeline {
             buf_b,
             u16: u16_scratch,
             cap_pixels,
+            cap_channels,
         } = scratch;
+        assert!(*cap_channels >= self.max_stage_channels);
         // Inner tile width: never exceed the scratch capacity (which may be < CHUNK
         // for a small `do_transform` call).
         let tile = (*cap_pixels).min(CHUNK);
@@ -600,8 +650,10 @@ impl BatchedPipeline {
             buf_a,
             buf_b,
             cap_pixels,
+            cap_channels,
             ..
         } = scratch;
+        assert!(*cap_channels >= self.max_stage_channels);
         // Inner tile width: never exceed the scratch capacity (see `eval_16_buffer`).
         let tile = (*cap_pixels).min(CHUNK);
         // `ctx` threaded in (created once per `do_transform`, not per tile).
@@ -778,6 +830,22 @@ pub fn try_optimize(lut: &Pipeline, in_fmt: u32, _out_fmt: u32) -> Option<Batche
         return None;
     }
 
+    let first = stages.first()?;
+    let last = stages.last()?;
+    if lut.input_channels > MAX_STAGE_CHANNELS
+        || lut.output_channels > MAX_STAGE_CHANNELS
+        || lut.input_channels != first.input_channels()
+        || lut.output_channels != last.output_channels()
+    {
+        return None;
+    }
+
+    let max_stage_channels = stages
+        .iter()
+        .flat_map(|stage| [stage.input_channels(), stage.output_channels()])
+        .chain([lut.input_channels, lut.output_channels])
+        .max()?;
+
     let inf = PixelFormat(in_fmt);
     // 8-bit (1 byte, non-float) input lets us memoize the first ToneCurves stage.
     let input_8bit = inf.bytes() == 1 && !inf.is_float();
@@ -830,6 +898,7 @@ pub fn try_optimize(lut: &Pipeline, in_fmt: u32, _out_fmt: u32) -> Option<Batche
         stages_float: batched,
         in_ch: lut.input_channels,
         out_ch: lut.output_channels,
+        max_stage_channels,
         input_curve_luts,
         has_u16_run,
     })
@@ -983,7 +1052,7 @@ fn entry_word_roundtrip_is_identity() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::curve::build_gamma;
+    use crate::curve::{build_gamma, build_tabulated_16};
     use crate::format::decode::{TYPE_CMYK_16, TYPE_CMYK_FLT, TYPE_RGB_8};
     use crate::interp::InterpParams;
     use crate::pipeline::{Clut, ClutTable, ResolvedInterp};
@@ -1014,6 +1083,123 @@ mod tests {
         }))
         .unwrap();
         p
+    }
+
+    fn assert_endpoint_shape_is_rejected(pipeline: &Pipeline, case: &str) {
+        assert!(
+            try_optimize(pipeline, TYPE_RGB_8, TYPE_CMYK_16).is_none(),
+            "malformed {case} pipeline must not enter the batched optimizer"
+        );
+    }
+
+    #[test]
+    fn batched_rejects_overwidth_declared_input_endpoint() {
+        let mut pipeline = rgb_clut_pipeline();
+        pipeline.input_channels = MAX_STAGE_CHANNELS + 1;
+        assert_endpoint_shape_is_rejected(&pipeline, "overwidth input endpoint");
+    }
+
+    #[test]
+    fn batched_rejects_overwidth_declared_output_endpoint() {
+        let mut pipeline = rgb_clut_pipeline();
+        pipeline.output_channels = MAX_STAGE_CHANNELS + 1;
+        assert_endpoint_shape_is_rejected(&pipeline, "overwidth output endpoint");
+    }
+
+    #[test]
+    fn batched_rejects_declared_input_that_differs_from_first_stage() {
+        let mut pipeline = rgb_clut_pipeline();
+        pipeline.input_channels = 4;
+        assert_endpoint_shape_is_rejected(&pipeline, "input/first-stage mismatch");
+    }
+
+    #[test]
+    fn batched_rejects_declared_output_that_differs_from_last_stage() {
+        let mut pipeline = rgb_clut_pipeline();
+        pipeline.output_channels = 3;
+        assert_endpoint_shape_is_rejected(&pipeline, "output/last-stage mismatch");
+    }
+
+    #[test]
+    fn batched_scratch_width_includes_a_prefusion_intermediate() {
+        for intermediate_width in [7, MAX_STAGE_CHANNELS] {
+            let mut pipeline = Pipeline::new(3, 3);
+            pipeline
+                .insert_stage_at_end(Stage::Matrix {
+                    rows: intermediate_width,
+                    cols: 3,
+                    m: vec![0.125; intermediate_width * 3],
+                    offset: None,
+                })
+                .unwrap();
+            if intermediate_width == 7 {
+                pipeline
+                    .insert_stage_at_end(Stage::ToneCurves(
+                        (0..intermediate_width)
+                            .map(|_| build_tabulated_16(&[0, 65535]))
+                            .collect(),
+                    ))
+                    .unwrap();
+                let samples = vec![2u32; intermediate_width];
+                let params = InterpParams::new(&samples, intermediate_width, 3);
+                pipeline
+                    .insert_stage_at_end(Stage::Clut(Clut {
+                        table: ClutTable::U16(vec![0x8123; (1 << intermediate_width) * 3]),
+                        params,
+                        is_trilinear: false,
+                        implements_identity: false,
+                        resolved: ResolvedInterp::default(),
+                    }))
+                    .unwrap();
+            } else {
+                pipeline
+                    .insert_stage_at_end(Stage::Matrix {
+                        rows: 3,
+                        cols: intermediate_width,
+                        m: vec![0.125; 3 * intermediate_width],
+                        offset: None,
+                    })
+                    .unwrap();
+            }
+
+            let batched =
+                try_optimize(&pipeline, TYPE_RGB_8, TYPE_RGB_8).expect("batched pipeline");
+            if intermediate_width == 7 {
+                assert!(
+                    batched.uses_u16_chain(),
+                    "the width-7 expanding/contracting fixture must fuse its u16 run"
+                );
+            }
+            assert_eq!(pipeline.input_channels(), 3);
+            assert_eq!(pipeline.output_channels(), 3);
+            assert_eq!(
+                batched.max_stage_channels(),
+                intermediate_width,
+                "scratch width must include the widest original stage before fusion"
+            );
+
+            let n = 257usize;
+            let input: Vec<u16> = (0..n)
+                .flat_map(|pixel| {
+                    [
+                        (pixel.wrapping_mul(257) & 0xffff) as u16,
+                        (pixel.wrapping_mul(977).wrapping_add(19) & 0xffff) as u16,
+                        (pixel.wrapping_mul(4051).wrapping_add(43) & 0xffff) as u16,
+                    ]
+                })
+                .collect();
+            let mut actual = vec![0u16; n * 3];
+            let mut scratch = BatchedScratch::empty();
+            scratch.prepare(n, batched.max_stage_channels(), true);
+            batched.eval_16_buffer_with(&input, &mut actual, n, &mut scratch, &Context::new());
+            for (pixel, win) in input.chunks_exact(3).enumerate() {
+                assert_eq!(
+                    &actual[pixel * 3..pixel * 3 + 3],
+                    &pipeline.eval_16(win)[..],
+                    "right-sized scratch changed width-{intermediate_width} pipeline pixel {pixel}"
+                );
+            }
+        }
     }
 
     /// The batched 16-bit eval must equal the per-pixel `eval_16` bit-for-bit.
